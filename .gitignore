@@ -1,0 +1,12 @@
+.env
+users.json
+__pycache__/
+*.pyc
+screenshots/
+downloads/
+*.log
+.venv/
+.claude/
+extension_source/
+test_report.html
+.pytest_cache/

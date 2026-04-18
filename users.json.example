@@ -1,0 +1,16 @@
+[
+  {
+    "name": "YourName",
+    "username": "your_username",
+    "password": "your_password",
+    "security_questions": {
+      "Where did you meet your spouse?": "YourAnswer",
+      "What is the name of the town/city where you were born?": "YourAnswer",
+      "What was the first company that you worked for?": "YourAnswer"
+    },
+    "preferred_consulates": ["Mumbai", "New Delhi", "Hyderabad"],
+    "date_range_start": "2026-05-01",
+    "date_range_end": "2026-12-31",
+    "telegram_chat_id": ""
+  }
+]
