@@ -37,8 +37,26 @@ def _step1_login(page: Page, user: UserProfile) -> bool:
     """Step 1: Login page — redirects to Azure B2C (atlasauth.b2clogin.com)."""
     chat_id = user.telegram_chat_id
     try:
-        page.goto(f"{BASE_URL}/sign-in", wait_until="domcontentloaded", timeout=30000)
+        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(random.randint(2000, 4000))
+
+        # If we hit "Page Not Found", click "Visa Application Home" link
+        if "page not found" in page.title().lower() or "page not found" in (page.locator("body").inner_text()[:500].lower()):
+            home_link = page.locator("a:has-text('Visa Application Home')")
+            if home_link.count() > 0:
+                print(f"[Login] {user.name} — Page Not Found, clicking Visa Application Home...")
+                home_link.first.click()
+                page.wait_for_load_state("domcontentloaded", timeout=15000)
+                page.wait_for_timeout(random.randint(2000, 4000))
+
+        # If not on B2C login page yet, look for sign-in link on the site
+        if "b2clogin.com" not in page.url.lower():
+            sign_in_link = page.locator("a[href*='sign-in'], a[href*='Sign-In'], a[href*='login'], a[href*='Login']")
+            if sign_in_link.count() > 0:
+                print(f"[Login] {user.name} — Clicking sign-in link...")
+                sign_in_link.first.click()
+                page.wait_for_load_state("domcontentloaded", timeout=15000)
+                page.wait_for_timeout(random.randint(2000, 4000))
 
         # Azure B2C login form
         page.wait_for_selector("#signInName", timeout=15000)
@@ -251,7 +269,7 @@ def ensure_logged_in(page: Page, user: UserProfile) -> bool:
     try:
         page.goto(BASE_URL, wait_until="domcontentloaded", timeout=20000)
         url = page.url.lower()
-        if "/sign-in" in url or "b2clogin.com" in url or "login" in url:
+        if "b2clogin.com" in url or "/sign-in" in url or "/login" in url:
             print(f"[Login] {user.name} — Session expired, re-logging in...")
             return login(page, user)
         return True

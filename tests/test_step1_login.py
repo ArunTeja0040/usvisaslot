@@ -39,6 +39,7 @@ class TestStep1Login:
         from login import _step1_login
 
         page = MockPage()
+        page.url = "https://atlasauth.b2clogin.com/login"
         page.set_locator("#signInName", MockLocator(visible=True, count=1))
         page.set_locator("#password", MockLocator(visible=True, count=1))
 
@@ -109,6 +110,7 @@ class TestStep1Login:
         from login import _step1_login
 
         page = MockPage()
+        page.url = "https://atlasauth.b2clogin.com/login"
         page.set_locator("#signInName", MockLocator(visible=True, count=1))
         page.set_locator("#password", MockLocator(visible=True, count=1))
         page.set_locator("#captchaImage", MockLocator(visible=False, count=0))

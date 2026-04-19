@@ -121,11 +121,12 @@ class MockPage:
     """Mock Playwright Page with configurable state for each test step."""
 
     def __init__(self):
-        self.url = "https://usvisascheduling.com/sign-in"
+        self.url = "https://www.usvisascheduling.com/"
         self._locators = {}
         self._goto_history = []
         self._default_locator = MockLocator(visible=False, count=0)
         self._body_text = ""
+        self._title = ""
 
     def goto(self, url, wait_until="domcontentloaded", timeout=30000):
         self._goto_history.append(url)
@@ -139,6 +140,9 @@ class MockPage:
 
     def wait_for_selector(self, selector, timeout=10000):
         pass
+
+    def title(self):
+        return self._title
 
     def reload(self, wait_until="domcontentloaded", timeout=15000):
         pass

@@ -16,7 +16,7 @@ if _missing:
     sys.exit(1)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-BASE_URL = os.getenv("BASE_URL", "https://usvisascheduling.com")
+BASE_URL = os.getenv("BASE_URL", "https://www.usvisascheduling.com")
 
 # Slot polling interval (seconds) — how often to re-check without page refresh
 POLL_DELAY_MIN = int(os.getenv("POLL_DELAY_MIN", "10"))
