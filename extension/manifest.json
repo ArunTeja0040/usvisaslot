@@ -1,0 +1,57 @@
+{
+"name": "US Visa Auto Booking",
+    "description": "Enhanced US visa slot checker with auto-login, CAPTCHA solving, auto-select dates, and auto-submit.",
+    "manifest_version": 3,
+    "version": "5.0.0",
+    "homepage_url": "https://checkvisaslots.com/",
+    "background": {"service_worker": "js/sw-enhanced.js"},
+    "action": {
+        "default_icon": { "32": "img/32.png" }
+    },
+    "options_page": "options.html",
+    "icons": {
+        "24": "img/24.png",
+        "32": "img/32.png",
+        "64": "img/64.png",
+        "128": "img/128.png",
+        "256": "img/256.png"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+				"https://*.usvisascheduling.com/*/*",
+                "https://atlasauth.b2clogin.com/*"
+            ],
+            "js": ["js/html2canvas.js", "js/content.js", "js/auto-booking.js"],
+            "css": ["css/sidebar.css"],
+            "run_at": "document_end"
+        },
+        {
+            "matches": ["https://atlasauth.b2clogin.com/*"],
+            "js": ["js/sidebarl.js"],
+            "css": ["css/sidebar.css"],
+            "run_at": "document_end"
+        },
+        {
+            "matches": ["https://*.usvisascheduling.com/*/appointment-confirmation/*"],
+            "css": ["css/sweetalert2.min.css"],
+            "js": [ "js/sweetalert2.min.js", "js/html2pdf.bundle.min.js"],
+            "run_at": "document_start"
+        }
+    ],
+    "permissions": ["storage", "activeTab", "scripting"],
+    "host_permissions": [
+        "https://*.usvisascheduling.com/*",
+        "https://atlasauth.b2clogin.com/*"
+    ],
+    "web_accessible_resources": [
+        {
+            "matches": ["<all_urls>"],
+            "resources": ["popup.html"],
+            "use_dynamic_url": true
+        }
+    ],
+    "externally_connectable": {
+        "matches": ["https://*.checkvisaslots.com/*"]
+    }
+}

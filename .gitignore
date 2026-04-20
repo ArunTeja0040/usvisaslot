@@ -10,3 +10,6 @@ downloads/
 extension_source/
 test_report.html
 .pytest_cache/
+.chrome_profile/
+.bot_chrome_profile/
+.bot_chrome_data/
