@@ -162,6 +162,10 @@ class MockPage:
         return MagicMock()
 
     def locator(self, selector):
+        # Exact match first
+        if selector in self._locators:
+            return self._locators[selector]
+        # Substring match as fallback
         for key, loc in self._locators.items():
             if key in selector or selector in key:
                 return loc

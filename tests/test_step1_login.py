@@ -115,8 +115,20 @@ class TestStep1Login:
         page.set_locator("#password", MockLocator(visible=True, count=1))
         page.set_locator("#captchaImage", MockLocator(visible=False, count=0))
 
+        # Continue button keeps URL on B2C (login failed)
         continue_btn = MockLocator(visible=True, count=1)
+        continue_btn.click = lambda: setattr(page, 'url', 'https://atlasauth.b2clogin.com/login')
         page.set_locator("#continue", continue_btn)
+
+        # Not on security questions page
+        page.set_locator("#signInNameReadOnly", MockLocator(visible=False, count=0))
+
+        # Override goto to stay on B2C
+        original_goto = page.goto
+        def stay_on_b2c(url, **kwargs):
+            original_goto(url, **kwargs)
+            page.url = "https://atlasauth.b2clogin.com/login"
+        page.goto = stay_on_b2c
 
         # Error shown after submit
         page.set_locator("#claimVerificationServerError", MockLocator(

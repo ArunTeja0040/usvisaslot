@@ -36,8 +36,15 @@ def book_ofc(page: Page, user: UserProfile) -> BookingResult | None:
     # Navigate to OFC booking page
     current_url = page.url.lower()
     if "ofc-schedule" not in current_url:
-        page.goto(f"{BASE_URL}/ofc-schedule", wait_until="domcontentloaded", timeout=20000)
-    page.wait_for_timeout(random.randint(1000, 2000))
+        page.goto(f"{BASE_URL}/ofc-schedule", wait_until="commit", timeout=30000)
+    page.wait_for_timeout(random.randint(2000, 4000))
+
+    # Handle Cloudflare block
+    from cloudflare import wait_for_cloudflare, is_blocked
+    if is_blocked(page):
+        if not wait_for_cloudflare(page, user.name, max_wait=60):
+            notify_error(user.name, "Blocked by Cloudflare on OFC page", chat_id)
+            return None
 
     # Wait for the consulate dropdown to appear
     try:
