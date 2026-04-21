@@ -55,6 +55,17 @@
     return null;
   }
 
+  function clickSafe(el) {
+    if (!el) return;
+    // Strip javascript: href to avoid CSP violation, then restore after click
+    const href = el.getAttribute("href");
+    if (href && href.trimStart().startsWith("javascript:")) {
+      el.removeAttribute("href");
+    }
+    el.click();
+    if (href) el.setAttribute("href", href);
+  }
+
   async function handleCaptcha(settings) {
     const captchaImg = document.getElementById("captchaImage");
     const captchaInput = document.getElementById(
@@ -88,7 +99,7 @@
       const answer = await solveCaptchaOCR(captchaImg);
       if (!answer) {
         log(`Attempt ${attempt}: OCR failed, refreshing...`);
-        if (refreshBtn) refreshBtn.click();
+        clickSafe(refreshBtn);
         await sleep(2000);
         continue;
       }
@@ -105,7 +116,7 @@
       const errorEl = document.getElementById("claimVerificationServerError");
       if (errorEl && errorEl.textContent.toLowerCase().includes("captcha")) {
         log(`Attempt ${attempt}: CAPTCHA failed, retrying...`);
-        if (refreshBtn) refreshBtn.click();
+        clickSafe(refreshBtn);
         await sleep(2000);
         continue;
       }
@@ -164,14 +175,280 @@
     }
   }
 
+  // ─── SETTINGS PANEL (injected on login page) ─────────────────────
+
+  const SECURITY_QUESTIONS = [
+    "Where did you meet your spouse?",
+    "What is your sibling's middle name?",
+    "Who was your childhood hero?",
+    "In what city or town was your first job?",
+    "What is the name of a college you applied to but didn't attend?",
+    "What is the name of the road/street you grew up on?",
+    "What is your least favorite food?",
+    "What was the first company that you worked for?",
+    "What is your favorite food?",
+    "What high school did you attend?",
+    "What is your mother's maiden name?",
+    "What was the name of your first/current/favorite pet?",
+    "What was your first car?",
+    "What elementary school did you attend?",
+    "What is the name of the town/city where you were born?",
+  ];
+
+  const OFC_LOCATIONS = [
+    "CHENNAI VAC", "HYDERABAD VAC", "KOLKATA VAC", "MUMBAI VAC", "NEW DELHI VAC",
+  ];
+  const CA_LOCATIONS = [
+    "CHENNAI", "HYDERABAD", "KOLKATA", "MUMBAI", "NEW DELHI",
+  ];
+
+  function buildQuestionOptions() {
+    return '<option value="">-- Select --</option>' +
+      SECURITY_QUESTIONS.map((q) => `<option value="${q}">${q}</option>`).join("");
+  }
+
+  function buildLocationCheckboxes(locations, prefix) {
+    return locations
+      .map(
+        (loc) =>
+          `<label style="display:inline-flex;align-items:center;gap:3px;margin-right:10px;font-size:12px;cursor:pointer;">
+            <input type="checkbox" class="sp-loc-${prefix}" value="${loc}" style="cursor:pointer;"> ${loc}
+          </label>`
+      )
+      .join("");
+  }
+
+  function injectSettingsPanel() {
+    if (document.getElementById("sp-panel")) return;
+
+    const target = document.getElementById("api") || document.body;
+
+    const qOpts = buildQuestionOptions();
+
+    const panel = document.createElement("div");
+    panel.id = "sp-panel";
+    panel.style.cssText =
+      "position:fixed;top:10px;right:10px;width:420px;max-height:90vh;overflow-y:auto;z-index:99999;" +
+      "box-shadow:0 4px 20px rgba(0,0,0,0.3);border-radius:8px;font-family:Arial,sans-serif;font-size:13px;";
+    panel.innerHTML = `
+      <div id="sp-header" style="background:#1a5276;color:white;padding:10px 14px;border-radius:8px 8px 0 0;display:flex;justify-content:space-between;align-items:center;cursor:pointer;">
+        <strong>Auto-Booking Settings</strong>
+        <span id="sp-toggle" style="font-size:18px;line-height:1;">&#9660;</span>
+      </div>
+      <div id="sp-body" style="background:white;padding:14px;border:1px solid #ddd;border-top:none;border-radius:0 0 8px 8px;">
+
+        <!-- Login Credentials -->
+        <div style="margin-bottom:12px;">
+          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Login Credentials</div>
+          <div style="display:flex;gap:8px;margin-bottom:6px;">
+            <input type="text" id="sp-username" placeholder="Email / Username" style="flex:1;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;">
+            <input type="password" id="sp-password" placeholder="Password" style="flex:1;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;">
+          </div>
+        </div>
+
+        <!-- Security Questions -->
+        <div style="margin-bottom:12px;">
+          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Security Questions</div>
+          ${[1, 2, 3]
+            .map(
+              (n) => `
+            <div style="margin-bottom:6px;">
+              <select id="sp-q${n}" style="width:100%;padding:4px;border:1px solid #ccc;border-radius:4px;font-size:11px;margin-bottom:3px;">${qOpts}</select>
+              <input type="text" id="sp-a${n}" placeholder="Answer ${n}" style="width:100%;padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;">
+            </div>`
+            )
+            .join("")}
+        </div>
+
+        <!-- Automation Toggles -->
+        <div style="margin-bottom:12px;">
+          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Automation</div>
+          <label style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer;">
+            <input type="checkbox" id="sp-auto-login" checked> Auto-fill Login
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer;">
+            <input type="checkbox" id="sp-auto-dashboard" checked> Auto-navigate Dashboard
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer;">
+            <input type="checkbox" id="sp-auto-select"> Auto-select Earliest Slot
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer;">
+            <input type="checkbox" id="sp-auto-submit"> Auto-submit Booking
+          </label>
+          <div style="margin-top:6px;">
+            <strong style="font-size:12px;">CAPTCHA:</strong>
+            <label style="margin-left:8px;cursor:pointer;"><input type="radio" name="sp-captcha" value="manual" checked> Manual</label>
+            <label style="margin-left:8px;cursor:pointer;"><input type="radio" name="sp-captcha" value="auto"> Auto (OCR)</label>
+          </div>
+        </div>
+
+        <!-- Date Preferences -->
+        <div style="margin-bottom:12px;">
+          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Preferred Date Range</div>
+          <div style="display:flex;gap:8px;">
+            <label style="flex:1;font-size:12px;">Start:
+              <input type="date" id="sp-start-date" style="width:100%;padding:4px;border:1px solid #ccc;border-radius:4px;">
+            </label>
+            <label style="flex:1;font-size:12px;">End:
+              <input type="date" id="sp-end-date" style="width:100%;padding:4px;border:1px solid #ccc;border-radius:4px;">
+            </label>
+          </div>
+        </div>
+
+        <!-- Location Preferences -->
+        <div style="margin-bottom:12px;">
+          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Preferred Locations</div>
+          <div style="margin-bottom:6px;">
+            <strong style="font-size:11px;color:#666;">OFC:</strong><br>
+            ${buildLocationCheckboxes(OFC_LOCATIONS, "ofc")}
+          </div>
+          <div>
+            <strong style="font-size:11px;color:#666;">Interview:</strong><br>
+            ${buildLocationCheckboxes(CA_LOCATIONS, "ca")}
+          </div>
+        </div>
+
+        <!-- Save -->
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button id="sp-save-btn"
+                  style="background:#27ae60;color:white;border:none;padding:8px 24px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:13px;flex:1;">
+            SAVE ALL SETTINGS
+          </button>
+          <span id="sp-save-status" style="font-size:12px;color:#27ae60;"></span>
+        </div>
+      </div>`;
+
+    target.insertBefore(panel, target.firstChild);
+
+    // Toggle collapse
+    document.getElementById("sp-header").addEventListener("click", () => {
+      const body = document.getElementById("sp-body");
+      const arrow = document.getElementById("sp-toggle");
+      if (body.style.display === "none") {
+        body.style.display = "block";
+        arrow.innerHTML = "&#9660;";
+      } else {
+        body.style.display = "none";
+        arrow.innerHTML = "&#9654;";
+      }
+    });
+
+    // Load saved settings
+    chrome.storage.local.get(
+      [
+        "loginDetails",
+        "securityQuestions",
+        "is_auto-login",
+        "is_auto-submit",
+        "is_auto-dashboard",
+        "is_sel-1st-slot",
+        "is_display-slots",
+        "captchaMode",
+        "preferred_window",
+        "preferred_locations",
+      ],
+      (data) => {
+        if (data.loginDetails) {
+          document.getElementById("sp-username").value = data.loginDetails.username || "";
+          document.getElementById("sp-password").value = data.loginDetails.password || "";
+        }
+
+        if (data.securityQuestions) {
+          const entries = Object.entries(data.securityQuestions);
+          entries.forEach(([q, a], idx) => {
+            const qEl = document.getElementById(`sp-q${idx + 1}`);
+            const aEl = document.getElementById(`sp-a${idx + 1}`);
+            if (qEl) qEl.value = q;
+            if (aEl) aEl.value = a;
+          });
+        }
+
+        document.getElementById("sp-auto-login").checked = data["is_auto-login"] !== false;
+        document.getElementById("sp-auto-dashboard").checked = data["is_auto-dashboard"] !== false;
+        document.getElementById("sp-auto-select").checked = data["is_sel-1st-slot"] !== false;
+        document.getElementById("sp-auto-submit").checked = data["is_auto-submit"] === true;
+
+        const mode = data.captchaMode || "manual";
+        const radio = document.querySelector(`input[name="sp-captcha"][value="${mode}"]`);
+        if (radio) radio.checked = true;
+
+        if (data.preferred_window) {
+          document.getElementById("sp-start-date").value = data.preferred_window.slot_start_date || "";
+          document.getElementById("sp-end-date").value = data.preferred_window.slot_end_date || "";
+        }
+
+        if (data.preferred_locations) {
+          if (data.preferred_locations.ofc) {
+            document.querySelectorAll(".sp-loc-ofc").forEach((cb) => {
+              cb.checked = data.preferred_locations.ofc.includes(cb.value);
+            });
+          }
+          if (data.preferred_locations.ca) {
+            document.querySelectorAll(".sp-loc-ca").forEach((cb) => {
+              cb.checked = data.preferred_locations.ca.includes(cb.value);
+            });
+          }
+        }
+      }
+    );
+
+    // Save handler
+    document.getElementById("sp-save-btn").addEventListener("click", () => {
+      const loginDetails = {
+        username: document.getElementById("sp-username").value,
+        password: document.getElementById("sp-password").value,
+      };
+
+      const securityQuestions = {};
+      for (let i = 1; i <= 3; i++) {
+        const q = document.getElementById(`sp-q${i}`).value;
+        const a = document.getElementById(`sp-a${i}`).value;
+        if (q && a) securityQuestions[q] = a;
+      }
+
+      const captchaMode = document.querySelector('input[name="sp-captcha"]:checked')?.value || "manual";
+
+      const ofcLocs = Array.from(document.querySelectorAll(".sp-loc-ofc:checked")).map((cb) => cb.value);
+      const caLocs = Array.from(document.querySelectorAll(".sp-loc-ca:checked")).map((cb) => cb.value);
+
+      chrome.storage.local.set(
+        {
+          loginDetails,
+          securityQuestions,
+          "is_auto-login": document.getElementById("sp-auto-login").checked,
+          "is_auto-dashboard": document.getElementById("sp-auto-dashboard").checked,
+          "is_sel-1st-slot": document.getElementById("sp-auto-select").checked,
+          "is_auto-submit": document.getElementById("sp-auto-submit").checked,
+          captchaMode,
+          preferred_window: {
+            slot_start_date: document.getElementById("sp-start-date").value,
+            slot_end_date: document.getElementById("sp-end-date").value,
+          },
+          preferred_locations: { ofc: ofcLocs, ca: caLocs },
+        },
+        () => {
+          const status = document.getElementById("sp-save-status");
+          status.textContent = "Saved!";
+          setTimeout(() => (status.textContent = ""), 3000);
+          log("All settings saved");
+        }
+      );
+    });
+
+    log("Settings panel injected on login page");
+  }
+
   // ─── LOGIN PAGE ─────────────────────────────────────────────────────
 
   async function handleLoginPage(settings) {
+    // Always inject settings panel on the login page
+    injectSettingsPanel();
+
     if (!settings["is_auto-login"]) return;
 
     const loginDetails = settings.loginDetails;
     if (!loginDetails || !loginDetails.username || !loginDetails.password) {
-      log("No login credentials configured");
+      log("No login credentials configured — fill in the settings panel");
       return;
     }
 
