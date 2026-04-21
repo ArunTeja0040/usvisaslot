@@ -195,41 +195,23 @@
     "What is the name of the town/city where you were born?",
   ];
 
-  const OFC_LOCATIONS = [
-    "CHENNAI VAC", "HYDERABAD VAC", "KOLKATA VAC", "MUMBAI VAC", "NEW DELHI VAC",
-  ];
-  const CA_LOCATIONS = [
-    "CHENNAI", "HYDERABAD", "KOLKATA", "MUMBAI", "NEW DELHI",
-  ];
-
   function buildQuestionOptions() {
     return '<option value="">-- Select --</option>' +
       SECURITY_QUESTIONS.map((q) => `<option value="${q}">${q}</option>`).join("");
   }
 
-  function buildLocationCheckboxes(locations, prefix) {
-    return locations
-      .map(
-        (loc) =>
-          `<label style="display:inline-flex;align-items:center;gap:3px;margin-right:10px;font-size:12px;cursor:pointer;">
-            <input type="checkbox" class="sp-loc-${prefix}" value="${loc}" style="cursor:pointer;"> ${loc}
-          </label>`
-      )
-      .join("");
-  }
-
   function injectSettingsPanel() {
     if (document.getElementById("sp-panel")) return;
 
-    const target = document.getElementById("api") || document.body;
+    const heading = document.querySelector("h1, .heading, #heading");
+    const target = heading ? heading.parentElement : document.getElementById("api") || document.body;
 
     const qOpts = buildQuestionOptions();
 
     const panel = document.createElement("div");
     panel.id = "sp-panel";
     panel.style.cssText =
-      "position:fixed;top:10px;right:10px;width:420px;max-height:90vh;overflow-y:auto;z-index:99999;" +
-      "box-shadow:0 4px 20px rgba(0,0,0,0.3);border-radius:8px;font-family:Arial,sans-serif;font-size:13px;";
+      "margin:10px auto 15px;max-width:960px;box-shadow:0 2px 10px rgba(0,0,0,0.15);border-radius:8px;font-family:Arial,sans-serif;font-size:13px;";
     panel.innerHTML = `
       <div id="sp-header" style="background:#1a5276;color:white;padding:10px 14px;border-radius:8px 8px 0 0;display:flex;justify-content:space-between;align-items:center;cursor:pointer;">
         <strong>Auto-Booking Settings</strong>
@@ -237,88 +219,59 @@
       </div>
       <div id="sp-body" style="background:white;padding:14px;border:1px solid #ddd;border-top:none;border-radius:0 0 8px 8px;">
 
-        <!-- Login Credentials -->
-        <div style="margin-bottom:12px;">
-          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Login Credentials</div>
-          <div style="display:flex;gap:8px;margin-bottom:6px;">
-            <input type="text" id="sp-username" placeholder="Email / Username" style="flex:1;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;">
-            <input type="password" id="sp-password" placeholder="Password" style="flex:1;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;">
+        <!-- Row 1: Credentials + Security Questions side by side -->
+        <div style="display:flex;gap:16px;margin-bottom:12px;">
+          <div style="flex:1;">
+            <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Login Credentials</div>
+            <input type="text" id="sp-username" placeholder="Email / Username" style="width:100%;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;margin-bottom:6px;">
+            <input type="password" id="sp-password" placeholder="Password" style="width:100%;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;">
+          </div>
+          <div style="flex:2;">
+            <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Security Questions</div>
+            ${[1, 2, 3]
+              .map(
+                (n) => `
+              <div style="display:flex;gap:6px;margin-bottom:4px;align-items:center;">
+                <select id="sp-q${n}" style="flex:2;padding:4px;border:1px solid #ccc;border-radius:4px;font-size:11px;">${qOpts}</select>
+                <input type="text" id="sp-a${n}" placeholder="Answer" style="flex:1;padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;">
+              </div>`
+              )
+              .join("")}
           </div>
         </div>
 
-        <!-- Security Questions -->
-        <div style="margin-bottom:12px;">
-          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Security Questions</div>
-          ${[1, 2, 3]
-            .map(
-              (n) => `
-            <div style="margin-bottom:6px;">
-              <select id="sp-q${n}" style="width:100%;padding:4px;border:1px solid #ccc;border-radius:4px;font-size:11px;margin-bottom:3px;">${qOpts}</select>
-              <input type="text" id="sp-a${n}" placeholder="Answer ${n}" style="width:100%;padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;">
-            </div>`
-            )
-            .join("")}
-        </div>
-
-        <!-- Automation Toggles -->
-        <div style="margin-bottom:12px;">
-          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Automation</div>
-          <label style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer;">
-            <input type="checkbox" id="sp-auto-login" checked> Auto-fill Login
+        <!-- Row 2: Automation toggles + Save -->
+        <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;">
+          <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
+            <input type="checkbox" id="sp-auto-login" checked> Auto-Login
           </label>
-          <label style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer;">
-            <input type="checkbox" id="sp-auto-dashboard" checked> Auto-navigate Dashboard
+          <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
+            <input type="checkbox" id="sp-auto-dashboard" checked> Auto-Dashboard
           </label>
-          <label style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer;">
-            <input type="checkbox" id="sp-auto-select"> Auto-select Earliest Slot
+          <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
+            <input type="checkbox" id="sp-auto-select"> Auto-Select Slot
           </label>
-          <label style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer;">
-            <input type="checkbox" id="sp-auto-submit"> Auto-submit Booking
+          <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
+            <input type="checkbox" id="sp-auto-submit"> Auto-Submit
           </label>
-          <div style="margin-top:6px;">
+          <span style="border-left:1px solid #ccc;padding-left:12px;display:inline-flex;gap:6px;align-items:center;">
             <strong style="font-size:12px;">CAPTCHA:</strong>
-            <label style="margin-left:8px;cursor:pointer;"><input type="radio" name="sp-captcha" value="manual" checked> Manual</label>
-            <label style="margin-left:8px;cursor:pointer;"><input type="radio" name="sp-captcha" value="auto"> Auto (OCR)</label>
-          </div>
-        </div>
-
-        <!-- Date Preferences -->
-        <div style="margin-bottom:12px;">
-          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Preferred Date Range</div>
-          <div style="display:flex;gap:8px;">
-            <label style="flex:1;font-size:12px;">Start:
-              <input type="date" id="sp-start-date" style="width:100%;padding:4px;border:1px solid #ccc;border-radius:4px;">
-            </label>
-            <label style="flex:1;font-size:12px;">End:
-              <input type="date" id="sp-end-date" style="width:100%;padding:4px;border:1px solid #ccc;border-radius:4px;">
-            </label>
-          </div>
-        </div>
-
-        <!-- Location Preferences -->
-        <div style="margin-bottom:12px;">
-          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Preferred Locations</div>
-          <div style="margin-bottom:6px;">
-            <strong style="font-size:11px;color:#666;">OFC:</strong><br>
-            ${buildLocationCheckboxes(OFC_LOCATIONS, "ofc")}
-          </div>
-          <div>
-            <strong style="font-size:11px;color:#666;">Interview:</strong><br>
-            ${buildLocationCheckboxes(CA_LOCATIONS, "ca")}
-          </div>
-        </div>
-
-        <!-- Save -->
-        <div style="display:flex;gap:8px;align-items:center;">
+            <label style="cursor:pointer;"><input type="radio" name="sp-captcha" value="manual" checked> Manual</label>
+            <label style="cursor:pointer;"><input type="radio" name="sp-captcha" value="auto"> Auto</label>
+          </span>
           <button id="sp-save-btn"
-                  style="background:#27ae60;color:white;border:none;padding:8px 24px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:13px;flex:1;">
-            SAVE ALL SETTINGS
+                  style="margin-left:auto;background:#27ae60;color:white;border:none;padding:6px 20px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:12px;">
+            SAVE
           </button>
           <span id="sp-save-status" style="font-size:12px;color:#27ae60;"></span>
         </div>
       </div>`;
 
-    target.insertBefore(panel, target.firstChild);
+    if (heading) {
+      heading.insertAdjacentElement("afterend", panel);
+    } else {
+      target.insertBefore(panel, target.firstChild);
+    }
 
     // Toggle collapse
     document.getElementById("sp-header").addEventListener("click", () => {
@@ -342,10 +295,7 @@
         "is_auto-submit",
         "is_auto-dashboard",
         "is_sel-1st-slot",
-        "is_display-slots",
         "captchaMode",
-        "preferred_window",
-        "preferred_locations",
       ],
       (data) => {
         if (data.loginDetails) {
@@ -372,23 +322,6 @@
         const radio = document.querySelector(`input[name="sp-captcha"][value="${mode}"]`);
         if (radio) radio.checked = true;
 
-        if (data.preferred_window) {
-          document.getElementById("sp-start-date").value = data.preferred_window.slot_start_date || "";
-          document.getElementById("sp-end-date").value = data.preferred_window.slot_end_date || "";
-        }
-
-        if (data.preferred_locations) {
-          if (data.preferred_locations.ofc) {
-            document.querySelectorAll(".sp-loc-ofc").forEach((cb) => {
-              cb.checked = data.preferred_locations.ofc.includes(cb.value);
-            });
-          }
-          if (data.preferred_locations.ca) {
-            document.querySelectorAll(".sp-loc-ca").forEach((cb) => {
-              cb.checked = data.preferred_locations.ca.includes(cb.value);
-            });
-          }
-        }
       }
     );
 
@@ -408,9 +341,6 @@
 
       const captchaMode = document.querySelector('input[name="sp-captcha"]:checked')?.value || "manual";
 
-      const ofcLocs = Array.from(document.querySelectorAll(".sp-loc-ofc:checked")).map((cb) => cb.value);
-      const caLocs = Array.from(document.querySelectorAll(".sp-loc-ca:checked")).map((cb) => cb.value);
-
       chrome.storage.local.set(
         {
           loginDetails,
@@ -420,11 +350,6 @@
           "is_sel-1st-slot": document.getElementById("sp-auto-select").checked,
           "is_auto-submit": document.getElementById("sp-auto-submit").checked,
           captchaMode,
-          preferred_window: {
-            slot_start_date: document.getElementById("sp-start-date").value,
-            slot_end_date: document.getElementById("sp-end-date").value,
-          },
-          preferred_locations: { ofc: ofcLocs, ca: caLocs },
         },
         () => {
           const status = document.getElementById("sp-save-status");
