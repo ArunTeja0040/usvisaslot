@@ -175,7 +175,10 @@
       return;
     }
 
-    // Wait for login form
+    // Mark that auto-booking.js is handling login (prevents content.js M() conflict)
+    if (window.__autoBookingLoginActive) return;
+    window.__autoBookingLoginActive = true;
+
     const waitForForm = setInterval(async () => {
       const userField = document.getElementById("signInName");
       const passField = document.getElementById("password");
@@ -184,13 +187,19 @@
       if (userField && passField && captchaImg) {
         clearInterval(waitForForm);
 
+        // Small delay to let content.js M()/A() run first if it will,
+        // then we overwrite with proper event dispatching
+        await sleep(600);
+
         log("Login form detected — auto-filling...");
         userField.value = loginDetails.username;
         userField.dispatchEvent(new Event("input", { bubbles: true }));
+        userField.dispatchEvent(new Event("change", { bubbles: true }));
         await sleep(300);
 
         passField.value = loginDetails.password;
         passField.dispatchEvent(new Event("input", { bubbles: true }));
+        passField.dispatchEvent(new Event("change", { bubbles: true }));
         await sleep(300);
 
         await handleCaptcha(settings);
@@ -327,10 +336,11 @@
     }
   }
 
-  // Wait for document ready then init
-  if (document.readyState === "complete") {
-    init();
-  } else {
+  // Content scripts at document_end run after DOMContentLoaded,
+  // so readyState is "interactive" and the event already fired.
+  if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
   }
 })();

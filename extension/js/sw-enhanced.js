@@ -10,8 +10,9 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
           extVersion: chrome.runtime.getManifest().version,
           "is_display-slots": t["is_display-slots"] ?? true,
           "is_sel-1st-slot": t["is_sel-1st-slot"] ?? true,
-          "is_auto-login": t["is_auto-login"] ?? false,
+          "is_auto-login": t["is_auto-login"] ?? true,
           "is_auto-submit": t["is_auto-submit"] ?? false,
+          "is_auto-dashboard": t["is_auto-dashboard"] ?? true,
           captchaMode: t["captchaMode"] ?? "manual",
         },
         function () {
@@ -45,21 +46,7 @@ chrome.runtime.onMessageExternal.addListener((e, t, s) => {
 });
 
 chrome.action.onClicked.addListener((tab) => {
-  chrome.tabs.sendMessage(tab.id, "toggle", (t) => {
-    chrome.runtime.lastError;
-    chrome.scripting.insertCSS(
-      { target: { tabId: tab.id }, files: ["css/sidebar.css"] },
-      () => {
-        let err = chrome.runtime.lastError;
-        if (err) console.log(err.message);
-        else
-          chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            files: ["js/sidebarr.js"],
-          });
-      }
-    );
-  });
+  chrome.runtime.openOptionsPage();
 });
 
 // CAPTCHA solving via offscreen canvas in service worker
@@ -117,39 +104,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // CAPTCHA solving request from content script
   if (msg.action === "solveCaptcha") {
     (async () => {
-      // Try local OCR first
-      let result = await solveCaptchaLocal(msg.imageBase64);
-
-      // If local fails, try the extension's API (if user has API key)
-      if (!result) {
-        try {
-          const settings = await chrome.storage.local.get(["apiKey"]);
-          if (settings.apiKey) {
-            const resp = await fetch(
-              "https://app.checkvisaslots.com/captcha/solve",
-              {
-                method: "POST",
-                headers: {
-                  "x-api-key": settings.apiKey,
-                  "Content-Type": "application/json",
-                },
-                body: JSON.stringify({ image: msg.imageBase64 }),
-              }
-            );
-            if (resp.ok) {
-              const data = await resp.json();
-              if (data && data.text) {
-                sendResponse({ text: data.text });
-                return;
-              }
-            }
+      try {
+        const resp = await fetch("http://localhost:5123/solve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ image: msg.imageBase64 }),
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          if (data && data.text) {
+            console.log("CAPTCHA solved:", data.text);
+            sendResponse({ text: data.text });
+            return;
           }
-        } catch (e) {
-          console.log("API CAPTCHA error:", e);
         }
+      } catch (e) {
+        console.log("Local CAPTCHA server error:", e);
       }
-
-      sendResponse({ text: result });
+      sendResponse({ text: null });
     })();
     return true;
   }

@@ -27,12 +27,6 @@
             "run_at": "document_end"
         },
         {
-            "matches": ["https://atlasauth.b2clogin.com/*"],
-            "js": ["js/sidebarl.js"],
-            "css": ["css/sidebar.css"],
-            "run_at": "document_end"
-        },
-        {
             "matches": ["https://*.usvisascheduling.com/*/appointment-confirmation/*"],
             "css": ["css/sweetalert2.min.css"],
             "js": [ "js/sweetalert2.min.js", "js/html2pdf.bundle.min.js"],
@@ -42,7 +36,8 @@
     "permissions": ["storage", "activeTab", "scripting"],
     "host_permissions": [
         "https://*.usvisascheduling.com/*",
-        "https://atlasauth.b2clogin.com/*"
+        "https://atlasauth.b2clogin.com/*",
+        "http://localhost/*"
     ],
     "web_accessible_resources": [
         {
