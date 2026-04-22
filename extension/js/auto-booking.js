@@ -4,6 +4,15 @@
   const LOG_PREFIX = "[AutoBook]";
   const CAPTCHA_MAX_RETRIES = 5;
   const DASHBOARD_CLICK_DELAY = 2000;
+  const STARTED_FLAG = "__autoBookingStarted";
+
+  function isStarted() {
+    return sessionStorage.getItem(STARTED_FLAG) === "true";
+  }
+
+  function markStarted() {
+    sessionStorage.setItem(STARTED_FLAG, "true");
+  }
 
   function log(msg) {
     console.log(`${LOG_PREFIX} ${msg}`);
@@ -375,6 +384,7 @@
         if (body) body.style.display = "none";
         document.getElementById("sp-toggle").innerHTML = "&#9654;";
 
+        markStarted();
         window.__autoBookingLoginActive = false;
         getSettings().then((s) => runLogin(s));
       }, 500);
@@ -435,6 +445,7 @@
     // If re-login flag is set (session expired during cycling), auto-login immediately
     if (sessionStorage.getItem(RELOGIN_FLAG) === "true") {
       sessionStorage.removeItem(RELOGIN_FLAG);
+      markStarted();
       log("Re-login triggered after session expiry — auto-starting...");
       await sleep(1500);
       const settings = await getSettings();
@@ -450,6 +461,11 @@
   // ─── DASHBOARD ──────────────────────────────────────────────────────
 
   async function handleDashboard(settings) {
+    if (!isStarted()) {
+      log("Dashboard: not started — skipping auto-navigate");
+      return;
+    }
+
     // After re-login, always auto-navigate to booking page
     const savedState = getReloginState();
     if (savedState && savedState.active) {
@@ -1048,7 +1064,7 @@
       return;
     }
 
-    if (settings["is_auto-submit"] && !cycling.active) {
+    if (isStarted() && settings["is_auto-submit"] && !cycling.active) {
       setupAutoSubmit();
     }
   }
