@@ -209,6 +209,152 @@
       SECURITY_QUESTIONS.map((q) => `<option value="${q}">${q}</option>`).join("");
   }
 
+  // ─── MULTI-USER HELPERS ──────────────────────────────────────────────
+
+  function getSavedUsers() {
+    return new Promise((resolve) => {
+      chrome.storage.local.get(["savedUsers"], (data) => {
+        resolve(data.savedUsers || []);
+      });
+    });
+  }
+
+  function saveUsers(users) {
+    return new Promise((resolve) => {
+      chrome.storage.local.set({ savedUsers: users }, resolve);
+    });
+  }
+
+  function getFormUserData() {
+    const username = document.getElementById("sp-username").value.trim();
+    const password = document.getElementById("sp-password").value;
+    const securityQuestions = {};
+    for (let i = 1; i <= 3; i++) {
+      const q = document.getElementById(`sp-q${i}`).value;
+      const a = document.getElementById(`sp-a${i}`).value;
+      if (q && a) securityQuestions[q] = a;
+    }
+    const label = document.getElementById("sp-label").value.trim() || username.split("@")[0] || "User";
+    return { label, username, password, securityQuestions };
+  }
+
+  function setActiveUser(user) {
+    chrome.storage.local.set({
+      loginDetails: { username: user.username, password: user.password },
+      securityQuestions: user.securityQuestions || {},
+    });
+  }
+
+  function renderUserList(users) {
+    const container = document.getElementById("sp-user-list");
+    if (!container) return;
+
+    if (users.length === 0) {
+      container.innerHTML = '<div style="color:#999;font-size:12px;padding:4px 0;">No saved users. Add one below.</div>';
+      return;
+    }
+
+    container.innerHTML = users
+      .map(
+        (u, idx) => `
+      <div style="display:flex;align-items:center;gap:6px;padding:5px 0;${idx < users.length - 1 ? "border-bottom:1px solid #f0f0f0;" : ""}">
+        <div style="flex:1;min-width:0;">
+          <div style="font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${u.label || u.username.split("@")[0]}</div>
+          <div style="font-size:11px;color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${u.username}</div>
+        </div>
+        <button class="sp-user-start" data-idx="${idx}"
+                style="background:#27ae60;color:white;border:none;padding:4px 14px;border-radius:4px;cursor:pointer;font-weight:bold;font-size:11px;white-space:nowrap;">
+          START
+        </button>
+        <button class="sp-user-edit" data-idx="${idx}"
+                style="background:#2980b9;color:white;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px;">
+          Edit
+        </button>
+        <button class="sp-user-del" data-idx="${idx}"
+                style="background:#e74c3c;color:white;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;font-size:11px;">
+          X
+        </button>
+      </div>`
+      )
+      .join("");
+
+    // START buttons
+    container.querySelectorAll(".sp-user-start").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const idx = parseInt(btn.dataset.idx);
+        const users = await getSavedUsers();
+        const user = users[idx];
+        if (!user) return;
+
+        setActiveUser(user);
+        saveAutomationSettings();
+
+        const body = document.getElementById("sp-body");
+        if (body) body.style.display = "none";
+        document.getElementById("sp-toggle").innerHTML = "&#9654;";
+
+        markStarted();
+        window.__autoBookingLoginActive = false;
+        getSettings().then((s) => runLogin(s));
+      });
+    });
+
+    // Edit buttons
+    container.querySelectorAll(".sp-user-edit").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const idx = parseInt(btn.dataset.idx);
+        const users = await getSavedUsers();
+        const user = users[idx];
+        if (!user) return;
+
+        document.getElementById("sp-label").value = user.label || "";
+        document.getElementById("sp-username").value = user.username || "";
+        document.getElementById("sp-password").value = user.password || "";
+
+        for (let i = 1; i <= 3; i++) {
+          document.getElementById(`sp-q${i}`).value = "";
+          document.getElementById(`sp-a${i}`).value = "";
+        }
+        if (user.securityQuestions) {
+          Object.entries(user.securityQuestions).forEach(([q, a], i) => {
+            const qEl = document.getElementById(`sp-q${i + 1}`);
+            const aEl = document.getElementById(`sp-a${i + 1}`);
+            if (qEl) qEl.value = q;
+            if (aEl) aEl.value = a;
+          });
+        }
+
+        document.getElementById("sp-editing-idx").value = idx;
+        document.getElementById("sp-form-title").textContent = "Edit User";
+        document.getElementById("sp-form-section").style.display = "block";
+      });
+    });
+
+    // Delete buttons
+    container.querySelectorAll(".sp-user-del").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const idx = parseInt(btn.dataset.idx);
+        const users = await getSavedUsers();
+        users.splice(idx, 1);
+        await saveUsers(users);
+        renderUserList(users);
+      });
+    });
+  }
+
+  function saveAutomationSettings() {
+    const captchaMode = document.querySelector('input[name="sp-captcha"]:checked')?.value || "manual";
+    chrome.storage.local.set({
+      "is_auto-login": document.getElementById("sp-auto-login").checked,
+      "is_auto-dashboard": document.getElementById("sp-auto-dashboard").checked,
+      "is_sel-1st-slot": document.getElementById("sp-auto-select").checked,
+      "is_auto-submit": document.getElementById("sp-auto-submit").checked,
+      captchaMode,
+    });
+  }
+
+  // ─── SETTINGS PANEL ────────────────────────────────────────────────
+
   function injectSettingsPanel() {
     if (document.getElementById("sp-panel")) return;
 
@@ -226,27 +372,47 @@
       </div>
       <div id="sp-body" style="background:white;padding:14px;border:1px solid #ddd;border-top:none;border-radius:0 0 8px 8px;">
 
-        <!-- Login Credentials -->
+        <!-- Saved Users List -->
         <div style="margin-bottom:10px;">
-          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Login Credentials</div>
-          <div style="display:flex;gap:8px;">
+          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;display:flex;justify-content:space-between;align-items:center;">
+            Saved Users
+            <button id="sp-add-user-btn" style="background:#1a5276;color:white;border:none;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px;">+ Add User</button>
+          </div>
+          <div id="sp-user-list"></div>
+        </div>
+
+        <!-- Add/Edit User Form (hidden by default) -->
+        <div id="sp-form-section" style="display:none;margin-bottom:10px;border:1px solid #ddd;border-radius:6px;padding:10px;background:#fafafa;">
+          <input type="hidden" id="sp-editing-idx" value="-1">
+          <div id="sp-form-title" style="font-weight:bold;margin-bottom:6px;color:#1a5276;">Add New User</div>
+
+          <input type="text" id="sp-label" placeholder="Display Name (e.g. Kavita)" style="width:100%;padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;margin-bottom:6px;box-sizing:border-box;">
+          <div style="display:flex;gap:8px;margin-bottom:6px;">
             <input type="text" id="sp-username" placeholder="Email / Username" style="flex:1;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;">
             <input type="password" id="sp-password" placeholder="Password" style="flex:1;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;">
           </div>
-        </div>
 
-        <!-- Security Questions -->
-        <div style="margin-bottom:10px;">
-          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Security Questions</div>
+          <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#555;">Security Questions</div>
           ${[1, 2, 3]
             .map(
               (n) => `
-            <div style="margin-bottom:6px;">
-              <select id="sp-q${n}" style="width:100%;padding:4px;border:1px solid #ccc;border-radius:4px;font-size:11px;margin-bottom:3px;">${qOpts}</select>
+            <div style="margin-bottom:5px;">
+              <select id="sp-q${n}" style="width:100%;padding:4px;border:1px solid #ccc;border-radius:4px;font-size:11px;margin-bottom:2px;">${qOpts}</select>
               <input type="text" id="sp-a${n}" placeholder="Answer ${n}" style="width:100%;padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;box-sizing:border-box;">
             </div>`
             )
             .join("")}
+
+          <div style="display:flex;gap:8px;margin-top:6px;">
+            <button id="sp-save-user-btn"
+                    style="background:#27ae60;color:white;border:none;padding:6px 18px;border-radius:4px;cursor:pointer;font-weight:bold;font-size:12px;">
+              Save User
+            </button>
+            <button id="sp-cancel-btn"
+                    style="background:#95a5a6;color:white;border:none;padding:6px 18px;border-radius:4px;cursor:pointer;font-size:12px;">
+              Cancel
+            </button>
+          </div>
         </div>
 
         <!-- Automation toggles -->
@@ -273,18 +439,6 @@
           </div>
         </div>
 
-        <!-- Buttons -->
-        <div style="display:flex;gap:8px;align-items:center;">
-          <button id="sp-save-btn"
-                  style="background:#2c3e50;color:white;border:none;padding:8px 20px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:13px;">
-            SAVE
-          </button>
-          <button id="sp-start-btn"
-                  style="flex:1;background:#27ae60;color:white;border:none;padding:8px 20px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:13px;">
-            SAVE & START
-          </button>
-          <span id="sp-save-status" style="font-size:12px;color:#27ae60;"></span>
-        </div>
       </div>`;
 
     document.body.appendChild(panel);
@@ -302,92 +456,93 @@
       }
     });
 
-    // Load saved settings
+    // Load saved automation settings
     chrome.storage.local.get(
-      [
-        "loginDetails",
-        "securityQuestions",
-        "is_auto-login",
-        "is_auto-submit",
-        "is_auto-dashboard",
-        "is_sel-1st-slot",
-        "captchaMode",
-      ],
+      ["is_auto-login", "is_auto-submit", "is_auto-dashboard", "is_sel-1st-slot", "captchaMode"],
       (data) => {
-        if (data.loginDetails) {
-          document.getElementById("sp-username").value = data.loginDetails.username || "";
-          document.getElementById("sp-password").value = data.loginDetails.password || "";
-        }
-
-        if (data.securityQuestions) {
-          const entries = Object.entries(data.securityQuestions);
-          entries.forEach(([q, a], idx) => {
-            const qEl = document.getElementById(`sp-q${idx + 1}`);
-            const aEl = document.getElementById(`sp-a${idx + 1}`);
-            if (qEl) qEl.value = q;
-            if (aEl) aEl.value = a;
-          });
-        }
-
         document.getElementById("sp-auto-login").checked = data["is_auto-login"] !== false;
         document.getElementById("sp-auto-dashboard").checked = data["is_auto-dashboard"] !== false;
         document.getElementById("sp-auto-select").checked = data["is_sel-1st-slot"] !== false;
         document.getElementById("sp-auto-submit").checked = data["is_auto-submit"] === true;
-
         const mode = data.captchaMode || "manual";
         const radio = document.querySelector(`input[name="sp-captcha"][value="${mode}"]`);
         if (radio) radio.checked = true;
-
       }
     );
 
-    // Save handler
-    document.getElementById("sp-save-btn").addEventListener("click", () => {
-      const loginDetails = {
-        username: document.getElementById("sp-username").value,
-        password: document.getElementById("sp-password").value,
-      };
+    // Auto-save automation toggles on change
+    document.querySelectorAll("#sp-panel .custom-cb").forEach((el) =>
+      el.addEventListener("change", saveAutomationSettings)
+    );
+    ["sp-auto-login", "sp-auto-dashboard", "sp-auto-select", "sp-auto-submit"].forEach((id) => {
+      document.getElementById(id).addEventListener("change", saveAutomationSettings);
+    });
+    document.querySelectorAll('input[name="sp-captcha"]').forEach((r) =>
+      r.addEventListener("change", saveAutomationSettings)
+    );
 
-      const securityQuestions = {};
-      for (let i = 1; i <= 3; i++) {
-        const q = document.getElementById(`sp-q${i}`).value;
-        const a = document.getElementById(`sp-a${i}`).value;
-        if (q && a) securityQuestions[q] = a;
+    // Load and render saved users (migrate single-user data if needed)
+    getSavedUsers().then((users) => {
+      if (users.length === 0) {
+        chrome.storage.local.get(["loginDetails", "securityQuestions"], (data) => {
+          if (data.loginDetails?.username) {
+            const migrated = {
+              label: data.loginDetails.username.split("@")[0],
+              username: data.loginDetails.username,
+              password: data.loginDetails.password || "",
+              securityQuestions: data.securityQuestions || {},
+            };
+            users.push(migrated);
+            saveUsers(users);
+            log("Migrated existing user to multi-user list");
+          }
+          renderUserList(users);
+        });
+      } else {
+        renderUserList(users);
       }
-
-      const captchaMode = document.querySelector('input[name="sp-captcha"]:checked')?.value || "manual";
-
-      chrome.storage.local.set(
-        {
-          loginDetails,
-          securityQuestions,
-          "is_auto-login": document.getElementById("sp-auto-login").checked,
-          "is_auto-dashboard": document.getElementById("sp-auto-dashboard").checked,
-          "is_sel-1st-slot": document.getElementById("sp-auto-select").checked,
-          "is_auto-submit": document.getElementById("sp-auto-submit").checked,
-          captchaMode,
-        },
-        () => {
-          const status = document.getElementById("sp-save-status");
-          status.textContent = "Saved!";
-          setTimeout(() => (status.textContent = ""), 3000);
-          log("All settings saved");
-        }
-      );
     });
 
-    // START button: save + trigger login
-    document.getElementById("sp-start-btn").addEventListener("click", () => {
-      document.getElementById("sp-save-btn").click();
-      setTimeout(() => {
-        const body = document.getElementById("sp-body");
-        if (body) body.style.display = "none";
-        document.getElementById("sp-toggle").innerHTML = "&#9654;";
+    // Add User button — show form
+    document.getElementById("sp-add-user-btn").addEventListener("click", () => {
+      document.getElementById("sp-editing-idx").value = "-1";
+      document.getElementById("sp-form-title").textContent = "Add New User";
+      document.getElementById("sp-label").value = "";
+      document.getElementById("sp-username").value = "";
+      document.getElementById("sp-password").value = "";
+      for (let i = 1; i <= 3; i++) {
+        document.getElementById(`sp-q${i}`).value = "";
+        document.getElementById(`sp-a${i}`).value = "";
+      }
+      document.getElementById("sp-form-section").style.display = "block";
+    });
 
-        markStarted();
-        window.__autoBookingLoginActive = false;
-        getSettings().then((s) => runLogin(s));
-      }, 500);
+    // Cancel button
+    document.getElementById("sp-cancel-btn").addEventListener("click", () => {
+      document.getElementById("sp-form-section").style.display = "none";
+    });
+
+    // Save User button
+    document.getElementById("sp-save-user-btn").addEventListener("click", async () => {
+      const userData = getFormUserData();
+      if (!userData.username || !userData.password) {
+        alert("Username and password are required.");
+        return;
+      }
+
+      const users = await getSavedUsers();
+      const editIdx = parseInt(document.getElementById("sp-editing-idx").value);
+
+      if (editIdx >= 0 && editIdx < users.length) {
+        users[editIdx] = userData;
+      } else {
+        users.push(userData);
+      }
+
+      await saveUsers(users);
+      renderUserList(users);
+      document.getElementById("sp-form-section").style.display = "none";
+      log("User saved: " + userData.label);
     });
 
     log("Settings panel injected on login page");
