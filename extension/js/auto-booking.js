@@ -962,9 +962,9 @@
         continue;
       }
 
-      // Dates in range found!
+      // Dates in range found — STOP cycling and let user act
       setStatus(
-        `${loc.name}: ${inRange.length} dates in range! Selecting ${inRange[0].Date}...`
+        `SLOTS FOUND at ${loc.name}: ${inRange.length} dates in range! Earliest: ${inRange[0].Date}`
       );
 
       // Let content.js finish processing (it auto-selects first date)
@@ -972,25 +972,29 @@
 
       // Select the first in-range date explicitly
       const targetDate = new Date(inRange[0].Date + "T00:00:00");
-      const selected = await selectDateInCalendar(targetDate);
+      await selectDateInCalendar(targetDate);
 
-      if (!selected) {
-        setStatus(`Could not click date at ${loc.name}`);
-        await sleep(2000);
-        continue;
-      }
-
-      // Wait for time slots to load and submit
+      // Wait for time slots to load
       await sleep(1500);
-      const submitted = await waitForTimeSlotAndSubmit(12000);
 
-      if (submitted) {
-        stopCycling("Booking submitted!");
-        return;
+      // If auto-submit is on, try to submit automatically
+      const autoSubmit = await new Promise((r) =>
+        chrome.storage.local.get(["is_auto-submit"], (d) => r(d["is_auto-submit"]))
+      );
+
+      if (autoSubmit) {
+        const submitted = await waitForTimeSlotAndSubmit(12000);
+        if (submitted) {
+          stopCycling("Booking submitted!");
+          return;
+        }
       }
 
-      setStatus(`${loc.name}: Date selected but no time slots appeared`);
-      await sleep(2000);
+      // Stop cycling — keep the slots visible for manual action
+      stopCycling(
+        `SLOTS FOUND at ${loc.name}! Cycling paused — submit manually or click START to resume.`
+      );
+      return;
     }
 
     // All locations checked — wait and repeat
