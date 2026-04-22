@@ -47,7 +47,11 @@
         imageBase64: base64,
       });
       if (resp && resp.text) {
-        return resp.text.toUpperCase().trim();
+        // Clean: uppercase, keep only alphanumeric, must be exactly 5 chars
+        const cleaned = resp.text.toUpperCase().replace(/[^A-Z0-9]/g, "");
+        if (cleaned.length === 5) return cleaned;
+        log("OCR result rejected (not 5 chars): " + resp.text + " → " + cleaned);
+        return null;
       }
     } catch (e) {
       log("CAPTCHA solve error: " + e.message);

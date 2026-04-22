@@ -1,9 +1,14 @@
 import base64
+import re
 import ddddocr
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 
 ocr = ddddocr.DdddOcr(show_ad=False)
+
+def clean_captcha(text):
+    cleaned = re.sub(r'[^A-Za-z0-9]', '', text).upper()
+    return cleaned if len(cleaned) == 5 else text.upper().strip()
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -18,7 +23,9 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             image_bytes = base64.b64decode(image_b64)
-            result = ocr.classification(image_bytes)
+            raw = ocr.classification(image_bytes)
+            result = clean_captcha(raw)
+            print(f"[CAPTCHA] Raw: {raw} → Cleaned: {result}")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
