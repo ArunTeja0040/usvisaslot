@@ -4,27 +4,6 @@
   const LOG_PREFIX = "[AutoBook]";
   const CAPTCHA_MAX_RETRIES = 5;
   const DASHBOARD_CLICK_DELAY = 2000;
-  const STARTED_FLAG = "__abStarted";
-
-  function isStarted() {
-    return window.__abStartedCache === true;
-  }
-
-  function markStarted() {
-    window.__abStartedCache = true;
-    chrome.storage.session.set({ [STARTED_FLAG]: Date.now() });
-  }
-
-  async function loadStartedFlag() {
-    return new Promise((resolve) => {
-      chrome.storage.session.get([STARTED_FLAG], (data) => {
-        if (data[STARTED_FLAG]) {
-          window.__abStartedCache = true;
-        }
-        resolve();
-      });
-    });
-  }
 
   function log(msg) {
     console.log(`${LOG_PREFIX} ${msg}`);
@@ -78,6 +57,7 @@
 
   function clickSafe(el) {
     if (!el) return;
+    // Strip javascript: href to avoid CSP violation, then restore after click
     const href = el.getAttribute("href");
     if (href && href.trimStart().startsWith("javascript:")) {
       el.removeAttribute("href");
@@ -395,7 +375,6 @@
         if (body) body.style.display = "none";
         document.getElementById("sp-toggle").innerHTML = "&#9654;";
 
-        markStarted();
         window.__autoBookingLoginActive = false;
         getSettings().then((s) => runLogin(s));
       }, 500);
@@ -451,23 +430,11 @@
   // ─── LOGIN PAGE (panel only — waits for START, unless re-login) ────
 
   async function handleLoginPage() {
-    // B2C page loads dynamically and may overwrite body — keep retrying
-    function ensurePanel() {
-      if (!document.getElementById("sp-panel")) {
-        injectSettingsPanel();
-      }
-    }
-    ensurePanel();
-    const panelWatch = setInterval(ensurePanel, 1000);
-    setTimeout(() => clearInterval(panelWatch), 30000);
+    injectSettingsPanel();
 
     // If re-login flag is set (session expired during cycling), auto-login immediately
-    const reloginData = await new Promise((r) =>
-      chrome.storage.session.get(["__abRelogin"], (d) => r(d))
-    );
-    if (reloginData["__abRelogin"]) {
-      chrome.storage.session.remove("__abRelogin");
-      markStarted();
+    if (sessionStorage.getItem(RELOGIN_FLAG) === "true") {
+      sessionStorage.removeItem(RELOGIN_FLAG);
       log("Re-login triggered after session expiry — auto-starting...");
       await sleep(1500);
       const settings = await getSettings();
@@ -483,22 +450,21 @@
   // ─── DASHBOARD ──────────────────────────────────────────────────────
 
   async function handleDashboard(settings) {
-    if (!isStarted()) {
-      log("Dashboard: not started — skipping auto-navigate");
-      return;
-    }
-
     // After re-login, always auto-navigate to booking page
-    const savedState = await getReloginState();
+    const savedState = getReloginState();
     if (savedState && savedState.active) {
       log("Re-login complete — auto-navigating from dashboard...");
     } else if (!settings["is_auto-dashboard"]) {
       return;
     }
 
-    if (isRateLimited()) {
-      doLogout();
-      return;
+    const warning = document.querySelector(".alert-warning.warning");
+    if (warning) {
+      const text = warning.textContent.trim().toLowerCase();
+      if (text.includes("exceeded") || text.includes("maximum")) {
+        log("Rate limited: " + text);
+        return;
+      }
     }
 
     const waitForBtn = setInterval(() => {
@@ -642,63 +608,40 @@
     if (el) el.textContent = msg;
   }
 
-  // ─── RATE LIMIT DETECTION & AUTO-LOGOUT ─────────────────────────────
-
-  function isRateLimited() {
-    const warning = document.querySelector(".alert-warning.warning, .alert.alert-warning");
-    if (!warning) return false;
-    const text = warning.textContent.trim().toLowerCase();
-    return text.includes("maximum number of times") || text.includes("approaching the maximum");
-  }
-
-  function doLogout() {
-    log("Rate limit warning — logging out to protect session...");
-    stopCycling("Rate limited — logging out...");
-    const logoutLink = document.querySelector('a[href*="logout"], a[href*="Logout"], a[href*="signout"], a[href*="SignOut"]');
-    if (logoutLink) {
-      logoutLink.click();
-      return;
-    }
-    const base = window.location.origin;
-    window.location.href = base + "/en-US/logout/";
-  }
-
   // ─── SESSION KEEP-ALIVE & 401 RECOVERY ─────────────────────────────
 
+  // Listen for 401 events dispatched by XHR/fetch on the page
+  // page.js (MAIN world) fires vSCP events — we also listen for a custom 401 signal
   let __session401Detected = false;
 
+  // Inject a script into MAIN world to intercept XHR 401 responses
   function inject401Detector() {
-    const marker = document.createElement("div");
-    marker.id = "__ab401marker";
-    marker.style.display = "none";
-    document.documentElement.appendChild(marker);
-
     const script = document.createElement("script");
     script.textContent = `
       (function() {
-        var marker = document.getElementById("__ab401marker");
-        function signal401(url) {
-          console.log("[AutoBook] 401 detected:", url);
-          if (marker) marker.setAttribute("data-hit", Date.now());
-        }
-
-        var origOpen = XMLHttpRequest.prototype.open;
-        var origSend = XMLHttpRequest.prototype.send;
+        const origOpen = XMLHttpRequest.prototype.open;
+        const origSend = XMLHttpRequest.prototype.send;
         XMLHttpRequest.prototype.open = function(method, url) {
           this._abUrl = url;
           return origOpen.apply(this, arguments);
         };
         XMLHttpRequest.prototype.send = function() {
           this.addEventListener("load", function() {
-            if (this.status === 401) signal401(this._abUrl);
+            if (this.status === 401) {
+              console.log("[AutoBook] 401 detected on XHR:", this._abUrl);
+              window.dispatchEvent(new CustomEvent("__ab401", { detail: { url: this._abUrl } }));
+            }
           });
           return origSend.apply(this, arguments);
         };
 
-        var origFetch = window.fetch;
+        const origFetch = window.fetch;
         window.fetch = function() {
           return origFetch.apply(this, arguments).then(function(resp) {
-            if (resp.status === 401) signal401(resp.url);
+            if (resp.status === 401) {
+              console.log("[AutoBook] 401 detected on fetch:", resp.url);
+              window.dispatchEvent(new CustomEvent("__ab401", { detail: { url: resp.url } }));
+            }
             return resp;
           });
         };
@@ -706,13 +649,12 @@
     `;
     document.documentElement.appendChild(script);
     script.remove();
-
-    const observer = new MutationObserver(() => {
-      log("401 detected via DOM bridge");
-      __session401Detected = true;
-    });
-    observer.observe(marker, { attributes: true });
   }
+
+  window.addEventListener("__ab401", () => {
+    log("Received 401 signal from page");
+    __session401Detected = true;
+  });
 
   function isSessionExpired() {
     if (__session401Detected) return true;
@@ -734,7 +676,7 @@
         saveReloginState();
         window.location.reload();
       }
-    }, 30000);
+    }, 30000); // check every 30s
   }
 
   function stopKeepAlive() {
@@ -756,25 +698,27 @@
       ),
       timestamp: Date.now(),
     };
-    chrome.storage.session.set({ "__abCyclingState": state });
+    sessionStorage.setItem("ab-cycling-state", JSON.stringify(state));
   }
 
   function getReloginState() {
-    return new Promise((resolve) => {
-      chrome.storage.session.get(["__abCyclingState"], (data) => {
-        const state = data["__abCyclingState"];
-        if (!state) return resolve(null);
-        if (Date.now() - state.timestamp > 5 * 60 * 1000) {
-          chrome.storage.session.remove("__abCyclingState");
-          return resolve(null);
-        }
-        resolve(state);
-      });
-    });
+    try {
+      const raw = sessionStorage.getItem("ab-cycling-state");
+      if (!raw) return null;
+      const state = JSON.parse(raw);
+      // Only valid if saved within last 5 minutes
+      if (Date.now() - state.timestamp > 5 * 60 * 1000) {
+        sessionStorage.removeItem("ab-cycling-state");
+        return null;
+      }
+      return state;
+    } catch {
+      return null;
+    }
   }
 
   function clearReloginState() {
-    chrome.storage.session.remove("__abCyclingState");
+    sessionStorage.removeItem("ab-cycling-state");
   }
 
   async function handle401Recovery() {
@@ -783,7 +727,7 @@
     __session401Detected = false;
     stopCycling("Session expired — re-logging in...");
     saveReloginState();
-    chrome.storage.session.set({ "__abRelogin": true });
+    sessionStorage.setItem(RELOGIN_FLAG, "true");
     window.location.href = window.location.origin;
   }
 
@@ -806,6 +750,7 @@
     stopBtn.disabled = false;
     stopBtn.style.opacity = "1";
 
+    // Save current date preferences
     chrome.storage.local.set({
       preferred_window: {
         slot_start_date: document.getElementById("ab-start-date")?.value || "",
@@ -928,7 +873,7 @@
     if (!cycling.active) return;
 
     cycling.round++;
-    cycling.lastRefresh = Date.now();
+    cycling.lastRefresh = Date.now(); // reset keep-alive timer on each round
     const startDate = document.getElementById("ab-start-date")?.value || "";
     const endDate = document.getElementById("ab-end-date")?.value || "";
     const interval =
@@ -945,11 +890,6 @@
     for (let i = 0; i < locations.length; i++) {
       if (!cycling.active) return;
 
-      if (isRateLimited()) {
-        doLogout();
-        return;
-      }
-
       const loc = locations[i];
       setStatus(`Checking ${loc.name} (${i + 1}/${locations.length})...`);
 
@@ -959,17 +899,20 @@
         return;
       }
 
+      // Set up listener BEFORE changing dropdown
       const dataPromise = waitForScheduleData(15000);
 
       if (select.value !== loc.value) {
         select.value = loc.value;
         select.dispatchEvent(new Event("change", { bubbles: true }));
       } else {
+        // Same location already selected — re-trigger to refresh
         select.dispatchEvent(new Event("change", { bubbles: true }));
       }
 
       const data = await dataPromise;
 
+      // Check for 401 / session expiry after every network call
       if (isSessionExpired()) {
         await handle401Recovery();
         return;
@@ -982,6 +925,7 @@
         continue;
       }
 
+      // Filter dates within user's preferred range
       const inRange = data.ScheduleDays.filter((d) =>
         isDateInRange(d.Date, startDate, endDate)
       ).sort((a, b) => new Date(a.Date) - new Date(b.Date));
@@ -994,36 +938,38 @@
         continue;
       }
 
-      // Dates in range found — STOP cycling and let user act
+      // Dates in range found!
       setStatus(
-        `SLOTS FOUND at ${loc.name}: ${inRange.length} dates in range! Earliest: ${inRange[0].Date}`
+        `${loc.name}: ${inRange.length} dates in range! Selecting ${inRange[0].Date}...`
       );
 
+      // Let content.js finish processing (it auto-selects first date)
       await sleep(2000);
 
+      // Select the first in-range date explicitly
       const targetDate = new Date(inRange[0].Date + "T00:00:00");
-      await selectDateInCalendar(targetDate);
+      const selected = await selectDateInCalendar(targetDate);
 
-      await sleep(1500);
-
-      const autoSubmit = await new Promise((r) =>
-        chrome.storage.local.get(["is_auto-submit"], (d) => r(d["is_auto-submit"]))
-      );
-
-      if (autoSubmit) {
-        const submitted = await waitForTimeSlotAndSubmit(12000);
-        if (submitted) {
-          stopCycling("Booking submitted!");
-          return;
-        }
+      if (!selected) {
+        setStatus(`Could not click date at ${loc.name}`);
+        await sleep(2000);
+        continue;
       }
 
-      stopCycling(
-        `SLOTS FOUND at ${loc.name}! Cycling paused — submit manually or click START to resume.`
-      );
-      return;
+      // Wait for time slots to load and submit
+      await sleep(1500);
+      const submitted = await waitForTimeSlotAndSubmit(12000);
+
+      if (submitted) {
+        stopCycling("Booking submitted!");
+        return;
+      }
+
+      setStatus(`${loc.name}: Date selected but no time slots appeared`);
+      await sleep(2000);
     }
 
+    // All locations checked — wait and repeat
     if (!cycling.active) return;
     const sec = Math.round(interval / 1000);
     setStatus(`All locations checked. Next round in ${sec}s...`);
@@ -1065,19 +1011,16 @@
       attempts++;
     }
 
-    if (isRateLimited()) {
-      doLogout();
-      return;
-    }
-
     injectBookingPanel();
 
-    const savedState = await getReloginState();
+    // Restore cycling state after keep-alive refresh
+    const savedState = getReloginState();
     if (savedState && savedState.active) {
       log("Restoring cycling after page refresh...");
       clearReloginState();
       await sleep(1000);
 
+      // Restore form values
       const sd = document.getElementById("ab-start-date");
       const ed = document.getElementById("ab-end-date");
       const iv = document.getElementById("ab-interval");
@@ -1085,6 +1028,7 @@
       if (ed) ed.value = savedState.endDate;
       if (iv) iv.value = savedState.interval;
 
+      // Restore location checkboxes
       if (savedState.locations?.length > 0) {
         document.querySelectorAll(".ab-loc-cb").forEach((cb) => {
           cb.checked = savedState.locations.includes(cb.value);
@@ -1096,7 +1040,7 @@
       return;
     }
 
-    if (isStarted() && settings["is_auto-submit"] && !cycling.active) {
+    if (settings["is_auto-submit"] && !cycling.active) {
       setupAutoSubmit();
     }
   }
@@ -1104,11 +1048,11 @@
   // ─── MAIN ROUTER ───────────────────────────────────────────────────
 
   async function init() {
-    await loadStartedFlag();
     const settings = await getSettings();
     const path = window.location.pathname.toLowerCase();
     const host = window.location.hostname.toLowerCase();
 
+    // Inject 401 detector on scheduling pages (MAIN world XHR intercept)
     if (host.includes("usvisascheduling.com")) {
       inject401Detector();
     }
