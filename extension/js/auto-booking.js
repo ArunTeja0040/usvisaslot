@@ -4,14 +4,26 @@
   const LOG_PREFIX = "[AutoBook]";
   const CAPTCHA_MAX_RETRIES = 5;
   const DASHBOARD_CLICK_DELAY = 2000;
-  const STARTED_FLAG = "__autoBookingStarted";
+  const STARTED_FLAG = "__abStarted";
 
   function isStarted() {
-    return sessionStorage.getItem(STARTED_FLAG) === "true";
+    return window.__abStartedCache === true;
   }
 
   function markStarted() {
-    sessionStorage.setItem(STARTED_FLAG, "true");
+    window.__abStartedCache = true;
+    chrome.storage.session.set({ [STARTED_FLAG]: Date.now() });
+  }
+
+  async function loadStartedFlag() {
+    return new Promise((resolve) => {
+      chrome.storage.session.get([STARTED_FLAG], (data) => {
+        if (data[STARTED_FLAG]) {
+          window.__abStartedCache = true;
+        }
+        resolve();
+      });
+    });
   }
 
   function log(msg) {
@@ -598,8 +610,11 @@
     injectSettingsPanel();
 
     // If re-login flag is set (session expired during cycling), auto-login immediately
-    if (sessionStorage.getItem(RELOGIN_FLAG) === "true") {
-      sessionStorage.removeItem(RELOGIN_FLAG);
+    const reloginData = await new Promise((r) =>
+      chrome.storage.session.get(["__abRelogin"], (d) => r(d))
+    );
+    if (reloginData["__abRelogin"]) {
+      chrome.storage.session.remove("__abRelogin");
       markStarted();
       log("Re-login triggered after session expiry — auto-starting...");
       await sleep(1500);
@@ -622,7 +637,7 @@
     }
 
     // After re-login, always auto-navigate to booking page
-    const savedState = getReloginState();
+    const savedState = await getReloginState();
     if (savedState && savedState.active) {
       log("Re-login complete — auto-navigating from dashboard...");
     } else if (!settings["is_auto-dashboard"]) {
@@ -896,27 +911,25 @@
       ),
       timestamp: Date.now(),
     };
-    sessionStorage.setItem("ab-cycling-state", JSON.stringify(state));
+    chrome.storage.session.set({ "__abCyclingState": state });
   }
 
   function getReloginState() {
-    try {
-      const raw = sessionStorage.getItem("ab-cycling-state");
-      if (!raw) return null;
-      const state = JSON.parse(raw);
-      // Only valid if saved within last 5 minutes
-      if (Date.now() - state.timestamp > 5 * 60 * 1000) {
-        sessionStorage.removeItem("ab-cycling-state");
-        return null;
-      }
-      return state;
-    } catch {
-      return null;
-    }
+    return new Promise((resolve) => {
+      chrome.storage.session.get(["__abCyclingState"], (data) => {
+        const state = data["__abCyclingState"];
+        if (!state) return resolve(null);
+        if (Date.now() - state.timestamp > 5 * 60 * 1000) {
+          chrome.storage.session.remove("__abCyclingState");
+          return resolve(null);
+        }
+        resolve(state);
+      });
+    });
   }
 
   function clearReloginState() {
-    sessionStorage.removeItem("ab-cycling-state");
+    chrome.storage.session.remove("__abCyclingState");
   }
 
   async function handle401Recovery() {
@@ -925,7 +938,7 @@
     __session401Detected = false;
     stopCycling("Session expired — re-logging in...");
     saveReloginState();
-    sessionStorage.setItem(RELOGIN_FLAG, "true");
+    chrome.storage.session.set({ "__abRelogin": true });
     window.location.href = window.location.origin;
   }
 
@@ -1228,7 +1241,7 @@
     injectBookingPanel();
 
     // Restore cycling state after keep-alive refresh
-    const savedState = getReloginState();
+    const savedState = await getReloginState();
     if (savedState && savedState.active) {
       log("Restoring cycling after page refresh...");
       clearReloginState();
@@ -1262,6 +1275,7 @@
   // ─── MAIN ROUTER ───────────────────────────────────────────────────
 
   async function init() {
+    await loadStartedFlag();
     const settings = await getSettings();
     const path = window.location.pathname.toLowerCase();
     const host = window.location.hostname.toLowerCase();
