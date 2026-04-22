@@ -493,6 +493,8 @@
       r.addEventListener("change", saveAutomationSettings)
     );
 
+    log("Panel appended to DOM, loading users...");
+
     // Load and render saved users (migrate single-user data if needed)
     getSavedUsers().then((users) => {
       if (users.length === 0) {
@@ -607,7 +609,15 @@
   // ─── LOGIN PAGE (panel only — waits for START, unless re-login) ────
 
   async function handleLoginPage() {
-    injectSettingsPanel();
+    // B2C page loads dynamically and may overwrite body — keep retrying injection
+    function ensurePanel() {
+      if (!document.getElementById("sp-panel")) {
+        injectSettingsPanel();
+      }
+    }
+    ensurePanel();
+    const panelWatch = setInterval(ensurePanel, 1000);
+    setTimeout(() => clearInterval(panelWatch), 30000);
 
     // If re-login flag is set (session expired during cycling), auto-login immediately
     const reloginData = await new Promise((r) =>
