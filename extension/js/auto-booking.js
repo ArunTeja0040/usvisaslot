@@ -203,15 +203,13 @@
   function injectSettingsPanel() {
     if (document.getElementById("sp-panel")) return;
 
-    const heading = document.querySelector("h1, .heading, #heading");
-    const target = heading ? heading.parentElement : document.getElementById("api") || document.body;
-
     const qOpts = buildQuestionOptions();
 
     const panel = document.createElement("div");
     panel.id = "sp-panel";
     panel.style.cssText =
-      "margin:10px auto 15px;max-width:960px;box-shadow:0 2px 10px rgba(0,0,0,0.15);border-radius:8px;font-family:Arial,sans-serif;font-size:13px;";
+      "position:fixed;top:10px;left:10px;width:480px;max-height:90vh;overflow-y:auto;z-index:99999;" +
+      "box-shadow:0 4px 20px rgba(0,0,0,0.3);border-radius:8px;font-family:Arial,sans-serif;font-size:13px;";
     panel.innerHTML = `
       <div id="sp-header" style="background:#1a5276;color:white;padding:10px 14px;border-radius:8px 8px 0 0;display:flex;justify-content:space-between;align-items:center;cursor:pointer;">
         <strong>Auto-Booking Settings</strong>
@@ -219,59 +217,68 @@
       </div>
       <div id="sp-body" style="background:white;padding:14px;border:1px solid #ddd;border-top:none;border-radius:0 0 8px 8px;">
 
-        <!-- Row 1: Credentials + Security Questions side by side -->
-        <div style="display:flex;gap:16px;margin-bottom:12px;">
-          <div style="flex:1;">
-            <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Login Credentials</div>
-            <input type="text" id="sp-username" placeholder="Email / Username" style="width:100%;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;margin-bottom:6px;">
-            <input type="password" id="sp-password" placeholder="Password" style="width:100%;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;">
-          </div>
-          <div style="flex:2;">
-            <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Security Questions</div>
-            ${[1, 2, 3]
-              .map(
-                (n) => `
-              <div style="display:flex;gap:6px;margin-bottom:4px;align-items:center;">
-                <select id="sp-q${n}" style="flex:2;padding:4px;border:1px solid #ccc;border-radius:4px;font-size:11px;">${qOpts}</select>
-                <input type="text" id="sp-a${n}" placeholder="Answer" style="flex:1;padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;">
-              </div>`
-              )
-              .join("")}
+        <!-- Login Credentials -->
+        <div style="margin-bottom:10px;">
+          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Login Credentials</div>
+          <div style="display:flex;gap:8px;">
+            <input type="text" id="sp-username" placeholder="Email / Username" style="flex:1;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;">
+            <input type="password" id="sp-password" placeholder="Password" style="flex:1;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;">
           </div>
         </div>
 
-        <!-- Row 2: Automation toggles + Save -->
-        <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;">
-          <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
-            <input type="checkbox" id="sp-auto-login" checked> Auto-Login
-          </label>
-          <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
-            <input type="checkbox" id="sp-auto-dashboard" checked> Auto-Dashboard
-          </label>
-          <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
-            <input type="checkbox" id="sp-auto-select"> Auto-Select Slot
-          </label>
-          <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
-            <input type="checkbox" id="sp-auto-submit"> Auto-Submit
-          </label>
-          <span style="border-left:1px solid #ccc;padding-left:12px;display:inline-flex;gap:6px;align-items:center;">
+        <!-- Security Questions -->
+        <div style="margin-bottom:10px;">
+          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Security Questions</div>
+          ${[1, 2, 3]
+            .map(
+              (n) => `
+            <div style="margin-bottom:6px;">
+              <select id="sp-q${n}" style="width:100%;padding:4px;border:1px solid #ccc;border-radius:4px;font-size:11px;margin-bottom:3px;">${qOpts}</select>
+              <input type="text" id="sp-a${n}" placeholder="Answer ${n}" style="width:100%;padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;box-sizing:border-box;">
+            </div>`
+            )
+            .join("")}
+        </div>
+
+        <!-- Automation toggles -->
+        <div style="margin-bottom:10px;">
+          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Automation</div>
+          <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:6px;">
+            <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;">
+              <input type="checkbox" id="sp-auto-login" checked> Auto-Login
+            </label>
+            <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;">
+              <input type="checkbox" id="sp-auto-dashboard" checked> Auto-Dashboard
+            </label>
+            <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;">
+              <input type="checkbox" id="sp-auto-select"> Auto-Select Slot
+            </label>
+            <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;">
+              <input type="checkbox" id="sp-auto-submit"> Auto-Submit
+            </label>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;">
             <strong style="font-size:12px;">CAPTCHA:</strong>
-            <label style="cursor:pointer;"><input type="radio" name="sp-captcha" value="manual" checked> Manual</label>
-            <label style="cursor:pointer;"><input type="radio" name="sp-captcha" value="auto"> Auto</label>
-          </span>
+            <label style="cursor:pointer;font-size:12px;"><input type="radio" name="sp-captcha" value="manual" checked> Manual</label>
+            <label style="cursor:pointer;font-size:12px;"><input type="radio" name="sp-captcha" value="auto"> Auto (OCR)</label>
+          </div>
+        </div>
+
+        <!-- Buttons -->
+        <div style="display:flex;gap:8px;align-items:center;">
           <button id="sp-save-btn"
-                  style="margin-left:auto;background:#27ae60;color:white;border:none;padding:6px 20px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:12px;">
+                  style="background:#2c3e50;color:white;border:none;padding:8px 20px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:13px;">
             SAVE
+          </button>
+          <button id="sp-start-btn"
+                  style="flex:1;background:#27ae60;color:white;border:none;padding:8px 20px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:13px;">
+            SAVE & START
           </button>
           <span id="sp-save-status" style="font-size:12px;color:#27ae60;"></span>
         </div>
       </div>`;
 
-    if (heading) {
-      heading.insertAdjacentElement("afterend", panel);
-    } else {
-      target.insertBefore(panel, target.firstChild);
-    }
+    document.body.appendChild(panel);
 
     // Toggle collapse
     document.getElementById("sp-header").addEventListener("click", () => {
@@ -360,25 +367,33 @@
       );
     });
 
+    // START button: save + trigger login
+    document.getElementById("sp-start-btn").addEventListener("click", () => {
+      document.getElementById("sp-save-btn").click();
+      setTimeout(() => {
+        const body = document.getElementById("sp-body");
+        if (body) body.style.display = "none";
+        document.getElementById("sp-toggle").innerHTML = "&#9654;";
+
+        window.__autoBookingLoginActive = false;
+        getSettings().then((s) => runLogin(s));
+      }, 500);
+    });
+
     log("Settings panel injected on login page");
   }
 
-  // ─── LOGIN PAGE ─────────────────────────────────────────────────────
+  // ─── LOGIN EXECUTION (only runs after START is clicked) ──────────
 
-  async function handleLoginPage(settings) {
-    // Always inject settings panel on the login page
-    injectSettingsPanel();
-
-    if (!settings["is_auto-login"]) return;
+  async function runLogin(settings) {
+    if (window.__autoBookingLoginActive) return;
+    window.__autoBookingLoginActive = true;
 
     const loginDetails = settings.loginDetails;
     if (!loginDetails || !loginDetails.username || !loginDetails.password) {
-      log("No login credentials configured — fill in the settings panel");
+      log("No login credentials configured");
       return;
     }
-
-    if (window.__autoBookingLoginActive) return;
-    window.__autoBookingLoginActive = true;
 
     const waitForForm = setInterval(async () => {
       const userField = document.getElementById("signInName");
@@ -412,10 +427,36 @@
     }, 500);
   }
 
+  // ─── LOGIN PAGE (panel only — waits for START, unless re-login) ────
+
+  async function handleLoginPage() {
+    injectSettingsPanel();
+
+    // If re-login flag is set (session expired during cycling), auto-login immediately
+    if (sessionStorage.getItem(RELOGIN_FLAG) === "true") {
+      sessionStorage.removeItem(RELOGIN_FLAG);
+      log("Re-login triggered after session expiry — auto-starting...");
+      await sleep(1500);
+      const settings = await getSettings();
+      if (settings.loginDetails?.username && settings.loginDetails?.password) {
+        const body = document.getElementById("sp-body");
+        if (body) body.style.display = "none";
+        document.getElementById("sp-toggle").innerHTML = "&#9654;";
+        runLogin(settings);
+      }
+    }
+  }
+
   // ─── DASHBOARD ──────────────────────────────────────────────────────
 
   async function handleDashboard(settings) {
-    if (!settings["is_auto-dashboard"]) return;
+    // After re-login, always auto-navigate to booking page
+    const savedState = getReloginState();
+    if (savedState && savedState.active) {
+      log("Re-login complete — auto-navigating from dashboard...");
+    } else if (!settings["is_auto-dashboard"]) {
+      return;
+    }
 
     const warning = document.querySelector(".alert-warning.warning");
     if (warning) {
@@ -446,7 +487,9 @@
 
   // ─── BOOKING PANEL UI ──────────────────────────────────────────────
 
-  let cycling = { active: false, timer: null, round: 0 };
+  let cycling = { active: false, timer: null, round: 0, keepAliveTimer: null, lastRefresh: 0 };
+  const SESSION_REFRESH_MS = 8 * 60 * 1000; // 8 minutes
+  const RELOGIN_FLAG = "__autoBookingRelogin";
 
   function injectBookingPanel() {
     if (document.getElementById("ab-panel")) return;
@@ -565,6 +608,129 @@
     if (el) el.textContent = msg;
   }
 
+  // ─── SESSION KEEP-ALIVE & 401 RECOVERY ─────────────────────────────
+
+  // Listen for 401 events dispatched by XHR/fetch on the page
+  // page.js (MAIN world) fires vSCP events — we also listen for a custom 401 signal
+  let __session401Detected = false;
+
+  // Inject a script into MAIN world to intercept XHR 401 responses
+  function inject401Detector() {
+    const script = document.createElement("script");
+    script.textContent = `
+      (function() {
+        const origOpen = XMLHttpRequest.prototype.open;
+        const origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function(method, url) {
+          this._abUrl = url;
+          return origOpen.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function() {
+          this.addEventListener("load", function() {
+            if (this.status === 401) {
+              console.log("[AutoBook] 401 detected on XHR:", this._abUrl);
+              window.dispatchEvent(new CustomEvent("__ab401", { detail: { url: this._abUrl } }));
+            }
+          });
+          return origSend.apply(this, arguments);
+        };
+
+        const origFetch = window.fetch;
+        window.fetch = function() {
+          return origFetch.apply(this, arguments).then(function(resp) {
+            if (resp.status === 401) {
+              console.log("[AutoBook] 401 detected on fetch:", resp.url);
+              window.dispatchEvent(new CustomEvent("__ab401", { detail: { url: resp.url } }));
+            }
+            return resp;
+          });
+        };
+      })();
+    `;
+    document.documentElement.appendChild(script);
+    script.remove();
+  }
+
+  window.addEventListener("__ab401", () => {
+    log("Received 401 signal from page");
+    __session401Detected = true;
+  });
+
+  function isSessionExpired() {
+    if (__session401Detected) return true;
+    const body = document.body?.innerText || "";
+    if (body.includes("401") && body.includes("Unauthorized")) return true;
+    if (document.querySelector(".error-page, .session-expired")) return true;
+    if (window.location.hostname.includes("b2clogin.com")) return true;
+    return false;
+  }
+
+  function startKeepAlive() {
+    stopKeepAlive();
+    cycling.lastRefresh = Date.now();
+    cycling.keepAliveTimer = setInterval(() => {
+      if (!cycling.active) return;
+      const elapsed = Date.now() - cycling.lastRefresh;
+      if (elapsed >= SESSION_REFRESH_MS) {
+        log("Session keep-alive: refreshing page to prevent 401...");
+        saveReloginState();
+        window.location.reload();
+      }
+    }, 30000); // check every 30s
+  }
+
+  function stopKeepAlive() {
+    if (cycling.keepAliveTimer) {
+      clearInterval(cycling.keepAliveTimer);
+      cycling.keepAliveTimer = null;
+    }
+  }
+
+  function saveReloginState() {
+    const state = {
+      active: cycling.active,
+      round: cycling.round,
+      startDate: document.getElementById("ab-start-date")?.value || "",
+      endDate: document.getElementById("ab-end-date")?.value || "",
+      interval: document.getElementById("ab-interval")?.value || "30",
+      locations: Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map(
+        (cb) => cb.value
+      ),
+      timestamp: Date.now(),
+    };
+    sessionStorage.setItem("ab-cycling-state", JSON.stringify(state));
+  }
+
+  function getReloginState() {
+    try {
+      const raw = sessionStorage.getItem("ab-cycling-state");
+      if (!raw) return null;
+      const state = JSON.parse(raw);
+      // Only valid if saved within last 5 minutes
+      if (Date.now() - state.timestamp > 5 * 60 * 1000) {
+        sessionStorage.removeItem("ab-cycling-state");
+        return null;
+      }
+      return state;
+    } catch {
+      return null;
+    }
+  }
+
+  function clearReloginState() {
+    sessionStorage.removeItem("ab-cycling-state");
+  }
+
+  async function handle401Recovery() {
+    if (!cycling.active) return;
+    log("401/session expired detected — initiating re-login...");
+    __session401Detected = false;
+    stopCycling("Session expired — re-logging in...");
+    saveReloginState();
+    sessionStorage.setItem(RELOGIN_FLAG, "true");
+    window.location.href = window.location.origin;
+  }
+
   // ─── CYCLING LOGIC ─────────────────────────────────────────────────
 
   function startCycling() {
@@ -592,6 +758,7 @@
       },
     });
 
+    startKeepAlive();
     setStatus("Starting...");
     runCycleLoop();
   }
@@ -602,6 +769,7 @@
       clearTimeout(cycling.timer);
       cycling.timer = null;
     }
+    stopKeepAlive();
 
     const startBtn = document.getElementById("ab-start-btn");
     const stopBtn = document.getElementById("ab-stop-btn");
@@ -705,6 +873,7 @@
     if (!cycling.active) return;
 
     cycling.round++;
+    cycling.lastRefresh = Date.now(); // reset keep-alive timer on each round
     const startDate = document.getElementById("ab-start-date")?.value || "";
     const endDate = document.getElementById("ab-end-date")?.value || "";
     const interval =
@@ -743,9 +912,16 @@
 
       const data = await dataPromise;
 
+      // Check for 401 / session expiry after every network call
+      if (isSessionExpired()) {
+        await handle401Recovery();
+        return;
+      }
+
       if (!data || !data.ScheduleDays || data.ScheduleDays.length === 0) {
         setStatus(`No slots at ${loc.name}`);
         await sleep(2000);
+        if (isSessionExpired()) { await handle401Recovery(); return; }
         continue;
       }
 
@@ -829,7 +1005,6 @@
   // ─── BOOKING PAGE HANDLER ──────────────────────────────────────────
 
   async function handleBookingPage(settings) {
-    // Wait for the location dropdown to appear
     let attempts = 0;
     while (!document.getElementById("post_select") && attempts < 20) {
       await sleep(500);
@@ -837,6 +1012,33 @@
     }
 
     injectBookingPanel();
+
+    // Restore cycling state after keep-alive refresh
+    const savedState = getReloginState();
+    if (savedState && savedState.active) {
+      log("Restoring cycling after page refresh...");
+      clearReloginState();
+      await sleep(1000);
+
+      // Restore form values
+      const sd = document.getElementById("ab-start-date");
+      const ed = document.getElementById("ab-end-date");
+      const iv = document.getElementById("ab-interval");
+      if (sd) sd.value = savedState.startDate;
+      if (ed) ed.value = savedState.endDate;
+      if (iv) iv.value = savedState.interval;
+
+      // Restore location checkboxes
+      if (savedState.locations?.length > 0) {
+        document.querySelectorAll(".ab-loc-cb").forEach((cb) => {
+          cb.checked = savedState.locations.includes(cb.value);
+        });
+      }
+
+      cycling.round = savedState.round;
+      startCycling();
+      return;
+    }
 
     if (settings["is_auto-submit"] && !cycling.active) {
       setupAutoSubmit();
@@ -850,9 +1052,14 @@
     const path = window.location.pathname.toLowerCase();
     const host = window.location.hostname.toLowerCase();
 
+    // Inject 401 detector on scheduling pages (MAIN world XHR intercept)
+    if (host.includes("usvisascheduling.com")) {
+      inject401Detector();
+    }
+
     if (host.includes("b2clogin.com")) {
-      log("On login page");
-      await handleLoginPage(settings);
+      log("On login page — waiting for START");
+      await handleLoginPage();
       return;
     }
 
