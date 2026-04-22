@@ -474,13 +474,9 @@
       return;
     }
 
-    const warning = document.querySelector(".alert-warning.warning");
-    if (warning) {
-      const text = warning.textContent.trim().toLowerCase();
-      if (text.includes("exceeded") || text.includes("maximum")) {
-        log("Rate limited: " + text);
-        return;
-      }
+    if (isRateLimited()) {
+      doLogout();
+      return;
     }
 
     const waitForBtn = setInterval(() => {
@@ -622,6 +618,29 @@
   function setCycleInfo(msg) {
     const el = document.getElementById("ab-cycle-info");
     if (el) el.textContent = msg;
+  }
+
+  // ─── RATE LIMIT DETECTION & AUTO-LOGOUT ─────────────────────────────
+
+  function isRateLimited() {
+    const warning = document.querySelector(".alert-warning.warning, .alert.alert-warning");
+    if (!warning) return false;
+    const text = warning.textContent.trim().toLowerCase();
+    return text.includes("maximum number of times") || text.includes("approaching the maximum");
+  }
+
+  function doLogout() {
+    log("Rate limit warning — logging out to protect session...");
+    stopCycling("Rate limited — logging out...");
+    // Find and click logout link on the page
+    const logoutLink = document.querySelector('a[href*="logout"], a[href*="Logout"], a[href*="signout"], a[href*="SignOut"]');
+    if (logoutLink) {
+      logoutLink.click();
+      return;
+    }
+    // Fallback: navigate to logout URL
+    const base = window.location.origin;
+    window.location.href = base + "/en-US/logout/";
   }
 
   // ─── SESSION KEEP-ALIVE & 401 RECOVERY ─────────────────────────────
@@ -914,6 +933,12 @@
     for (let i = 0; i < locations.length; i++) {
       if (!cycling.active) return;
 
+      // Check for rate limit warning each cycle
+      if (isRateLimited()) {
+        doLogout();
+        return;
+      }
+
       const loc = locations[i];
       setStatus(`Checking ${loc.name} (${i + 1}/${locations.length})...`);
 
@@ -1037,6 +1062,12 @@
     while (!document.getElementById("post_select") && attempts < 20) {
       await sleep(500);
       attempts++;
+    }
+
+    // Check for rate limit warning before doing anything
+    if (isRateLimited()) {
+      doLogout();
+      return;
     }
 
     injectBookingPanel();
