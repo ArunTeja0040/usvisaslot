@@ -615,33 +615,39 @@
   let __session401Detected = false;
 
   // Inject a script into MAIN world to intercept XHR 401 responses
+  // Uses a hidden DOM element as bridge since custom events don't cross worlds
   function inject401Detector() {
+    const marker = document.createElement("div");
+    marker.id = "__ab401marker";
+    marker.style.display = "none";
+    document.documentElement.appendChild(marker);
+
     const script = document.createElement("script");
     script.textContent = `
       (function() {
-        const origOpen = XMLHttpRequest.prototype.open;
-        const origSend = XMLHttpRequest.prototype.send;
+        var marker = document.getElementById("__ab401marker");
+        function signal401(url) {
+          console.log("[AutoBook] 401 detected:", url);
+          if (marker) marker.setAttribute("data-hit", Date.now());
+        }
+
+        var origOpen = XMLHttpRequest.prototype.open;
+        var origSend = XMLHttpRequest.prototype.send;
         XMLHttpRequest.prototype.open = function(method, url) {
           this._abUrl = url;
           return origOpen.apply(this, arguments);
         };
         XMLHttpRequest.prototype.send = function() {
           this.addEventListener("load", function() {
-            if (this.status === 401) {
-              console.log("[AutoBook] 401 detected on XHR:", this._abUrl);
-              window.dispatchEvent(new CustomEvent("__ab401", { detail: { url: this._abUrl } }));
-            }
+            if (this.status === 401) signal401(this._abUrl);
           });
           return origSend.apply(this, arguments);
         };
 
-        const origFetch = window.fetch;
+        var origFetch = window.fetch;
         window.fetch = function() {
           return origFetch.apply(this, arguments).then(function(resp) {
-            if (resp.status === 401) {
-              console.log("[AutoBook] 401 detected on fetch:", resp.url);
-              window.dispatchEvent(new CustomEvent("__ab401", { detail: { url: resp.url } }));
-            }
+            if (resp.status === 401) signal401(resp.url);
             return resp;
           });
         };
@@ -649,12 +655,14 @@
     `;
     document.documentElement.appendChild(script);
     script.remove();
-  }
 
-  window.addEventListener("__ab401", () => {
-    log("Received 401 signal from page");
-    __session401Detected = true;
-  });
+    // Content script (ISOLATED world) observes the marker attribute change
+    const observer = new MutationObserver(() => {
+      log("401 detected via DOM bridge");
+      __session401Detected = true;
+    });
+    observer.observe(marker, { attributes: true });
+  }
 
   function isSessionExpired() {
     if (__session401Detected) return true;
