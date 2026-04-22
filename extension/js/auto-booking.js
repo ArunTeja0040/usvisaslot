@@ -487,7 +487,7 @@
 
   // ─── BOOKING PANEL UI ──────────────────────────────────────────────
 
-  let cycling = { active: false, timer: null, round: 0, keepAliveTimer: null, lastRefresh: 0 };
+  let cycling = { active: false, timer: null, round: 0, keepAliveTimer: null, lastRefresh: 0, backoffMs: 0 };
   const SESSION_REFRESH_MS = 8 * 60 * 1000; // 8 minutes
   const RELOGIN_FLAG = "__autoBookingRelogin";
 
@@ -613,35 +613,49 @@
   // Listen for 401 events dispatched by XHR/fetch on the page
   // page.js (MAIN world) fires vSCP events — we also listen for a custom 401 signal
   let __session401Detected = false;
+  let __rateLimited429 = false;
 
-  // Inject a script into MAIN world to intercept XHR 401 responses
+  function randomDelay(minSec, maxSec) {
+    const ms = (minSec + Math.random() * (maxSec - minSec)) * 1000;
+    return sleep(ms);
+  }
+
+  // Inject a script into MAIN world to intercept XHR 401/429 responses
+  // Uses a hidden DOM element as bridge since custom events don't cross worlds
   function inject401Detector() {
+    const marker = document.createElement("div");
+    marker.id = "__ab401marker";
+    marker.style.display = "none";
+    document.documentElement.appendChild(marker);
+
     const script = document.createElement("script");
     script.textContent = `
       (function() {
-        const origOpen = XMLHttpRequest.prototype.open;
-        const origSend = XMLHttpRequest.prototype.send;
+        var marker = document.getElementById("__ab401marker");
+        function signal(type, url) {
+          console.log("[AutoBook] " + type + " detected:", url);
+          if (marker) marker.setAttribute("data-" + type, Date.now());
+        }
+
+        var origOpen = XMLHttpRequest.prototype.open;
+        var origSend = XMLHttpRequest.prototype.send;
         XMLHttpRequest.prototype.open = function(method, url) {
           this._abUrl = url;
           return origOpen.apply(this, arguments);
         };
         XMLHttpRequest.prototype.send = function() {
           this.addEventListener("load", function() {
-            if (this.status === 401) {
-              console.log("[AutoBook] 401 detected on XHR:", this._abUrl);
-              window.dispatchEvent(new CustomEvent("__ab401", { detail: { url: this._abUrl } }));
-            }
+            if (this.status === 401) signal("401", this._abUrl);
+            if (this.status === 429) signal("429", this._abUrl);
           });
           return origSend.apply(this, arguments);
         };
 
-        const origFetch = window.fetch;
+        var origFetch = window.fetch;
         window.fetch = function() {
           return origFetch.apply(this, arguments).then(function(resp) {
-            if (resp.status === 401) {
-              console.log("[AutoBook] 401 detected on fetch:", resp.url);
-              window.dispatchEvent(new CustomEvent("__ab401", { detail: { url: resp.url } }));
-            }
+            if (resp.status === 401) signal("401", resp.url);
+            if (resp.status === 429) signal("429", resp.url);
             return resp;
           });
         };
@@ -649,12 +663,29 @@
     `;
     document.documentElement.appendChild(script);
     script.remove();
+
+    // Content script (ISOLATED world) observes the marker attribute changes
+    const observer = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        if (m.attributeName === "data-401") {
+          log("401 detected via DOM bridge");
+          __session401Detected = true;
+        }
+        if (m.attributeName === "data-429") {
+          log("429 rate limit detected via DOM bridge");
+          __rateLimited429 = true;
+        }
+      }
+    });
+    observer.observe(marker, { attributes: true });
   }
 
-  window.addEventListener("__ab401", () => {
-    log("Received 401 signal from page");
-    __session401Detected = true;
-  });
+  function isCloudflareBlocked() {
+    const body = document.body?.innerText || "";
+    if (body.includes("Error 1015") || body.includes("rate limited")) return true;
+    if (body.includes("cloudflare") && body.includes("429")) return true;
+    return false;
+  }
 
   function isSessionExpired() {
     if (__session401Detected) return true;
@@ -890,6 +921,27 @@
     for (let i = 0; i < locations.length; i++) {
       if (!cycling.active) return;
 
+      // Random delay between locations (3-6 sec) to avoid rate limiting
+      if (i > 0) {
+        const delaySec = 3 + Math.random() * 3;
+        setStatus(`Waiting ${delaySec.toFixed(0)}s before next location...`);
+        await sleep(delaySec * 1000);
+        if (!cycling.active) return;
+      }
+
+      // Check for 429 rate limit — exponential backoff
+      if (__rateLimited429) {
+        __rateLimited429 = false;
+        cycling.backoffMs = cycling.backoffMs ? Math.min(cycling.backoffMs * 2, 300000) : 60000;
+        const waitSec = Math.round(cycling.backoffMs / 1000);
+        setStatus(`Rate limited (429)! Pausing ${waitSec}s...`);
+        log(`Backoff: waiting ${waitSec}s before resuming`);
+        await sleep(cycling.backoffMs);
+        if (!cycling.active) return;
+        // After backoff, re-check
+        if (__rateLimited429) { continue; }
+      }
+
       const loc = locations[i];
       setStatus(`Checking ${loc.name} (${i + 1}/${locations.length})...`);
 
@@ -906,13 +958,26 @@
         select.value = loc.value;
         select.dispatchEvent(new Event("change", { bubbles: true }));
       } else {
-        // Same location already selected — re-trigger to refresh
         select.dispatchEvent(new Event("change", { bubbles: true }));
       }
 
       const data = await dataPromise;
 
-      // Check for 401 / session expiry after every network call
+      // Check for 429 after data fetch
+      if (__rateLimited429) {
+        __rateLimited429 = false;
+        cycling.backoffMs = cycling.backoffMs ? Math.min(cycling.backoffMs * 2, 300000) : 60000;
+        const waitSec = Math.round(cycling.backoffMs / 1000);
+        setStatus(`Rate limited (429)! Pausing ${waitSec}s...`);
+        await sleep(cycling.backoffMs);
+        if (!cycling.active) return;
+        continue; // retry this round
+      }
+
+      // Reset backoff on successful request
+      cycling.backoffMs = 0;
+
+      // Check for 401 / session expiry
       if (isSessionExpired()) {
         await handle401Recovery();
         return;
