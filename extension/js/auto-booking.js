@@ -93,7 +93,7 @@
 
     log("CAPTCHA mode: auto — solving...");
 
-    for (let attempt = 1; attempt <= CAPTCHA_MAX_RETRIES; attempt++) {
+    for (let attempt = 1; ; attempt++) {
       await sleep(1000);
 
       if (!captchaImg.complete || !captchaImg.naturalWidth) {
@@ -129,7 +129,7 @@
       return;
     }
 
-    log("Max CAPTCHA retries reached — falling back to manual");
+    log("CAPTCHA loop exited unexpectedly");
     captchaInput.focus();
   }
 
@@ -181,6 +181,18 @@
 
   // ─── SETTINGS PANEL (injected on login page) ─────────────────────
 
+  const CONSULATE_LOCATIONS = [
+    "Mumbai",
+    "New Delhi",
+    "Chennai",
+    "Kolkata",
+    "Hyderabad",
+  ];
+
+  const VISA_TYPES = [
+    "H1B", "H4", "L1", "L2", "B1/B2", "F1", "F2", "J1", "J2", "O1", "Other"
+  ];
+
   const SECURITY_QUESTIONS = [
     "Where did you meet your spouse?",
     "What is your sibling's middle name?",
@@ -204,6 +216,118 @@
       SECURITY_QUESTIONS.map((q) => `<option value="${q}">${q}</option>`).join("");
   }
 
+  // ─── MULTI-USER PROFILE HELPERS ─────────────────────────────────
+
+  function loadUserProfiles() {
+    return new Promise((resolve) => {
+      chrome.storage.local.get(["userProfilesList"], (data) => {
+        resolve(data.userProfilesList || []);
+      });
+    });
+  }
+
+  function saveUserProfiles(profiles) {
+    return new Promise((resolve) => {
+      chrome.storage.local.set({ userProfilesList: profiles }, resolve);
+    });
+  }
+
+  function getFormData() {
+    const securityQuestions = {};
+    for (let i = 1; i <= 3; i++) {
+      const q = document.getElementById(`sp-q${i}`).value;
+      const a = document.getElementById(`sp-a${i}`).value;
+      if (q && a) securityQuestions[q] = a;
+    }
+    const selectedLocations = Array.from(document.querySelectorAll(".sp-loc-cb:checked")).map((cb) => cb.value);
+    return {
+      username: document.getElementById("sp-username").value.trim(),
+      password: document.getElementById("sp-password").value,
+      securityQuestions,
+      autoLogin: document.getElementById("sp-auto-login").checked,
+      autoDashboard: document.getElementById("sp-auto-dashboard").checked,
+      autoSelect: document.getElementById("sp-auto-select").checked,
+      autoSubmit: document.getElementById("sp-auto-submit").checked,
+      captchaMode: document.querySelector('input[name="sp-captcha"]:checked')?.value || "manual",
+      startDate: document.getElementById("sp-start-date")?.value || "",
+      endDate: document.getElementById("sp-end-date")?.value || "",
+      locations: selectedLocations,
+      visaType: document.getElementById("sp-visa-type")?.value || "",
+      agreedPrice: document.getElementById("sp-price")?.value || "",
+    };
+  }
+
+  function populateForm(profile) {
+    document.getElementById("sp-username").value = profile.username || "";
+    document.getElementById("sp-password").value = profile.password || "";
+
+    for (let i = 1; i <= 3; i++) {
+      document.getElementById(`sp-q${i}`).value = "";
+      document.getElementById(`sp-a${i}`).value = "";
+    }
+    if (profile.securityQuestions) {
+      const entries = Object.entries(profile.securityQuestions);
+      entries.forEach(([q, a], idx) => {
+        const qEl = document.getElementById(`sp-q${idx + 1}`);
+        const aEl = document.getElementById(`sp-a${idx + 1}`);
+        if (qEl) qEl.value = q;
+        if (aEl) aEl.value = a;
+      });
+    }
+
+    document.getElementById("sp-auto-login").checked = profile.autoLogin !== false;
+    document.getElementById("sp-auto-dashboard").checked = profile.autoDashboard !== false;
+    document.getElementById("sp-auto-select").checked = profile.autoSelect !== false;
+    document.getElementById("sp-auto-submit").checked = profile.autoSubmit === true;
+
+    const radio = document.querySelector(`input[name="sp-captcha"][value="${profile.captchaMode || "manual"}"]`);
+    if (radio) radio.checked = true;
+
+    const sd = document.getElementById("sp-start-date");
+    const ed = document.getElementById("sp-end-date");
+    if (sd) sd.value = profile.startDate || "";
+    if (ed) ed.value = profile.endDate || "";
+
+    const savedLocs = profile.locations || [];
+    document.querySelectorAll(".sp-loc-cb").forEach((cb) => {
+      cb.checked = savedLocs.length === 0 || savedLocs.includes(cb.value);
+    });
+
+    const visaEl = document.getElementById("sp-visa-type");
+    if (visaEl) visaEl.value = profile.visaType || "";
+
+    const priceEl = document.getElementById("sp-price");
+    if (priceEl) priceEl.value = profile.agreedPrice || "";
+  }
+
+  function deriveProfileName(username) {
+    if (!username) return "User";
+    const atIdx = username.indexOf("@");
+    return atIdx > 0 ? username.substring(0, atIdx) : username;
+  }
+
+  async function refreshUserDropdown(selectedUsername) {
+    const profiles = await loadUserProfiles();
+    const sel = document.getElementById("sp-user-select");
+    if (!sel) return;
+
+    sel.innerHTML = '<option value="__new__">+ New User</option>';
+    profiles.forEach((p) => {
+      const opt = document.createElement("option");
+      opt.value = p.username;
+      opt.textContent = p.name || deriveProfileName(p.username);
+      sel.appendChild(opt);
+    });
+
+    if (selectedUsername) {
+      sel.value = selectedUsername;
+    }
+
+    // Show/hide delete button
+    const delBtn = document.getElementById("sp-delete-btn");
+    if (delBtn) delBtn.style.display = sel.value === "__new__" ? "none" : "inline-block";
+  }
+
   function injectSettingsPanel() {
     if (document.getElementById("sp-panel")) return;
 
@@ -220,6 +344,17 @@
         <span id="sp-toggle" style="font-size:18px;line-height:1;">&#9660;</span>
       </div>
       <div id="sp-body" style="background:white;padding:14px;border:1px solid #ddd;border-top:none;border-radius:0 0 8px 8px;">
+
+        <!-- User Profile Selector -->
+        <div style="margin-bottom:10px;">
+          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">User Profile</div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <select id="sp-user-select" style="flex:1;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;">
+              <option value="__new__">+ New User</option>
+            </select>
+            <button id="sp-delete-btn" style="background:#e74c3c;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;display:none;">DELETE</button>
+          </div>
+        </div>
 
         <!-- Login Credentials -->
         <div style="margin-bottom:10px;">
@@ -242,6 +377,38 @@
             </div>`
             )
             .join("")}
+        </div>
+
+        <!-- Booking Preferences -->
+        <div style="margin-bottom:10px;">
+          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Booking Preferences</div>
+          <div style="display:flex;gap:8px;margin-bottom:6px;">
+            <label style="font-size:12px;font-weight:600;">Start Date:
+              <input type="date" id="sp-start-date" style="margin-left:2px;padding:4px 6px;border:1px solid #ccc;border-radius:4px;font-size:11px;">
+            </label>
+            <label style="font-size:12px;font-weight:600;">End Date:
+              <input type="date" id="sp-end-date" style="margin-left:2px;padding:4px 6px;border:1px solid #ccc;border-radius:4px;font-size:11px;">
+            </label>
+          </div>
+          <div style="margin-bottom:6px;">
+            <strong style="font-size:12px;">Locations: </strong>
+            ${CONSULATE_LOCATIONS.map((loc) => `
+              <label style="display:inline-flex;align-items:center;gap:3px;margin-right:10px;cursor:pointer;font-size:12px;">
+                <input type="checkbox" class="sp-loc-cb" value="${loc}" checked style="width:13px;height:13px;cursor:pointer;">
+                ${loc}
+              </label>`).join("")}
+          </div>
+          <div style="display:flex;gap:8px;">
+            <label style="font-size:12px;font-weight:600;">Visa Type:
+              <select id="sp-visa-type" style="margin-left:2px;padding:4px 6px;border:1px solid #ccc;border-radius:4px;font-size:11px;">
+                <option value="">-- Select --</option>
+                ${VISA_TYPES.map((v) => `<option value="${v}">${v}</option>`).join("")}
+              </select>
+            </label>
+            <label style="font-size:12px;font-weight:600;">Agreed Price ($):
+              <input type="number" id="sp-price" placeholder="0" min="0" style="width:80px;margin-left:2px;padding:4px 6px;border:1px solid #ccc;border-radius:4px;font-size:11px;">
+            </label>
+          </div>
         </div>
 
         <!-- Automation toggles -->
@@ -297,78 +464,146 @@
       }
     });
 
-    // Load saved settings
-    chrome.storage.local.get(
-      [
-        "loginDetails",
-        "securityQuestions",
-        "is_auto-login",
-        "is_auto-submit",
-        "is_auto-dashboard",
-        "is_sel-1st-slot",
-        "captchaMode",
-      ],
-      (data) => {
-        if (data.loginDetails) {
-          document.getElementById("sp-username").value = data.loginDetails.username || "";
-          document.getElementById("sp-password").value = data.loginDetails.password || "";
+    // User dropdown change — populate form with selected profile
+    document.getElementById("sp-user-select").addEventListener("change", async () => {
+      const sel = document.getElementById("sp-user-select");
+      const delBtn = document.getElementById("sp-delete-btn");
+
+      if (sel.value === "__new__") {
+        document.getElementById("sp-username").value = "";
+        document.getElementById("sp-password").value = "";
+        for (let i = 1; i <= 3; i++) {
+          document.getElementById(`sp-q${i}`).value = "";
+          document.getElementById(`sp-a${i}`).value = "";
         }
-
-        if (data.securityQuestions) {
-          const entries = Object.entries(data.securityQuestions);
-          entries.forEach(([q, a], idx) => {
-            const qEl = document.getElementById(`sp-q${idx + 1}`);
-            const aEl = document.getElementById(`sp-a${idx + 1}`);
-            if (qEl) qEl.value = q;
-            if (aEl) aEl.value = a;
-          });
-        }
-
-        document.getElementById("sp-auto-login").checked = data["is_auto-login"] !== false;
-        document.getElementById("sp-auto-dashboard").checked = data["is_auto-dashboard"] !== false;
-        document.getElementById("sp-auto-select").checked = data["is_sel-1st-slot"] !== false;
-        document.getElementById("sp-auto-submit").checked = data["is_auto-submit"] === true;
-
-        const mode = data.captchaMode || "manual";
-        const radio = document.querySelector(`input[name="sp-captcha"][value="${mode}"]`);
-        if (radio) radio.checked = true;
-
+        document.getElementById("sp-start-date").value = "";
+        document.getElementById("sp-end-date").value = "";
+        document.querySelectorAll(".sp-loc-cb").forEach((cb) => (cb.checked = true));
+        document.getElementById("sp-visa-type").value = "";
+        document.getElementById("sp-price").value = "";
+        if (delBtn) delBtn.style.display = "none";
+        return;
       }
-    );
 
-    // Save handler
-    document.getElementById("sp-save-btn").addEventListener("click", () => {
-      const loginDetails = {
-        username: document.getElementById("sp-username").value,
-        password: document.getElementById("sp-password").value,
+      if (delBtn) delBtn.style.display = "inline-block";
+
+      const profiles = await loadUserProfiles();
+      const profile = profiles.find((p) => p.username === sel.value);
+      if (profile) populateForm(profile);
+    });
+
+    // Delete button
+    document.getElementById("sp-delete-btn").addEventListener("click", async () => {
+      const sel = document.getElementById("sp-user-select");
+      if (sel.value === "__new__") return;
+
+      const username = sel.value;
+      if (!confirm(`Delete profile for "${deriveProfileName(username)}"?`)) return;
+
+      let profiles = await loadUserProfiles();
+      profiles = profiles.filter((p) => p.username !== username);
+      await saveUserProfiles(profiles);
+
+      // Also clear active loginDetails if it matches
+      chrome.storage.local.get(["loginDetails"], (data) => {
+        if (data.loginDetails?.username === username) {
+          chrome.storage.local.remove(["loginDetails", "securityQuestions"]);
+        }
+      });
+
+      // Clear form and refresh dropdown
+      document.getElementById("sp-username").value = "";
+      document.getElementById("sp-password").value = "";
+      for (let i = 1; i <= 3; i++) {
+        document.getElementById(`sp-q${i}`).value = "";
+        document.getElementById(`sp-a${i}`).value = "";
+      }
+      await refreshUserDropdown("__new__");
+
+      const status = document.getElementById("sp-save-status");
+      status.textContent = "Deleted!";
+      status.style.color = "#e74c3c";
+      setTimeout(() => { status.textContent = ""; status.style.color = "#27ae60"; }, 3000);
+      log("Profile deleted: " + username);
+    });
+
+    // Load profiles and populate dropdown, then select first or migrate legacy
+    (async () => {
+      let profiles = await loadUserProfiles();
+
+      // Migrate legacy single-user data if no profiles exist
+      if (profiles.length === 0) {
+        const legacy = await new Promise((resolve) => {
+          chrome.storage.local.get(["loginDetails", "securityQuestions", "is_auto-login", "is_auto-submit", "is_auto-dashboard", "is_sel-1st-slot", "captchaMode"], resolve);
+        });
+        if (legacy.loginDetails?.username) {
+          profiles.push({
+            username: legacy.loginDetails.username,
+            password: legacy.loginDetails.password,
+            name: deriveProfileName(legacy.loginDetails.username),
+            securityQuestions: legacy.securityQuestions || {},
+            autoLogin: legacy["is_auto-login"] !== false,
+            autoDashboard: legacy["is_auto-dashboard"] !== false,
+            autoSelect: legacy["is_sel-1st-slot"] !== false,
+            autoSubmit: legacy["is_auto-submit"] === true,
+            captchaMode: legacy.captchaMode || "manual",
+          });
+          await saveUserProfiles(profiles);
+          log("Migrated legacy settings to multi-user profile");
+        }
+      }
+
+      await refreshUserDropdown(profiles.length > 0 ? profiles[0].username : "__new__");
+      if (profiles.length > 0) {
+        populateForm(profiles[0]);
+      }
+    })();
+
+    // Save handler — saves to profile list AND sets as active loginDetails
+    document.getElementById("sp-save-btn").addEventListener("click", async () => {
+      const formData = getFormData();
+
+      if (!formData.username) {
+        const status = document.getElementById("sp-save-status");
+        status.textContent = "Enter username!";
+        status.style.color = "#e74c3c";
+        setTimeout(() => { status.textContent = ""; status.style.color = "#27ae60"; }, 3000);
+        return;
+      }
+
+      // Update or add profile
+      let profiles = await loadUserProfiles();
+      const idx = profiles.findIndex((p) => p.username === formData.username);
+      const profile = {
+        ...formData,
+        name: deriveProfileName(formData.username),
       };
 
-      const securityQuestions = {};
-      for (let i = 1; i <= 3; i++) {
-        const q = document.getElementById(`sp-q${i}`).value;
-        const a = document.getElementById(`sp-a${i}`).value;
-        if (q && a) securityQuestions[q] = a;
+      if (idx >= 0) {
+        profiles[idx] = profile;
+      } else {
+        profiles.push(profile);
       }
 
-      const captchaMode = document.querySelector('input[name="sp-captcha"]:checked')?.value || "manual";
+      await saveUserProfiles(profiles);
 
-      chrome.storage.local.set(
-        {
-          loginDetails,
-          securityQuestions,
-          "is_auto-login": document.getElementById("sp-auto-login").checked,
-          "is_auto-dashboard": document.getElementById("sp-auto-dashboard").checked,
-          "is_sel-1st-slot": document.getElementById("sp-auto-select").checked,
-          "is_auto-submit": document.getElementById("sp-auto-submit").checked,
-          captchaMode,
-        },
-        () => {
-          const status = document.getElementById("sp-save-status");
-          status.textContent = "Saved!";
-          setTimeout(() => (status.textContent = ""), 3000);
-          log("All settings saved");
-        }
-      );
+      // Set as active user for login/security/dashboard handlers
+      chrome.storage.local.set({
+        loginDetails: { username: formData.username, password: formData.password },
+        securityQuestions: formData.securityQuestions,
+        "is_auto-login": formData.autoLogin,
+        "is_auto-dashboard": formData.autoDashboard,
+        "is_sel-1st-slot": formData.autoSelect,
+        "is_auto-submit": formData.autoSubmit,
+        captchaMode: formData.captchaMode,
+      });
+
+      await refreshUserDropdown(formData.username);
+
+      const status = document.getElementById("sp-save-status");
+      status.textContent = "Saved!";
+      setTimeout(() => (status.textContent = ""), 3000);
+      log("Profile saved: " + formData.username);
     });
 
     // START button: save + trigger login
@@ -433,10 +668,43 @@
 
   // ─── LOGIN PAGE (panel only — waits for START, unless re-login) ────
 
+  function isSecurityQuestionsPage() {
+    return document.querySelectorAll('[id$="_response"]').length >= 2;
+  }
+
+  function waitForB2CPageReady() {
+    return new Promise((resolve) => {
+      let checks = 0;
+      const interval = setInterval(() => {
+        checks++;
+        if (document.getElementById("signInName") || document.getElementById("captchaImage")) {
+          clearInterval(interval);
+          resolve("login");
+        } else if (isSecurityQuestionsPage()) {
+          clearInterval(interval);
+          resolve("security");
+        } else if (checks > 6) {
+          clearInterval(interval);
+          resolve("unknown");
+        }
+      }, 500);
+    });
+  }
+
   async function handleLoginPage() {
+    const pageType = await waitForB2CPageReady();
+
+    if (pageType === "security") {
+      log("On security questions page — skipping settings panel");
+      const settings = await getSettings();
+      if (settings.securityQuestions) {
+        await handleSecurityQuestions(settings.securityQuestions);
+      }
+      return;
+    }
+
     injectSettingsPanel();
 
-    // If re-login flag is set (session expired during cycling), auto-login immediately
     if (sessionStorage.getItem(RELOGIN_FLAG) === "true") {
       sessionStorage.removeItem(RELOGIN_FLAG);
       log("Re-login triggered after session expiry — auto-starting...");
@@ -454,6 +722,15 @@
   // ─── DASHBOARD ──────────────────────────────────────────────────────
 
   async function handleDashboard(settings) {
+    // Waiting room detection — page says "waiting room", auto-refresh until login/dashboard loads
+    const bodyText = document.body?.innerText || "";
+    if (bodyText.includes("waiting room") || bodyText.includes("will be redirected")) {
+      log("Waiting room detected — refreshing in 10s...");
+      await sleep(10000);
+      window.location.reload();
+      return;
+    }
+
     // After re-login, always auto-navigate to booking page
     const savedState = getReloginState();
     if (savedState && savedState.active) {
@@ -568,25 +845,28 @@
 
     mainContainer.parentNode.insertBefore(panel, mainContainer);
 
+    // Auto-populate from active user's profile
     chrome.storage.local.get(
-      ["preferred_window", "preferred_locations"],
+      ["loginDetails", "userProfilesList"],
       (data) => {
-        if (data.preferred_window) {
+        const activeUser = data.loginDetails?.username;
+        const profiles = data.userProfilesList || [];
+        const profile = activeUser ? profiles.find((p) => p.username === activeUser) : null;
+
+        if (profile) {
           const sd = document.getElementById("ab-start-date");
           const ed = document.getElementById("ab-end-date");
-          if (sd && data.preferred_window.slot_start_date)
-            sd.value = data.preferred_window.slot_start_date;
-          if (ed && data.preferred_window.slot_end_date)
-            ed.value = data.preferred_window.slot_end_date;
-        }
-        if (data.preferred_locations) {
-          const key = isOFC ? "ofc" : "ca";
-          const prefs = data.preferred_locations[key];
-          if (prefs && prefs.length > 0) {
+          if (sd && profile.startDate) sd.value = profile.startDate;
+          if (ed && profile.endDate) ed.value = profile.endDate;
+
+          if (profile.locations && profile.locations.length > 0) {
             document.querySelectorAll(".ab-loc-cb").forEach((cb) => {
-              cb.checked = prefs.includes(cb.dataset.name);
+              cb.checked = profile.locations.some(
+                (loc) => cb.dataset.name.toLowerCase().includes(loc.toLowerCase())
+              );
             });
           }
+          log("Booking panel auto-populated from profile: " + (profile.name || activeUser));
         }
       }
     );
@@ -785,12 +1065,16 @@
     stopBtn.disabled = false;
     stopBtn.style.opacity = "1";
 
-    // Save current date preferences
-    chrome.storage.local.set({
-      preferred_window: {
-        slot_start_date: document.getElementById("ab-start-date")?.value || "",
-        slot_end_date: document.getElementById("ab-end-date")?.value || "",
-      },
+    // Save dates back to active user's profile
+    chrome.storage.local.get(["loginDetails", "userProfilesList"], (data) => {
+      const activeUser = data.loginDetails?.username;
+      const profiles = data.userProfilesList || [];
+      const idx = profiles.findIndex((p) => p.username === activeUser);
+      if (idx >= 0) {
+        profiles[idx].startDate = document.getElementById("ab-start-date")?.value || "";
+        profiles[idx].endDate = document.getElementById("ab-end-date")?.value || "";
+        chrome.storage.local.set({ userProfilesList: profiles });
+      }
     });
 
     startKeepAlive();
@@ -881,7 +1165,7 @@
     return false;
   }
 
-  async function waitForTimeSlotAndSubmit(timeout = 12000) {
+  async function waitForTimeSlotAndSelect(timeout = 12000) {
     const start = Date.now();
     while (Date.now() - start < timeout) {
       const radio = document.querySelector(
@@ -893,9 +1177,6 @@
 
         const submitBtn = document.getElementById("submitbtn");
         if (submitBtn && !submitBtn.disabled) {
-          setStatus("Slot found — submitting!");
-          await sleep(1000);
-          submitBtn.click();
           return true;
         }
       }
@@ -1025,12 +1306,22 @@
         continue;
       }
 
-      // Wait for time slots to load and submit
+      // Wait for time slots to load
       await sleep(1500);
-      const submitted = await waitForTimeSlotAndSubmit(12000);
+      const slotReady = await waitForTimeSlotAndSelect(12000);
 
-      if (submitted) {
-        stopCycling("Booking submitted!");
+      if (slotReady) {
+        const settings = await getSettings();
+        if (settings["is_auto-submit"]) {
+          setStatus(`${loc.name}: Slot found — auto-submitting!`);
+          await sleep(1000);
+          const submitBtn = document.getElementById("submitbtn");
+          if (submitBtn && !submitBtn.disabled) submitBtn.click();
+          stopCycling("Booking submitted!");
+          return;
+        }
+        // Auto-submit OFF — stop cycling, let user review and submit manually
+        stopCycling(`${loc.name}: Slot found! Review and click Submit.`);
         return;
       }
 
@@ -1127,8 +1418,23 @@
     }
 
     if (host.includes("b2clogin.com")) {
-      log("On login page — waiting for START");
+      sessionStorage.removeItem("__ab401RetryCount");
+      log("On b2clogin.com — detecting page type...");
       await handleLoginPage();
+      return;
+    }
+
+    if (path.includes("signin-aad-b2c") || document.querySelector("h1")?.textContent?.trim() === "Page Not Found") {
+      const retryCount = parseInt(sessionStorage.getItem("__ab401RetryCount") || "0");
+      if (retryCount < 10) {
+        sessionStorage.setItem("__ab401RetryCount", String(retryCount + 1));
+        log(`Page Not Found — retry ${retryCount + 1}/10, refreshing in 3s...`);
+        await sleep(3000);
+        window.location.href = window.location.origin + "/";
+      } else {
+        sessionStorage.removeItem("__ab401RetryCount");
+        log("Page Not Found — max retries reached, stopping.");
+      }
       return;
     }
 

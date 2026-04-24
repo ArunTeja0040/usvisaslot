@@ -4,60 +4,98 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Multi-user automated US visa appointment bot targeting https://usvisascheduling.com for Indian consulates (Mumbai, New Delhi, Chennai, Kolkata, Hyderabad). Handles the full 6-step booking flow: login → security questions → dashboard → OFC booking → interview booking → confirmation download. Uses Playwright for browser automation and Telegram for notifications.
+Chrome extension for automated US visa appointment booking on https://usvisascheduling.com for Indian consulates (Mumbai, New Delhi, Chennai, Kolkata, Hyderabad). Handles: login with CAPTCHA solving, security questions, dashboard navigation, and OFC/interview slot cycling with auto-submit.
 
 ## Setup & Run
 
-```bash
-pip install -r requirements.txt
-playwright install chromium
-cp .env.example .env          # fill in Telegram token + settings
-cp users.json.example users.json  # or edit users.json directly — add each user's credentials
-python main.py
-```
+1. Load extension in Chrome:
+   - Go to `chrome://extensions/` → Enable Developer mode → Load unpacked → select `extension/` folder
+2. Start CAPTCHA solver server:
+   ```bash
+   pip install ddddocr
+   python captcha_server.py
+   ```
+3. Open https://usvisascheduling.com → settings panel appears on login page → fill credentials → click SAVE & START
 
 ## Architecture
 
-The bot follows the exact 6-step flow of usvisascheduling.com:
+```
+extension/
+  ├── manifest.json           MV3 manifest — permissions, content scripts, service worker
+  ├── js/auto-booking.js      Main automation (login, CAPTCHA, security Qs, dashboard, cycling)
+  ├── js/sw-enhanced.js       Service worker — relays CAPTCHA images to local solver
+  ├── js/content.js           Original CVS extension — slot display, date selection, XHR processing
+  ├── js/page.js              MAIN world script — intercepts XHR, dispatches vSCP events
+  ├── js/options-init.js      Options page logic (not used in current flow)
+  ├── js/html2canvas.js       Screenshot library
+  ├── js/html2pdf.bundle.min.js  PDF generation for confirmations
+  ├── js/sweetalert2.min.js   Alert dialogs
+  ├── options.html             Options page HTML
+  └── css/sidebar.css          Sidebar styles
+
+captcha_server.py             Local OCR server (ddddocr) on port 5123
+```
+
+### Flow
 
 ```
-main.py (orchestrator — loops users × cycles)
-  ├── login.py          Step 1: Login (username + password + CAPTCHA)
-  │                     Step 2: Security Questions (2 of 3, randomly selected)
-  ├── dashboard.py      Step 3: Click Schedule or Reschedule button
-  ├── ofc_booking.py    Step 4: OFC — select location, green date box, time slot, submit
-  ├── interview_booking.py  Step 5: Interview — date dropdown, time slot, submit
-  │                         Handles 20-30 min edge case + OFC reset detection
-  ├── confirmation.py   Step 6: Download/screenshot confirmation document
-  ├── notifier.py       Telegram notifications (per-user chat_id)
-  ├── models.py         UserProfile and BookingResult dataclasses
-  └── config.py         .env + users.json loading
+Login Page (b2clogin.com)
+  → Settings panel injected (position:fixed, left side)
+  → User clicks SAVE & START
+  → Auto-fill username/password
+  → CAPTCHA: capture image → canvas → base64 → service worker → localhost:5123 → ddddocr OCR
+  → CAPTCHA rules: must be exactly 5 alphanumeric chars, uppercase only
+  → Click Continue
+  → If wrong: refresh CAPTCHA, retry (up to 5 attempts)
+
+Security Questions Page (b2clogin.com)
+  → Detect 2 questions from saved answers
+  → Auto-fill and click Continue
+
+Dashboard (usvisascheduling.com)
+  → Auto-click Reschedule/Continue button
+
+Booking Page — OFC or Interview (usvisascheduling.com)
+  → Booking panel injected (date range, location checkboxes, START/STOP)
+  → Cycling: iterate through selected locations
+  → 3-6 second random delay between locations (avoid Cloudflare rate limit)
+  → Listen for vSCP events from page.js for schedule data
+  → If dates found in preferred range → STOP cycling, select date, wait for user to submit
+  → If auto-submit enabled → auto-select time slot and click submit
 ```
 
-### Multi-user flow
-- Each user gets an isolated browser context (separate cookies/session)
-- Users are processed sequentially with random delays between them
-- Completed users are skipped in subsequent cycles
-- Bot stops when all users are booked or manually stopped (Ctrl+C)
+### Key Design Decisions
 
-### Edge case: OFC → Interview timing gap
-After OFC booking, interview dates may not appear for 20-30 minutes. The bot retries within `INTERVIEW_WAIT_MINUTES`. If OFC becomes unblocked during this wait (status resets to PENDING), it raises `OFCResetRequired` and restarts from Step 4.
+- **SAVE & START gate**: All automation (login, security Qs, dashboard, auto-submit) only triggers after user explicitly clicks SAVE & START. Without it, the site works normally. Uses `sessionStorage` flag.
+- **Content script worlds**: auto-booking.js runs in ISOLATED world. page.js runs in MAIN world (intercepts XHR). Communication via CustomEvents (`vSCP`).
+- **CAPTCHA canvas approach**: Image drawn to canvas → toDataURL → base64. Works because CAPTCHA is same-origin on b2clogin.com.
+- **CSP workaround**: `clickSafe()` strips `javascript:` href before clicking to avoid CSP violations on b2clogin.com.
 
-## Critical: Selectors Need Updating
+### Error Handling
 
-All CSS selectors across `login.py`, `dashboard.py`, `ofc_booking.py`, `interview_booking.py`, and `confirmation.py` are **placeholders** marked with `--- UPDATE ---` comments. You must:
+- **401 Unauthorized**: DOM bridge detection (hidden div + MutationObserver crosses MAIN/ISOLATED world boundary). Saves cycling state to sessionStorage, redirects to login, auto-re-logins, restores cycling.
+- **429 Rate Limited (Cloudflare)**: Detected via same DOM bridge. Exponential backoff: 60s → 120s → 240s → max 5min. Resets after successful request.
+- **Rate limit warning** ("approaching maximum number of times"): Auto-logout to protect session.
+- **Session keep-alive**: Page refreshes every ~8 minutes during cycling to prevent session expiry.
 
-1. Open https://usvisascheduling.com in a browser with DevTools
-2. Inspect each page (login form, security questions, dashboard, OFC calendar, interview dropdown, confirmation)
-3. Update the selectors in each file to match the real DOM
+## Files
 
-## Configuration
+| File | Purpose |
+|---|---|
+| `extension/js/auto-booking.js` | All automation logic — the main file you'll edit |
+| `extension/js/sw-enhanced.js` | Service worker — CAPTCHA relay + slot data push |
+| `extension/js/content.js` | Original CVS extension (minified, read-only) |
+| `extension/js/page.js` | MAIN world XHR interceptor |
+| `captcha_server.py` | Local ddddocr OCR server |
+| `extension/manifest.json` | Extension config |
 
-- `.env` — global settings (Telegram token, delays, CAPTCHA mode, headless)
-- `users.json` — per-user credentials, security answers, consulate preferences, date ranges, Telegram chat IDs
+## CAPTCHA Details
 
-## CAPTCHA Handling
+- Server: `captcha_server.py` on `localhost:5123` using `ddddocr` library
+- Rules: always 5 characters, alphabets always uppercase, alphanumeric only
+- Flow: image → canvas → base64 → service worker → POST to server → OCR → clean (strip special chars, uppercase, validate 5 chars) → return or reject and refresh
+- Max 5 retry attempts before falling back to manual
 
-Set `CAPTCHA_MODE` in `.env`:
-- `manual` — bot pauses and waits up to 3 min for you to solve in the browser (requires `HEADLESS=false`)
-- `2captcha` — placeholder for 2Captcha API integration (not yet implemented)
+## Branch
+
+Active branch: `extension-v2-enhanced`

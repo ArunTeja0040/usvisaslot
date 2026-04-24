@@ -8,7 +8,6 @@
     "action": {
         "default_icon": { "32": "img/32.png" }
     },
-    "options_page": "options.html",
     "icons": {
         "24": "img/24.png",
         "32": "img/32.png",
@@ -23,7 +22,6 @@
                 "https://atlasauth.b2clogin.com/*"
             ],
             "js": ["js/html2canvas.js", "js/content.js", "js/auto-booking.js"],
-            "css": ["css/sidebar.css"],
             "run_at": "document_end"
         },
         {
@@ -39,14 +37,7 @@
         "https://atlasauth.b2clogin.com/*",
         "http://localhost/*"
     ],
-    "web_accessible_resources": [
-        {
-            "matches": ["<all_urls>"],
-            "resources": ["popup.html"],
-            "use_dynamic_url": true
-        }
-    ],
-    "externally_connectable": {
+"externally_connectable": {
         "matches": ["https://*.checkvisaslots.com/*"]
     }
 }
