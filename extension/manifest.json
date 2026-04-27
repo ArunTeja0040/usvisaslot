@@ -17,8 +17,14 @@
     },
     "content_scripts": [
         {
+            "matches": ["https://*.usvisascheduling.com/*"],
+            "js": ["js/alert-override.js"],
+            "run_at": "document_start",
+            "world": "MAIN"
+        },
+        {
             "matches": [
-				"https://*.usvisascheduling.com/*/*",
+				"https://*.usvisascheduling.com/*",
                 "https://atlasauth.b2clogin.com/*"
             ],
             "js": ["js/html2canvas.js", "js/content.js", "js/auto-booking.js"],
@@ -31,11 +37,13 @@
             "run_at": "document_start"
         }
     ],
-    "permissions": ["storage", "activeTab", "scripting"],
+    "permissions": ["storage", "activeTab", "scripting", "tabs", "alarms"],
     "host_permissions": [
         "https://*.usvisascheduling.com/*",
         "https://atlasauth.b2clogin.com/*",
-        "http://localhost/*"
+        "http://localhost/*",
+        "https://docs.google.com/*",
+        "https://api.telegram.org/*"
     ],
 "externally_connectable": {
         "matches": ["https://*.checkvisaslots.com/*"]

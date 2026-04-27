@@ -4,13 +4,71 @@
   const LOG_PREFIX = "[AutoBook]";
   const CAPTCHA_MAX_RETRIES = 5;
   const DASHBOARD_CLICK_DELAY = 2000;
+  const MAX_EVENT_LOG = 500;
+  const RELOGIN_FLAG = "__autoBookingRelogin";
+  let __abortAll = false;
+
+  const EVENT_TYPES = {
+    LOGIN: "login", CAPTCHA: "captcha", SECURITY: "security",
+    DASHBOARD: "dashboard", CYCLING: "cycling", SLOT_FOUND: "slot_found",
+    BOOKING: "booking", ERROR: "error", QUEUE: "queue", SESSION: "session",
+  };
 
   function log(msg) {
     console.log(`${LOG_PREFIX} ${msg}`);
   }
 
+  function trackEvent(type, message, username, extra) {
+    const event = {
+      id: Date.now() + "_" + Math.random().toString(36).substring(2, 6),
+      type, message, username: username || "",
+      timestamp: new Date().toISOString(),
+      ...extra,
+    };
+    chrome.storage.local.get(["eventLog"], (data) => {
+      const events = data.eventLog || [];
+      events.unshift(event);
+      if (events.length > MAX_EVENT_LOG) events.length = MAX_EVENT_LOG;
+      chrome.storage.local.set({ eventLog: events });
+    });
+    log(`[${type}] ${message}`);
+  }
+
+  function updateUserStatus(username, status, extra) {
+    if (!username) return;
+    chrome.storage.local.get(["userStatuses"], (data) => {
+      const statuses = data.userStatuses || {};
+      statuses[username] = {
+        ...(statuses[username] || {}),
+        ...extra,
+        status,
+        updatedAt: new Date().toISOString(),
+      };
+      chrome.storage.local.set({ userStatuses: statuses });
+    });
+  }
+
   function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
+  }
+
+  function sendTelegramNotification(type, message) {
+    chrome.storage.local.get(["telegramBotToken", "telegramChatId", "telegramNotify"], (data) => {
+      if (!data.telegramBotToken || !data.telegramChatId) return;
+      const notify = data.telegramNotify || { slot: true, confirmed: true, error: true, rate: true, login: true, cycling: true, stopped: true };
+      if (notify[type] === false) return;
+
+      const ts = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true, hour: "2-digit", minute: "2-digit", second: "2-digit", day: "2-digit", month: "short" });
+      const fullMessage = message + `\n\n🕐 <i>${ts} IST</i>`;
+
+      chrome.runtime.sendMessage({ action: "sendTelegram", text: fullMessage }, (resp) => {
+        if (chrome.runtime.lastError) {
+          log("Telegram send failed: " + chrome.runtime.lastError.message);
+        } else if (resp && !resp.ok) {
+          log("Telegram error: " + (resp.error || "unknown"));
+        }
+      });
+    });
   }
 
   function getSettings() {
@@ -92,17 +150,25 @@
     }
 
     log("CAPTCHA mode: auto — solving...");
+    const activeUser = (await getSettings()).loginDetails?.username || "";
+    trackEvent(EVENT_TYPES.CAPTCHA, "Auto-solving CAPTCHA", activeUser);
 
-    for (let attempt = 1; ; attempt++) {
+    for (let attempt = 1; attempt <= CAPTCHA_MAX_RETRIES; attempt++) {
+      if (__abortAll) { log("CAPTCHA aborted"); return; }
       await sleep(1000);
 
       if (!captchaImg.complete || !captchaImg.naturalWidth) {
-        await new Promise((r) => (captchaImg.onload = r));
+        await Promise.race([
+          new Promise((r) => captchaImg.addEventListener("load", r, { once: true })),
+          new Promise((r) => captchaImg.addEventListener("error", r, { once: true })),
+          sleep(10000),
+        ]);
       }
 
       const answer = await solveCaptchaOCR(captchaImg);
       if (!answer) {
         log(`Attempt ${attempt}: OCR failed, refreshing...`);
+        trackEvent(EVENT_TYPES.CAPTCHA, `Attempt ${attempt}: OCR failed`, activeUser);
         clickSafe(refreshBtn);
         await sleep(2000);
         continue;
@@ -120,31 +186,59 @@
       const errorEl = document.getElementById("claimVerificationServerError");
       if (errorEl && errorEl.textContent.toLowerCase().includes("captcha")) {
         log(`Attempt ${attempt}: CAPTCHA failed, retrying...`);
+        trackEvent(EVENT_TYPES.CAPTCHA, `Attempt ${attempt}: Wrong answer "${answer}"`, activeUser);
         clickSafe(refreshBtn);
         await sleep(2000);
         continue;
       }
 
+      trackEvent(EVENT_TYPES.CAPTCHA, `Solved on attempt ${attempt}`, activeUser);
       log("CAPTCHA appears solved or page navigated");
       return;
     }
 
-    log("CAPTCHA loop exited unexpectedly");
+    log("CAPTCHA max retries reached — falling back to manual");
+    trackEvent(EVENT_TYPES.CAPTCHA, `Failed after ${CAPTCHA_MAX_RETRIES} attempts — manual input needed`, activeUser);
     captchaInput.focus();
   }
 
   // ─── SECURITY QUESTIONS ─────────────────────────────────────────────
 
-  async function handleSecurityQuestions(securityQAs) {
+  function normalizeQ(text) {
+    return text.toLowerCase().replace(/[^a-z0-9]/g, "");
+  }
+
+  function findAnswer(securityQAs, questionText) {
+    const exact = securityQAs[questionText];
+    if (exact) return exact;
+
+    const normQ = normalizeQ(questionText);
+    for (const [savedQ, answer] of Object.entries(securityQAs)) {
+      if (normalizeQ(savedQ) === normQ) return answer;
+      if (normQ.includes(normalizeQ(savedQ)) || normalizeQ(savedQ).includes(normQ)) return answer;
+    }
+    return null;
+  }
+
+  async function handleSecurityQuestions(securityQAs, retries = 0) {
+    if (__abortAll) { log("Security questions aborted"); return; }
     const questionItems = document.querySelectorAll(
       "#attributeList li.Paragraph"
     );
     if (questionItems.length < 2) {
+      if (retries >= 15) {
+        log("Security questions not found after 15 retries");
+        return;
+      }
       await sleep(1000);
-      return handleSecurityQuestions(securityQAs);
+      return handleSecurityQuestions(securityQAs, retries + 1);
     }
 
+    const activeUser = (await getSettings()).loginDetails?.username || "";
     log("Security questions detected");
+    log("Saved Q&A keys: " + Object.keys(securityQAs).join(" | "));
+    trackEvent(EVENT_TYPES.SECURITY, "Security questions page detected", activeUser);
+    updateUserStatus(activeUser, "security_questions");
     let answered = 0;
 
     for (const item of questionItems) {
@@ -152,7 +246,7 @@
       if (!questionEl) continue;
 
       const questionText = questionEl.textContent.trim();
-      const answer = securityQAs[questionText];
+      const answer = findAnswer(securityQAs, questionText);
 
       if (answer) {
         const answerInput = item.nextElementSibling?.querySelector(
@@ -165,17 +259,21 @@
           log(`Answered: "${questionText.substring(0, 50)}..."`);
         }
       } else {
-        log(`No answer found for: "${questionText.substring(0, 50)}..."`);
+        log(`No answer found for: "${questionText}"`);
       }
     }
 
     if (answered >= 2) {
-      await sleep(1000);
+      trackEvent(EVENT_TYPES.SECURITY, `Answered ${answered} questions`, activeUser);
+      sendTelegramNotification("login", `🔑 <b>LOGIN SUCCESSFUL</b>\n\n👤 <b>User:</b> ${activeUser}\n✅ Security questions answered\n🔄 Navigating to dashboard...`);
+      await sleep(2000);
       const continueBtn = document.getElementById("continue");
       if (continueBtn) {
         log("Clicking Continue after security questions");
         continueBtn.click();
       }
+    } else {
+      trackEvent(EVENT_TYPES.ERROR, `Only answered ${answered}/2 security questions`, activeUser);
     }
   }
 
@@ -328,6 +426,351 @@
     if (delBtn) delBtn.style.display = sel.value === "__new__" ? "none" : "inline-block";
   }
 
+  // ─── GOOGLE SHEETS SYNC ──────────────────────────────────────────
+
+  function toCSVExportUrl(url) {
+    // Convert any Google Sheet URL to published CSV export URL
+    const match = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
+    if (!match) return url; // already a direct URL or invalid
+    const sheetId = match[1];
+    return `https://docs.google.com/spreadsheets/d/${sheetId}/pub?output=csv`;
+  }
+
+  function parseCSVLine(line) {
+    const fields = [];
+    let current = "";
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (inQuotes) {
+        if (ch === '"' && line[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else if (ch === '"') {
+          inQuotes = false;
+        } else {
+          current += ch;
+        }
+      } else {
+        if (ch === '"') {
+          inQuotes = true;
+        } else if (ch === ',') {
+          fields.push(current.trim());
+          current = "";
+        } else {
+          current += ch;
+        }
+      }
+    }
+    fields.push(current.trim());
+    return fields;
+  }
+
+  function parseSheetCSV(csvText) {
+    const lines = csvText.split(/\r?\n/).filter((l) => l.trim());
+    if (lines.length < 2) return [];
+
+    const headers = parseCSVLine(lines[0]).map((h) => h.toLowerCase().trim());
+    const profiles = [];
+
+    for (let i = 1; i < lines.length; i++) {
+      const fields = parseCSVLine(lines[i]);
+      if (fields.length < 2) continue;
+
+      const row = {};
+      headers.forEach((h, idx) => (row[h] = fields[idx] || ""));
+
+      if (!row.username) continue;
+
+      const securityQuestions = {};
+      if (row.q1 && row.a1) securityQuestions[row.q1] = row.a1;
+      if (row.q2 && row.a2) securityQuestions[row.q2] = row.a2;
+      if (row.q3 && row.a3) securityQuestions[row.q3] = row.a3;
+
+      const locations = row.locations
+        ? row.locations.split(/[,;|]/).map((l) => l.trim()).filter(Boolean)
+        : [];
+
+      profiles.push({
+        username: row.username.trim(),
+        password: row.password || "",
+        name: deriveProfileName(row.username.trim()),
+        securityQuestions,
+        startDate: row.startdate || row["start date"] || "",
+        endDate: row.enddate || row["end date"] || "",
+        locations,
+        visaType: row.visatype || row["visa type"] || "",
+        agreedPrice: row.price || row.agreedprice || "",
+        autoLogin: true,
+        autoDashboard: true,
+        autoSelect: true,
+        autoSubmit: false,
+        captchaMode: "auto",
+      });
+    }
+    return profiles;
+  }
+
+  async function syncFromGoogleSheet(url) {
+    const csvUrl = toCSVExportUrl(url);
+    log("Syncing from Google Sheet: " + csvUrl);
+
+    const resp = await fetch(csvUrl);
+    if (!resp.ok) throw new Error(`Failed to fetch sheet: ${resp.status}`);
+
+    const csvText = await resp.text();
+    const sheetProfiles = parseSheetCSV(csvText);
+
+    if (sheetProfiles.length === 0) throw new Error("No valid profiles found in sheet");
+
+    // Merge: update existing by username, add new, keep local-only
+    let existing = await loadUserProfiles();
+    let added = 0, updated = 0;
+
+    for (const sp of sheetProfiles) {
+      const idx = existing.findIndex((p) => p.username === sp.username);
+      if (idx >= 0) {
+        // Merge: sheet data overwrites, but keep local automation toggles
+        existing[idx] = {
+          ...existing[idx],
+          password: sp.password || existing[idx].password,
+          securityQuestions: Object.keys(sp.securityQuestions).length > 0
+            ? sp.securityQuestions : existing[idx].securityQuestions,
+          startDate: sp.startDate || existing[idx].startDate,
+          endDate: sp.endDate || existing[idx].endDate,
+          locations: sp.locations.length > 0 ? sp.locations : existing[idx].locations,
+          visaType: sp.visaType || existing[idx].visaType,
+          agreedPrice: sp.agreedPrice || existing[idx].agreedPrice,
+          name: sp.name,
+        };
+        updated++;
+      } else {
+        existing.push(sp);
+        added++;
+      }
+    }
+
+    await saveUserProfiles(existing);
+    return { added, updated, total: existing.length };
+  }
+
+  // ─── PASTE CLIENT MESSAGE PARSER ─────────────────────────────────
+
+  const SECURITY_QUESTION_MAP = {
+    "birth ?place|town.+born|city.+born|where.+born": "What is the name of the town/city where you were born?",
+    "favorite food|fav.?food": "What is your favorite food?",
+    "childhood hero": "Who was your childhood hero?",
+    "spouse|meet.+spouse|where.+meet": "Where did you meet your spouse?",
+    "sibling.+middle|middle.+name.+sibling": "What is your sibling's middle name?",
+    "first.+job.+city|city.+first.+job": "In what city or town was your first job?",
+    "college.+not.+attend|college.+didn": "What is the name of a college you applied to but didn't attend?",
+    "street.+grew|road.+grew|grew.+up.+street|grew.+up.+road": "What is the name of the road/street you grew up on?",
+    "least.+fav.+food|least.+favorite.+food": "What is your least favorite food?",
+    "first.+company|company.+work": "What was the first company that you worked for?",
+    "high.?school": "What high school did you attend?",
+    "mother.+maiden|maiden.+name": "What is your mother's maiden name?",
+    "first.+pet|favorite.+pet|current.+pet|pet.+name": "What was the name of your first/current/favorite pet?",
+    "first.+car": "What was your first car?",
+    "elementary.+school": "What elementary school did you attend?",
+  };
+
+  const MONTH_MAP = {
+    jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2,
+    apr: 3, april: 3, may: 4, jun: 5, june: 5, jul: 6, july: 6,
+    aug: 7, august: 7, sep: 8, september: 8, oct: 9, october: 9,
+    nov: 10, november: 10, dec: 11, december: 11,
+  };
+
+  const LOCATION_ALIASES = {
+    "hyd": "Hyderabad", "hyderabad": "Hyderabad",
+    "mum": "Mumbai", "mumbai": "Mumbai", "bombay": "Mumbai",
+    "del": "New Delhi", "delhi": "New Delhi", "new delhi": "New Delhi",
+    "chen": "Chennai", "chennai": "Chennai", "madras": "Chennai",
+    "kol": "Kolkata", "kolkata": "Kolkata", "calcutta": "Kolkata",
+  };
+
+  function parseMonthRange(text) {
+    const lower = text.toLowerCase().replace(/[^a-z0-9\s,&-]/g, " ");
+    const year = new Date().getFullYear();
+
+    const monthEntries = [];
+    for (const [name, num] of Object.entries(MONTH_MAP)) {
+      const idx = lower.indexOf(name);
+      if (idx !== -1) {
+        const alreadyAdded = monthEntries.find((e) => e.num === num);
+        if (!alreadyAdded) monthEntries.push({ num, idx });
+      }
+    }
+    if (monthEntries.length === 0) return { startDate: "", endDate: "" };
+    monthEntries.sort((a, b) => a.idx - b.idx);
+
+    function weekToDay(monthNum, textAfterMonth) {
+      const wk = textAfterMonth.match(/(\d)\s*(?:st|nd|rd|th)?\s*week/);
+      if (wk) {
+        const weekNum = parseInt(wk[1]);
+        const day = Math.min((weekNum - 1) * 7 + 1, new Date(year, monthNum + 1, 0).getDate());
+        return day;
+      }
+      return null;
+    }
+
+    const firstEntry = monthEntries[0];
+    const lastEntry = monthEntries[monthEntries.length - 1];
+
+    const textAfterFirst = lower.substring(firstEntry.idx);
+    const startWeekDay = weekToDay(firstEntry.num, textAfterFirst);
+    const startDay = startWeekDay || 1;
+    const startDate = `${year}-${String(firstEntry.num + 1).padStart(2, "0")}-${String(startDay).padStart(2, "0")}`;
+
+    const textAfterLast = lower.substring(lastEntry.idx);
+    const endWeekDay = weekToDay(lastEntry.num, textAfterLast);
+    let endDay;
+    if (endWeekDay) {
+      endDay = Math.min(endWeekDay + 6, new Date(year, lastEntry.num + 1, 0).getDate());
+    } else {
+      endDay = new Date(year, lastEntry.num + 1, 0).getDate();
+    }
+    const endDate = `${year}-${String(lastEntry.num + 1).padStart(2, "0")}-${String(endDay).padStart(2, "0")}`;
+    return { startDate, endDate };
+  }
+
+  function parsePrice(text) {
+    const lower = text.toLowerCase().replace(/,/g, "");
+    const match = lower.match(/(\d+\.?\d*)\s*k/);
+    if (match) return String(Math.round(parseFloat(match[1]) * 1000));
+    const numMatch = lower.match(/(\d+)/);
+    return numMatch ? numMatch[1] : "";
+  }
+
+  function parseLocations(text) {
+    const lower = text.toLowerCase();
+    const found = [];
+    for (const [alias, city] of Object.entries(LOCATION_ALIASES)) {
+      if (lower.includes(alias) && !found.includes(city)) found.push(city);
+    }
+    return found;
+  }
+
+  function matchSecurityQuestion(key) {
+    const lower = key.toLowerCase().replace(/[^a-z\s]/g, "");
+    for (const [pattern, question] of Object.entries(SECURITY_QUESTION_MAP)) {
+      if (new RegExp(pattern, "i").test(lower)) return question;
+    }
+    return null;
+  }
+
+  function parseClientMessage(text) {
+    const profile = {
+      username: "", password: "", securityQuestions: {},
+      startDate: "", endDate: "", locations: [],
+      visaType: "", agreedPrice: "", applicants: "",
+      autoLogin: true, autoDashboard: true, autoSelect: true,
+      autoSubmit: false, captchaMode: "auto",
+    };
+
+    const lines = text.split(/\n/).map((l) => l.trim()).filter(Boolean);
+    let pendingQuestion = null; // for multi-line Q/A detection
+
+    for (let li = 0; li < lines.length; li++) {
+      const line = lines[li];
+
+      // Check if this line IS a known security question (exact or close match)
+      const exactQ = SECURITY_QUESTIONS.find((q) =>
+        line.replace(/[*\d]/g, "").trim().toLowerCase() === q.toLowerCase() ||
+        line.toLowerCase().includes(q.toLowerCase().substring(0, 30))
+      );
+      if (exactQ) {
+        pendingQuestion = exactQ;
+        continue;
+      }
+
+      // Check if this is an answer to a pending question
+      if (pendingQuestion && /^ans(wer)?\s*[:.]?\s*/i.test(line)) {
+        const answer = line.replace(/^ans(wer)?\s*[:.]?\s*/i, "").trim();
+        if (answer) profile.securityQuestions[pendingQuestion] = answer;
+        pendingQuestion = null;
+        continue;
+      }
+
+      // Skip lines like "Security Question 1*"
+      if (/^security\s+question\s*\d/i.test(line)) continue;
+
+      pendingQuestion = null;
+
+      // Try key:value split
+      const colonIdx = line.indexOf(":");
+      if (colonIdx < 0) {
+        // Check for standalone price like "42k agreed"
+        if (/(\d+\.?\d*)\s*k/i.test(line)) {
+          profile.agreedPrice = parsePrice(line);
+        }
+        continue;
+      }
+
+      let key = line.substring(0, colonIdx).replace(/[.\s]+$/g, "").trim();
+      let value = line.substring(colonIdx + 1).trim();
+
+      const keyLower = key.toLowerCase().replace(/[^a-z\s]/g, "");
+
+      // Username (handles typos like "sername", "usrname", etc.)
+      if (/u?ser\s*name|user\s*id|email/i.test(keyLower)) {
+        profile.username = value;
+        continue;
+      }
+
+      // Password
+      if (/pass\s*word|pwd/i.test(keyLower)) {
+        profile.password = value;
+        continue;
+      }
+
+      // Dates
+      if (/date|month|when|prefer.*date|slot.*date/i.test(keyLower)) {
+        const { startDate, endDate } = parseMonthRange(value);
+        if (startDate) profile.startDate = startDate;
+        if (endDate) profile.endDate = endDate;
+        continue;
+      }
+
+      // Location
+      if (/location|city|consulate|place.*prefer|prefer.*place/i.test(keyLower)) {
+        profile.locations = parseLocations(value);
+        continue;
+      }
+
+      // Visa type
+      if (/visa|typ.*visa|visa.*typ/i.test(keyLower)) {
+        profile.visaType = value.replace(/\s+/g, "").toUpperCase();
+        continue;
+      }
+
+      // Price — check before applicants so "18k each person : agreed" isn't consumed by /person/
+      if (/price|cost|amount|fee|\d+\s*k/i.test(key) || (/agreed|confirm|ok|done/i.test(value) && /\d/.test(key))) {
+        profile.agreedPrice = parsePrice(key + " " + value);
+        continue;
+      }
+
+      // Applicants
+      if (/applicant|member|people|person/i.test(keyLower)) {
+        profile.applicants = value.replace(/[^0-9]/g, "");
+        continue;
+      }
+
+      // Security questions — fuzzy match on key
+      const question = matchSecurityQuestion(key);
+      if (question) {
+        profile.securityQuestions[question] = value;
+        continue;
+      }
+    }
+
+    if (profile.username) {
+      profile.name = deriveProfileName(profile.username);
+    }
+
+    return profile;
+  }
+
   function injectSettingsPanel() {
     if (document.getElementById("sp-panel")) return;
 
@@ -344,6 +787,28 @@
         <span id="sp-toggle" style="font-size:18px;line-height:1;">&#9660;</span>
       </div>
       <div id="sp-body" style="background:white;padding:14px;border:1px solid #ddd;border-top:none;border-radius:0 0 8px 8px;">
+
+        <!-- Google Sheet Sync -->
+        <div style="margin-bottom:10px;">
+          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Google Sheet Sync</div>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <input type="text" id="sp-sheet-url" placeholder="Paste Google Sheet URL here" style="flex:1;padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:11px;">
+            <button id="sp-sync-btn" style="background:#2980b9;color:white;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;white-space:nowrap;">SYNC</button>
+          </div>
+          <div id="sp-sync-status" style="font-size:11px;color:#888;margin-top:4px;"></div>
+        </div>
+
+        <!-- Paste Client Message -->
+        <div style="margin-bottom:10px;">
+          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Quick Add (Paste Client Message)</div>
+          <textarea id="sp-paste-box" placeholder="Paste WhatsApp message here...&#10;&#10;username: john123&#10;password: Pass@123&#10;birth place: Mumbai&#10;favorite food: biryani&#10;dates: june and july&#10;location: Hyderabad&#10;visa: H1B&#10;42k: agreed"
+                    style="width:100%;height:0;min-height:0;padding:0;border:1px solid #ccc;border-radius:4px;font-size:11px;font-family:monospace;resize:vertical;box-sizing:border-box;overflow:hidden;transition:all 0.2s;display:none;"></textarea>
+          <div style="display:flex;gap:6px;align-items:center;margin-top:4px;">
+            <button id="sp-paste-toggle" style="background:#8e44ad;color:white;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;">PASTE MESSAGE</button>
+            <button id="sp-paste-parse" style="background:#27ae60;color:white;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;display:none;">ADD PROFILE</button>
+            <span id="sp-paste-status" style="font-size:11px;color:#888;"></span>
+          </div>
+        </div>
 
         <!-- User Profile Selector -->
         <div style="margin-bottom:10px;">
@@ -464,6 +929,124 @@
       }
     });
 
+    // Load saved Google Sheet URL
+    chrome.storage.local.get(["googleSheetUrl"], (data) => {
+      if (data.googleSheetUrl) {
+        document.getElementById("sp-sheet-url").value = data.googleSheetUrl;
+      }
+    });
+
+    // Sync button handler
+    document.getElementById("sp-sync-btn").addEventListener("click", async () => {
+      const urlInput = document.getElementById("sp-sheet-url");
+      const statusEl = document.getElementById("sp-sync-status");
+      const syncBtn = document.getElementById("sp-sync-btn");
+      const url = urlInput.value.trim();
+
+      if (!url) {
+        statusEl.textContent = "Paste a Google Sheet URL first";
+        statusEl.style.color = "#e74c3c";
+        return;
+      }
+
+      // Save the URL
+      chrome.storage.local.set({ googleSheetUrl: url });
+
+      syncBtn.disabled = true;
+      syncBtn.textContent = "Syncing...";
+      statusEl.textContent = "Fetching sheet...";
+      statusEl.style.color = "#888";
+
+      try {
+        const result = await syncFromGoogleSheet(url);
+        statusEl.textContent = `Synced! ${result.added} added, ${result.updated} updated (${result.total} total)`;
+        statusEl.style.color = "#27ae60";
+
+        // Refresh dropdown with updated profiles
+        const profiles = await loadUserProfiles();
+        await refreshUserDropdown(profiles.length > 0 ? profiles[0].username : "__new__");
+        if (profiles.length > 0) populateForm(profiles[0]);
+      } catch (e) {
+        statusEl.textContent = "Sync failed: " + e.message;
+        statusEl.style.color = "#e74c3c";
+        log("Google Sheet sync error: " + e.message);
+      } finally {
+        syncBtn.disabled = false;
+        syncBtn.textContent = "SYNC";
+      }
+    });
+
+    // Paste Message toggle
+    document.getElementById("sp-paste-toggle").addEventListener("click", () => {
+      const box = document.getElementById("sp-paste-box");
+      const parseBtn = document.getElementById("sp-paste-parse");
+      const toggleBtn = document.getElementById("sp-paste-toggle");
+      if (box.style.display === "none") {
+        box.style.display = "block";
+        box.style.height = "120px";
+        box.style.minHeight = "80px";
+        box.style.padding = "6px 8px";
+        parseBtn.style.display = "inline-block";
+        toggleBtn.textContent = "CANCEL";
+        toggleBtn.style.background = "#7f8c8d";
+        box.focus();
+      } else {
+        box.style.display = "none";
+        box.value = "";
+        parseBtn.style.display = "none";
+        toggleBtn.textContent = "PASTE MESSAGE";
+        toggleBtn.style.background = "#8e44ad";
+        document.getElementById("sp-paste-status").textContent = "";
+      }
+    });
+
+    // Parse pasted message and add profile
+    document.getElementById("sp-paste-parse").addEventListener("click", async () => {
+      const box = document.getElementById("sp-paste-box");
+      const statusEl = document.getElementById("sp-paste-status");
+      const text = box.value.trim();
+
+      if (!text) {
+        statusEl.textContent = "Paste a message first";
+        statusEl.style.color = "#e74c3c";
+        return;
+      }
+
+      const parsed = parseClientMessage(text);
+
+      if (!parsed.username) {
+        statusEl.textContent = "Could not find username in message";
+        statusEl.style.color = "#e74c3c";
+        return;
+      }
+
+      // Add/update profile
+      let profiles = await loadUserProfiles();
+      const idx = profiles.findIndex((p) => p.username === parsed.username);
+      if (idx >= 0) {
+        profiles[idx] = { ...profiles[idx], ...parsed, name: parsed.name };
+        statusEl.textContent = `Updated: ${parsed.name}`;
+      } else {
+        profiles.push(parsed);
+        statusEl.textContent = `Added: ${parsed.name}`;
+      }
+      statusEl.style.color = "#27ae60";
+
+      await saveUserProfiles(profiles);
+      await refreshUserDropdown(parsed.username);
+      populateForm(parsed);
+
+      // Collapse paste box
+      box.style.display = "none";
+      box.value = "";
+      document.getElementById("sp-paste-parse").style.display = "none";
+      const toggleBtn = document.getElementById("sp-paste-toggle");
+      toggleBtn.textContent = "PASTE MESSAGE";
+      toggleBtn.style.background = "#8e44ad";
+
+      log("Profile added from pasted message: " + parsed.username);
+    });
+
     // User dropdown change — populate form with selected profile
     document.getElementById("sp-user-select").addEventListener("change", async () => {
       const sel = document.getElementById("sp-user-select");
@@ -481,6 +1064,7 @@
         document.querySelectorAll(".sp-loc-cb").forEach((cb) => (cb.checked = true));
         document.getElementById("sp-visa-type").value = "";
         document.getElementById("sp-price").value = "";
+        document.getElementById("sp-applicants") && (document.getElementById("sp-applicants").value = "");
         if (delBtn) delBtn.style.display = "none";
         return;
       }
@@ -489,7 +1073,12 @@
 
       const profiles = await loadUserProfiles();
       const profile = profiles.find((p) => p.username === sel.value);
-      if (profile) populateForm(profile);
+      if (profile) {
+        log("Loading profile: " + profile.username);
+        populateForm(profile);
+      } else {
+        log("Profile not found for: " + sel.value);
+      }
     });
 
     // Delete button
@@ -635,6 +1224,7 @@
     }
 
     const waitForForm = setInterval(async () => {
+      if (__abortAll) { clearInterval(waitForForm); log("Login aborted"); return; }
       const userField = document.getElementById("signInName");
       const passField = document.getElementById("password");
       const captchaImg = document.getElementById("captchaImage");
@@ -645,6 +1235,8 @@
         await sleep(600);
 
         log("Login form detected — auto-filling...");
+        trackEvent(EVENT_TYPES.LOGIN, "Auto-filling login form", loginDetails.username);
+        updateUserStatus(loginDetails.username, "logging_in");
         userField.value = loginDetails.username;
         userField.dispatchEvent(new Event("input", { bubbles: true }));
         userField.dispatchEvent(new Event("change", { bubbles: true }));
@@ -677,13 +1269,14 @@
       let checks = 0;
       const interval = setInterval(() => {
         checks++;
-        if (document.getElementById("signInName") || document.getElementById("captchaImage")) {
+        if (document.getElementById("signInName") || document.getElementById("captchaImage") ||
+            document.getElementById("extension_atlasCaptchaResponse") || document.getElementById("continue")) {
           clearInterval(interval);
           resolve("login");
         } else if (isSecurityQuestionsPage()) {
           clearInterval(interval);
           resolve("security");
-        } else if (checks > 6) {
+        } else if (checks > 30) {
           clearInterval(interval);
           resolve("unknown");
         }
@@ -703,39 +1296,102 @@
       return;
     }
 
-    injectSettingsPanel();
+    // If page didn't load properly and automation is active, reload to retry
+    if (pageType === "unknown") {
+      const autoUser = await new Promise((r) => {
+        chrome.storage.local.get(["activeAutomationUser"], (d) => r(d.activeAutomationUser || null));
+      });
+      if (autoUser) {
+        const retryCount = parseInt(sessionStorage.getItem("__abLoginRetryCount") || "0");
+        if (retryCount < 5) {
+          sessionStorage.setItem("__abLoginRetryCount", String(retryCount + 1));
+          log(`Login page not ready (attempt ${retryCount + 1}/5) — reloading in 5s...`);
+          trackEvent(EVENT_TYPES.LOGIN, `Login page not ready, retrying (${retryCount + 1}/5)`, autoUser);
+          await sleep(5000);
+          window.location.reload();
+          return;
+        } else {
+          sessionStorage.removeItem("__abLoginRetryCount");
+          log("Login page failed to load after 5 retries");
+          trackEvent(EVENT_TYPES.ERROR, "Login page failed to load after 5 retries", autoUser);
+        }
+      }
+    }
 
-    if (sessionStorage.getItem(RELOGIN_FLAG) === "true") {
+    // Page loaded successfully — clear retry counter
+    sessionStorage.removeItem("__abLoginRetryCount");
+
+    // Check if there's a persistent active automation user (survives page reloads)
+    const activeAutoUser = await new Promise((resolve) => {
+      chrome.storage.local.get(["activeAutomationUser"], (d) => resolve(d.activeAutomationUser || null));
+    });
+    const isRelogin = sessionStorage.getItem(RELOGIN_FLAG) === "true";
+
+    if (activeAutoUser || isRelogin) {
       sessionStorage.removeItem(RELOGIN_FLAG);
-      log("Re-login triggered after session expiry — auto-starting...");
+      const targetUser = activeAutoUser;
+      log(`Auto-starting login (activeUser: ${targetUser || "relogin"})...`);
+      trackEvent(EVENT_TYPES.LOGIN, `Auto-login triggered${isRelogin ? " (re-login after session refresh)" : ""} for ${targetUser || "unknown"}`, targetUser || "");
+
+      // Load the active user's credentials directly — skip settings panel to avoid race conditions
+      if (targetUser) {
+        await new Promise((resolve) => {
+          chrome.storage.local.get(["userProfilesList"], (data) => {
+            const profiles = data.userProfilesList || [];
+            const profile = profiles.find((p) => p.username === targetUser);
+            if (profile) {
+              chrome.storage.local.set({
+                loginDetails: { username: profile.username, password: profile.password },
+                securityQuestions: profile.securityQuestions || {},
+                "is_auto-login": profile.autoLogin !== false,
+                "is_auto-dashboard": profile.autoDashboard !== false,
+                "is_sel-1st-slot": profile.autoSelect !== false,
+                "is_auto-submit": profile.autoSubmit === true,
+                captchaMode: profile.captchaMode || "manual",
+              }, resolve);
+            } else {
+              resolve();
+            }
+          });
+        });
+      }
+
       await sleep(1500);
       const settings = await getSettings();
       if (settings.loginDetails?.username && settings.loginDetails?.password) {
-        const body = document.getElementById("sp-body");
-        if (body) body.style.display = "none";
-        document.getElementById("sp-toggle").innerHTML = "&#9654;";
+        log(`Credentials loaded for: ${settings.loginDetails.username}`);
+        trackEvent(EVENT_TYPES.LOGIN, "Auto-filling login form", settings.loginDetails.username);
+        updateUserStatus(settings.loginDetails.username, "logging_in");
         runLogin(settings);
+      } else {
+        log("No credentials found for active user — falling back to settings panel");
+        trackEvent(EVENT_TYPES.ERROR, "No credentials found for active user — showing settings panel", targetUser || "");
+        injectSettingsPanel();
       }
+    } else {
+      injectSettingsPanel();
     }
   }
 
   // ─── DASHBOARD ──────────────────────────────────────────────────────
 
   async function handleDashboard(settings) {
-    // Waiting room detection — page says "waiting room", auto-refresh until login/dashboard loads
-    const bodyText = document.body?.innerText || "";
-    if (bodyText.includes("waiting room") || bodyText.includes("will be redirected")) {
-      log("Waiting room detected — refreshing in 10s...");
-      await sleep(10000);
-      window.location.reload();
-      return;
-    }
+    const activeUser = settings.loginDetails?.username || "";
+    trackEvent(EVENT_TYPES.DASHBOARD, "Reached dashboard", activeUser);
+    updateUserStatus(activeUser, "on_dashboard");
 
-    // After re-login, always auto-navigate to booking page
+    // Check if automation is still active (persistent flag survives page reloads)
+    const autoUser = await new Promise((r) => {
+      chrome.storage.local.get(["activeAutomationUser"], (d) => r(d.activeAutomationUser || null));
+    });
     const savedState = getReloginState();
+
     if (savedState && savedState.active) {
       log("Re-login complete — auto-navigating from dashboard...");
-    } else if (!settings["is_auto-dashboard"]) {
+      trackEvent(EVENT_TYPES.SESSION, "Re-login complete — navigating from dashboard to booking page", activeUser);
+    } else if (!autoUser && !settings["is_auto-dashboard"]) {
+      log("No active automation and auto-dashboard disabled — stopping");
+      trackEvent(EVENT_TYPES.DASHBOARD, "No active automation — auto-dashboard disabled, stopping", activeUser);
       return;
     }
 
@@ -744,33 +1400,71 @@
       const text = warning.textContent.trim().toLowerCase();
       if (text.includes("exceeded") || text.includes("maximum")) {
         log("Rate limited: " + text);
+        trackEvent(EVENT_TYPES.ERROR, "Rate limit warning on dashboard", activeUser);
+        updateUserStatus(activeUser, "rate_limited");
+        sendTelegramNotification("rate", `🔴 <b>RATE LIMITED</b>\n\n👤 <b>User:</b> ${activeUser}\n⚠️ Dashboard shows: "${text}"\n\nAutomation paused.`);
         return;
       }
     }
 
+    let attempts = 0;
     const waitForBtn = setInterval(() => {
+      if (__abortAll) { clearInterval(waitForBtn); log("Dashboard aborted"); return; }
+      attempts++;
       const rescheduleBtn = document.getElementById("reschedule_appointment");
       const continueBtn = document.getElementById("continue_application");
 
       if (rescheduleBtn) {
         clearInterval(waitForBtn);
         log("Found Reschedule Appointment — clicking...");
+        trackEvent(EVENT_TYPES.DASHBOARD, "Clicking Reschedule Appointment", activeUser);
         setTimeout(() => rescheduleBtn.click(), DASHBOARD_CLICK_DELAY);
-      } else if (continueBtn) {
+        return;
+      }
+      if (continueBtn) {
         clearInterval(waitForBtn);
         log("Found Continue Application — clicking...");
+        trackEvent(EVENT_TYPES.DASHBOARD, "Clicking Continue Application", activeUser);
         setTimeout(() => continueBtn.click(), DASHBOARD_CLICK_DELAY);
+        return;
+      }
+
+      // Look for any link/button that navigates to ofc-schedule or schedule page
+      const allLinks = document.querySelectorAll('a[href*="ofc-schedule"], a[href*="/schedule"], a[href*="appointment"]');
+      if (allLinks.length > 0) {
+        clearInterval(waitForBtn);
+        log("Found schedule link — clicking: " + allLinks[0].href);
+        trackEvent(EVENT_TYPES.DASHBOARD, "Clicking schedule link: " + allLinks[0].textContent.trim(), activeUser);
+        setTimeout(() => allLinks[0].click(), DASHBOARD_CLICK_DELAY);
+        return;
+      }
+
+      // Look for any submit/continue button by text content
+      const allBtns = document.querySelectorAll('button, input[type="submit"], a.btn, .btn');
+      for (const btn of allBtns) {
+        const txt = (btn.textContent || btn.value || "").trim().toLowerCase();
+        if (txt.includes("continue") || txt.includes("schedule") || txt.includes("reschedule") || txt.includes("proceed")) {
+          clearInterval(waitForBtn);
+          log("Found button by text — clicking: " + txt);
+          trackEvent(EVENT_TYPES.DASHBOARD, "Clicking button: " + txt, activeUser);
+          setTimeout(() => { clickSafe(btn); }, DASHBOARD_CLICK_DELAY);
+          return;
+        }
+      }
+
+      // Log every 10 seconds while waiting
+      if (attempts % 10 === 0) {
+        log(`Still waiting for schedule/reschedule button (${attempts}s)...`);
       }
     }, 1000);
 
-    setTimeout(() => clearInterval(waitForBtn), 30000);
+    // Keep scanning indefinitely while automation is active — no timeout
   }
 
   // ─── BOOKING PANEL UI ──────────────────────────────────────────────
 
   let cycling = { active: false, timer: null, round: 0, keepAliveTimer: null, lastRefresh: 0, backoffMs: 0 };
   const SESSION_REFRESH_MS = 8 * 60 * 1000; // 8 minutes
-  const RELOGIN_FLAG = "__autoBookingRelogin";
 
   function injectBookingPanel() {
     if (document.getElementById("ab-panel")) return;
@@ -839,6 +1533,10 @@
                   style="background:#c0392b;color:white;border:none;padding:8px 28px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:14px;opacity:0.5;">
             STOP
           </button>
+          <button id="ab-logout-btn"
+                  style="background:#e65100;color:white;border:none;padding:8px 28px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:14px;">
+            LOGOUT
+          </button>
           <span id="ab-cycle-info" style="font-size:12px;color:#888;margin-left:10px;"></span>
         </div>
       </div>`;
@@ -873,10 +1571,41 @@
 
     document
       .getElementById("ab-start-btn")
-      .addEventListener("click", startCycling);
+      .addEventListener("click", () => {
+        log("START button clicked");
+        startCycling();
+      });
     document
       .getElementById("ab-stop-btn")
-      .addEventListener("click", () => stopCycling("Stopped by user"));
+      .addEventListener("click", () => {
+        log("STOP button clicked");
+        stopCycling("Stopped by user");
+        chrome.storage.local.remove("activeAutomationUser");
+      });
+
+    document
+      .getElementById("ab-logout-btn")
+      .addEventListener("click", () => {
+        log("LOGOUT button clicked on OFC page");
+        if (cycling.active) stopCycling("Logged out from OFC page");
+        chrome.storage.local.get(["loginDetails"], (d) => {
+          const u = d.loginDetails?.username || "";
+          trackEvent(EVENT_TYPES.SESSION, `Logout from OFC page — clearing session for ${u}`, u);
+          sendTelegramNotification("logout", `🚪 <b>LOGGED OUT</b>\n\n👤 <b>User:</b> ${u}\n🔒 Session cleared from OFC page\n✅ Ready for next user`);
+          __abortAll = true;
+          window.__autoBookingLoginActive = false;
+          if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
+          sessionStorage.clear();
+          chrome.storage.local.remove(["activeAutomationUser", "loginDetails", "securityQuestions"]);
+          updateUserStatus(u, "idle");
+          const signOutLink = document.querySelector('a[href*="LogOff"], a[href*="sign-out"], a[href*="signout"], a[href*="logout"], a[aria-label="Sign out"]');
+          if (signOutLink) {
+            signOutLink.click();
+          } else {
+            window.location.href = window.location.origin + "/en-US/";
+          }
+        });
+      });
 
     log("Booking panel injected");
   }
@@ -907,6 +1636,7 @@
   // Inject a script into MAIN world to intercept XHR 401/429 responses
   // Uses a hidden DOM element as bridge since custom events don't cross worlds
   function inject401Detector() {
+    if (document.getElementById("__ab401marker")) return;
     const marker = document.createElement("div");
     marker.id = "__ab401marker";
     marker.style.display = "none";
@@ -954,10 +1684,18 @@
         if (m.attributeName === "data-401") {
           log("401 detected via DOM bridge");
           __session401Detected = true;
+          chrome.storage.local.get(["loginDetails"], (d) => {
+            trackEvent(EVENT_TYPES.ERROR, "401 session expired", d.loginDetails?.username || "");
+            updateUserStatus(d.loginDetails?.username || "", "session_expired");
+          });
         }
         if (m.attributeName === "data-429") {
           log("429 rate limit detected via DOM bridge");
           __rateLimited429 = true;
+          chrome.storage.local.get(["loginDetails"], (d) => {
+            trackEvent(EVENT_TYPES.ERROR, "429 rate limited", d.loginDetails?.username || "");
+            updateUserStatus(d.loginDetails?.username || "", "rate_limited");
+          });
         }
       }
     });
@@ -976,7 +1714,6 @@
     const body = document.body?.innerText || "";
     if (body.includes("401") && body.includes("Unauthorized")) return true;
     if (document.querySelector(".error-page, .session-expired")) return true;
-    if (window.location.hostname.includes("b2clogin.com")) return true;
     return false;
   }
 
@@ -988,6 +1725,10 @@
       const elapsed = Date.now() - cycling.lastRefresh;
       if (elapsed >= SESSION_REFRESH_MS) {
         log("Session keep-alive: refreshing page to prevent 401...");
+        chrome.storage.local.get(["loginDetails"], (d) => {
+          const u = d.loginDetails?.username || "";
+          trackEvent(EVENT_TYPES.SESSION, "Keep-alive refresh — preventing session expiry", u);
+        });
         saveReloginState();
         window.location.reload();
       }
@@ -1040,6 +1781,11 @@
     if (!cycling.active) return;
     log("401/session expired detected — initiating re-login...");
     __session401Detected = false;
+    chrome.storage.local.get(["loginDetails"], (d) => {
+      const u = d.loginDetails?.username || "";
+      trackEvent(EVENT_TYPES.SESSION, `Session expired (401) — auto re-login starting. Round was: ${cycling.round}`, u);
+      sendTelegramNotification("error", `⚠️ <b>SESSION EXPIRED</b>\n\n👤 <b>User:</b> ${u}\n🔄 Auto re-login in progress...\n🔁 <b>Round was:</b> ${cycling.round}`);
+    });
     stopCycling("Session expired — re-logging in...");
     saveReloginState();
     sessionStorage.setItem(RELOGIN_FLAG, "true");
@@ -1049,14 +1795,32 @@
   // ─── CYCLING LOGIC ─────────────────────────────────────────────────
 
   function startCycling() {
+    log("startCycling() called");
     const checked = document.querySelectorAll(".ab-loc-cb:checked");
     if (checked.length === 0) {
       setStatus("Select at least one location");
       return;
     }
 
+    __abortAll = false;
+    chrome.storage.local.remove("__stopSignal");
+    // Ensure activeAutomationUser is set when starting from OFC panel
+    chrome.storage.local.get(["loginDetails", "activeAutomationUser"], (d) => {
+      if (d.loginDetails?.username && !d.activeAutomationUser) {
+        chrome.storage.local.set({ activeAutomationUser: d.loginDetails.username });
+      }
+    });
     cycling.active = true;
     cycling.round = 0;
+    const locs = Array.from(checked).map((cb) => cb.dataset.name || cb.value).join(", ");
+    const startDate = document.getElementById("ab-start-date")?.value || "—";
+    const endDate = document.getElementById("ab-end-date")?.value || "—";
+    chrome.storage.local.get(["loginDetails"], (d) => {
+      const u = d.loginDetails?.username || "";
+      trackEvent(EVENT_TYPES.CYCLING, `Cycling started — locations: ${locs}`, u);
+      updateUserStatus(u, "cycling", { locations: locs, startedAt: new Date().toISOString() });
+      sendTelegramNotification("cycling", `🔄 <b>CYCLING STARTED</b>\n\n👤 <b>User:</b> ${u}\n📍 <b>Locations:</b> ${locs}\n📅 <b>Date Range:</b> ${startDate} → ${endDate}`);
+    });
 
     const startBtn = document.getElementById("ab-start-btn");
     const stopBtn = document.getElementById("ab-stop-btn");
@@ -1083,6 +1847,7 @@
   }
 
   function stopCycling(reason) {
+    const roundsCompleted = cycling.round;
     cycling.active = false;
     if (cycling.timer) {
       clearTimeout(cycling.timer);
@@ -1102,6 +1867,23 @@
     }
 
     setStatus(reason || "Stopped");
+    log("stopCycling: " + (reason || "Stopped"));
+    chrome.storage.local.get(["loginDetails", "activeAutomationUser"], (d) => {
+      const u = d.loginDetails?.username || d.activeAutomationUser || "";
+      trackEvent(EVENT_TYPES.CYCLING, `Cycling stopped: ${reason || "Stopped"}`, u);
+
+      const lowerReason = (reason || "").toLowerCase();
+      if (lowerReason.includes("slot found") && !lowerReason.includes("submitted")) {
+        updateUserStatus(u, "slot_found", { foundAt: new Date().toISOString() });
+      } else if (lowerReason.includes("submitted")) {
+        updateUserStatus(u, "confirmed", { confirmedAt: new Date().toISOString() });
+      } else {
+        updateUserStatus(u, "idle");
+        if (!lowerReason.includes("re-logging") && !lowerReason.includes("session expired")) {
+          sendTelegramNotification("stopped", `⏹ <b>CYCLING STOPPED</b>\n\n👤 <b>User:</b> ${u}\n📝 <b>Reason:</b> ${reason || "Manual stop"}\n🔁 <b>Rounds completed:</b> ${roundsCompleted}`);
+        }
+      }
+    });
   }
 
   function waitForScheduleData(timeout = 15000) {
@@ -1185,8 +1967,27 @@
     return false;
   }
 
+  async function checkStopSignal() {
+    return new Promise((resolve) => {
+      chrome.storage.local.get(["__stopSignal", "loginDetails"], (d) => {
+        if (d.__stopSignal) {
+          const u = d.loginDetails?.username || "";
+          trackEvent(EVENT_TYPES.QUEUE, "Stop signal detected from storage — halting automation", u);
+          __abortAll = true;
+          chrome.storage.local.remove("__stopSignal");
+          if (cycling.active) stopCycling("Stopped from dashboard");
+          if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
+          resolve(true);
+        } else {
+          resolve(false);
+        }
+      });
+    });
+  }
+
   async function runCycleLoop() {
-    if (!cycling.active) return;
+    if (!cycling.active || __abortAll) return;
+    if (await checkStopSignal()) return;
 
     cycling.round++;
     cycling.lastRefresh = Date.now(); // reset keep-alive timer on each round
@@ -1206,12 +2007,15 @@
     for (let i = 0; i < locations.length; i++) {
       if (!cycling.active) return;
 
+      // Check stop signal from dashboard between each location
+      if (await checkStopSignal()) return;
+
       // Random delay between locations (3-6 sec) to avoid rate limiting
       if (i > 0) {
         const delaySec = 3 + Math.random() * 3;
         setStatus(`Waiting ${delaySec.toFixed(0)}s before next location...`);
         await sleep(delaySec * 1000);
-        if (!cycling.active) return;
+        if (!cycling.active || await checkStopSignal()) return;
       }
 
       // Check for 429 rate limit — exponential backoff
@@ -1221,6 +2025,10 @@
         const waitSec = Math.round(cycling.backoffMs / 1000);
         setStatus(`Rate limited (429)! Pausing ${waitSec}s...`);
         log(`Backoff: waiting ${waitSec}s before resuming`);
+        chrome.storage.local.get(["loginDetails"], (d) => {
+          const u = d.loginDetails?.username || "";
+          trackEvent(EVENT_TYPES.ERROR, `429 rate limited — backoff ${waitSec}s (round ${cycling.round})`, u);
+        });
         await sleep(cycling.backoffMs);
         if (!cycling.active) return;
         // After backoff, re-check
@@ -1254,6 +2062,10 @@
         cycling.backoffMs = cycling.backoffMs ? Math.min(cycling.backoffMs * 2, 300000) : 60000;
         const waitSec = Math.round(cycling.backoffMs / 1000);
         setStatus(`Rate limited (429)! Pausing ${waitSec}s...`);
+        chrome.storage.local.get(["loginDetails"], (d) => {
+          const u = d.loginDetails?.username || "";
+          trackEvent(EVENT_TYPES.ERROR, `429 rate limited after fetch — backoff ${waitSec}s at ${loc.name}`, u);
+        });
         await sleep(cycling.backoffMs);
         if (!cycling.active) return;
         continue; // retry this round
@@ -1312,15 +2124,19 @@
 
       if (slotReady) {
         const settings = await getSettings();
+        const u = settings.loginDetails?.username || "";
+        trackEvent(EVENT_TYPES.SLOT_FOUND, `Slot found at ${loc.name} — date: ${inRange[0].Date}`, u, { location: loc.name, date: inRange[0].Date });
+        sendTelegramNotification("slot", `🟢 <b>SLOT FOUND!</b>\n\n👤 <b>User:</b> ${u}\n📍 <b>Location:</b> ${loc.name}\n📅 <b>Date:</b> ${inRange[0].Date}\n\n${settings["is_auto-submit"] ? "⏳ Auto-submitting..." : "⚠️ Manual submit needed — go to the tab NOW!"}`);
         if (settings["is_auto-submit"]) {
           setStatus(`${loc.name}: Slot found — auto-submitting!`);
           await sleep(1000);
           const submitBtn = document.getElementById("submitbtn");
           if (submitBtn && !submitBtn.disabled) submitBtn.click();
+          trackEvent(EVENT_TYPES.BOOKING, `Auto-submitted booking at ${loc.name}`, u);
+          sendTelegramNotification("confirmed", `✅ <b>BOOKING SUBMITTED!</b>\n\n👤 <b>User:</b> ${u}\n📍 <b>Location:</b> ${loc.name}\n📅 <b>Date:</b> ${inRange[0].Date}\n\n🎉 Check the confirmation page!`);
           stopCycling("Booking submitted!");
           return;
         }
-        // Auto-submit OFF — stop cycling, let user review and submit manually
         stopCycling(`${loc.name}: Slot found! Review and click Submit.`);
         return;
       }
@@ -1365,6 +2181,42 @@
   // ─── BOOKING PAGE HANDLER ──────────────────────────────────────────
 
   async function handleBookingPage(settings) {
+    // Check for error state: "No Class Selected" or empty post_select means page errored
+    await sleep(1000);
+    const postSelect = document.getElementById("post_select");
+    const groupMembers = document.querySelector(".applicant-table, .group-members, #applicant_table");
+    const noClassEl = document.body?.innerText?.includes("No Class Selected");
+
+    if (noClassEl || (postSelect && postSelect.options.length <= 1 && !postSelect.value)) {
+      const autoUser = await new Promise((r) => {
+        chrome.storage.local.get(["activeAutomationUser"], (d) => r(d.activeAutomationUser || null));
+      });
+      if (autoUser) {
+        const activeUser = settings.loginDetails?.username || "";
+        const errorCount = parseInt(sessionStorage.getItem("__abOFCErrorCount") || "0") + 1;
+        sessionStorage.setItem("__abOFCErrorCount", String(errorCount));
+
+        if (errorCount >= 3) {
+          log("Booking page error 3 times — stopping automation");
+          trackEvent(EVENT_TYPES.ERROR, "Booking page failed 3 times — stopped. May need manual intervention.", activeUser);
+          updateUserStatus(activeUser, "error");
+          sendTelegramNotification("error", `🔴 <b>AUTOMATION STOPPED</b>\n\n👤 <b>User:</b> ${activeUser}\n❌ Booking page error 3 times\n\nNeeds manual intervention.`);
+          sessionStorage.removeItem("__abOFCErrorCount");
+          chrome.storage.local.remove("activeAutomationUser");
+          return;
+        }
+
+        log(`Booking page error (${errorCount}/3) — going back to dashboard...`);
+        trackEvent(EVENT_TYPES.ERROR, `Booking page error — No Class Selected (attempt ${errorCount}/3)`, activeUser);
+        await sleep(3000);
+        window.location.href = window.location.origin + "/en-US/";
+        return;
+      }
+    }
+
+    // Page loaded successfully — clear error counter
+    sessionStorage.removeItem("__abOFCErrorCount");
+
     let attempts = 0;
     while (!document.getElementById("post_select") && attempts < 20) {
       await sleep(500);
@@ -1377,6 +2229,7 @@
     const savedState = getReloginState();
     if (savedState && savedState.active) {
       log("Restoring cycling after page refresh...");
+      trackEvent(EVENT_TYPES.SESSION, `Restoring cycling after page refresh — resuming from round ${savedState.round}`, activeUser);
       clearReloginState();
       await sleep(1000);
 
@@ -1400,6 +2253,19 @@
       return;
     }
 
+    // Auto-start cycling if launched from dashboard
+    const autoUser = await new Promise((r) => {
+      chrome.storage.local.get(["activeAutomationUser"], (d) => r(d.activeAutomationUser || null));
+    });
+    if (autoUser && !cycling.active) {
+      log("Active automation user detected — auto-starting cycling...");
+      const activeUser = settings.loginDetails?.username || "";
+      trackEvent(EVENT_TYPES.CYCLING, "Auto-starting cycling from dashboard", activeUser);
+      await sleep(1000);
+      startCycling();
+      return;
+    }
+
     if (settings["is_auto-submit"] && !cycling.active) {
       setupAutoSubmit();
     }
@@ -1412,9 +2278,23 @@
     const path = window.location.pathname.toLowerCase();
     const host = window.location.hostname.toLowerCase();
 
+    // Check persistent automation state — if stopped from dashboard, don't do anything
+    const activeAutoUser = await new Promise((resolve) => {
+      chrome.storage.local.get(["activeAutomationUser"], (d) => resolve(d.activeAutomationUser || null));
+    });
+    const hasReloginFlag = sessionStorage.getItem(RELOGIN_FLAG) === "true";
+    const automationActive = !!activeAutoUser || hasReloginFlag;
+
     // Inject 401 detector on scheduling pages (MAIN world XHR intercept)
     if (host.includes("usvisascheduling.com")) {
       inject401Detector();
+
+      // Listen for auto-dismissed alerts (from alert-override.js MAIN world script)
+      document.addEventListener("__abAlertDismissed", (e) => {
+        log("Alert auto-dismissed: " + e.detail);
+        const activeUser = settings.loginDetails?.username || "";
+        trackEvent(EVENT_TYPES.ERROR, "Alert dismissed: " + e.detail, activeUser);
+      });
     }
 
     if (host.includes("b2clogin.com")) {
@@ -1424,16 +2304,68 @@
       return;
     }
 
-    if (path.includes("signin-aad-b2c") || document.querySelector("h1")?.textContent?.trim() === "Page Not Found") {
+    // Cloudflare block detection on page load
+    if (host.includes("usvisascheduling.com") && isCloudflareBlocked()) {
+      const cfUser = settings.loginDetails?.username || activeAutoUser || "";
+      log("Cloudflare block detected on page load");
+      trackEvent(EVENT_TYPES.ERROR, "Cloudflare block detected (Error 1015 / 429) on page load", cfUser);
+      sendTelegramNotification("error", `🛡️ <b>CLOUDFLARE BLOCKED</b>\n\n👤 <b>User:</b> ${cfUser}\n⚠️ Rate limited by Cloudflare on page load\n💡 Wait a few minutes before retrying`);
+      return;
+    }
+
+    // Waiting room detection — only auto-refresh if automation is active
+    if (host.includes("usvisascheduling.com")) {
+      for (let wc = 0; wc < 6; wc++) {
+        const bodyText = (document.body?.innerText || "").toLowerCase();
+        const pageHtml = (document.body?.innerHTML || "").toLowerCase();
+        if (bodyText.includes("waiting room") || bodyText.includes("will be redirected") ||
+            bodyText.includes("website maintenance") || pageHtml.includes("waiting room") ||
+            pageHtml.includes("waitingroom")) {
+          if (!automationActive) {
+            log("Waiting room detected but automation is stopped — not refreshing");
+            return;
+          }
+          const attempt = parseInt(sessionStorage.getItem("__abWaitingRoomCount") || "0") + 1;
+          sessionStorage.setItem("__abWaitingRoomCount", String(attempt));
+          const activeUser = settings.loginDetails?.username || "";
+          if (attempt > 30) {
+            log("Waiting room — max retries (30) reached, stopping");
+            trackEvent(EVENT_TYPES.ERROR, "Waiting room max retries reached", activeUser);
+            sessionStorage.removeItem("__abWaitingRoomCount");
+            sendTelegramNotification("error", `🔴 <b>WAITING ROOM TIMEOUT</b>\n\n👤 <b>User:</b> ${activeUser}\n⚠️ Site maintenance detected — 30 retries exhausted`);
+            return;
+          }
+          trackEvent(EVENT_TYPES.SESSION, `Waiting room detected (attempt ${attempt})`, activeUser);
+          log(`Waiting room detected (attempt ${attempt}) — refreshing in 10s...`);
+          await sleep(10000);
+          window.location.reload();
+          return;
+        }
+        await sleep(500);
+      }
+      sessionStorage.removeItem("__abWaitingRoomCount");
+    }
+
+    const routerUser = settings.loginDetails?.username || activeAutoUser || "";
+
+    if (path.includes("signin-aad-b2c") || path.includes("externallogin") || document.querySelector("h1")?.textContent?.trim() === "Page Not Found") {
+      if (!automationActive) {
+        log("Page Not Found but automation is stopped — not retrying");
+        trackEvent(EVENT_TYPES.SESSION, "Page Not Found detected — automation not active, ignoring", routerUser);
+        return;
+      }
       const retryCount = parseInt(sessionStorage.getItem("__ab401RetryCount") || "0");
       if (retryCount < 10) {
         sessionStorage.setItem("__ab401RetryCount", String(retryCount + 1));
         log(`Page Not Found — retry ${retryCount + 1}/10, refreshing in 3s...`);
+        trackEvent(EVENT_TYPES.SESSION, `Page Not Found — retry ${retryCount + 1}/10`, routerUser);
         await sleep(3000);
         window.location.href = window.location.origin + "/";
       } else {
         sessionStorage.removeItem("__ab401RetryCount");
         log("Page Not Found — max retries reached, stopping.");
+        trackEvent(EVENT_TYPES.ERROR, "Page Not Found — max retries (10) reached, stopping", routerUser);
+        sendTelegramNotification("error", `🔴 <b>PAGE NOT FOUND</b>\n\n👤 <b>User:</b> ${routerUser}\n⚠️ Max retries (10) exhausted — automation stopped`);
       }
       return;
     }
@@ -1452,9 +2384,65 @@
 
     if (path.includes("appointment-confirmation")) {
       log("On confirmation page");
+      trackEvent(EVENT_TYPES.BOOKING, "Reached appointment confirmation page", routerUser);
+      sendTelegramNotification("confirmed", `✅ <b>BOOKING CONFIRMED</b>\n\n👤 <b>User:</b> ${routerUser}\n🎉 Appointment confirmation page reached!`);
       return;
     }
   }
+
+  // Listen for messages from dashboard
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg.action === "stopAll") {
+      log("STOP ALL command received from dashboard");
+      chrome.storage.local.get(["loginDetails", "activeAutomationUser"], (d) => {
+        const u = d.loginDetails?.username || d.activeAutomationUser || "";
+        trackEvent(EVENT_TYPES.QUEUE, "Stop command received from dashboard", u);
+      });
+      __abortAll = true;
+      window.__autoBookingLoginActive = false;
+      if (cycling.active) stopCycling("Stopped from dashboard");
+      if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
+      chrome.storage.local.remove("activeAutomationUser");
+      sendResponse({ ok: true });
+    }
+    if (msg.action === "startCycling") {
+      log("START CYCLING command received from dashboard");
+      chrome.storage.local.get(["loginDetails"], (d) => {
+        const u = d.loginDetails?.username || "";
+        trackEvent(EVENT_TYPES.CYCLING, "Start cycling command received from dashboard", u);
+      });
+      __abortAll = false;
+      chrome.storage.local.remove("__stopSignal");
+      if (!cycling.active) {
+        startCycling();
+      }
+      sendResponse({ ok: true });
+    }
+    if (msg.action === "logout") {
+      log("LOGOUT command received — clearing session and redirecting to login...");
+      chrome.storage.local.get(["loginDetails"], (d) => {
+        const u = d.loginDetails?.username || "";
+        trackEvent(EVENT_TYPES.SESSION, `Logout command received — clearing session for ${u}`, u);
+        sendTelegramNotification("logout", `🚪 <b>LOGGED OUT</b>\n\n👤 <b>User:</b> ${u}\n🔒 Session cleared from dashboard\n✅ Ready for next user`);
+      });
+      __abortAll = true;
+      window.__autoBookingLoginActive = false;
+      if (cycling.active) stopCycling("Logged out from dashboard");
+      if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
+      sessionStorage.clear();
+      chrome.storage.local.remove(["activeAutomationUser", "loginDetails", "securityQuestions"]);
+      if (window.location.hostname.includes("usvisascheduling.com")) {
+        const signOutLink = document.querySelector('a[href*="LogOff"], a[href*="sign-out"], a[href*="signout"], a[href*="logout"], a[aria-label="Sign out"]');
+        if (signOutLink) {
+          signOutLink.click();
+        } else {
+          window.location.href = window.location.origin + "/en-US/";
+        }
+      }
+      sendResponse({ ok: true });
+    }
+    return true;
+  });
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
