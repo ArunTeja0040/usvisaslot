@@ -34,6 +34,15 @@
     });
   }
 
+  // Flush pending events before page unload to avoid losing logs on navigation
+  window.addEventListener("beforeunload", () => {
+    if (__eventFlushTimer) {
+      clearTimeout(__eventFlushTimer);
+      __eventFlushTimer = null;
+    }
+    flushEventLog();
+  });
+
   function trackEvent(type, message, username, extra) {
     const event = {
       id: Date.now() + "_" + Math.random().toString(36).substring(2, 6),
@@ -1667,11 +1676,9 @@
         var marker = document.getElementById("__ab401marker");
         if (!marker) return;
 
-        // Hook into page.js's existing XHR open (it already stores _url).
-        // Add a single load listener that only checks status — no re-wrapping of open/send.
-        var origSend = XMLHttpRequest.prototype.send;
+        // Patch XHR.send to add a load listener for 401/429 status detection.
+        // page.js already wraps open/send for schedule data — we chain onto send only.
         var currentSend = XMLHttpRequest.prototype.send;
-        // Only patch if not already patched by us
         if (!XMLHttpRequest.prototype._ab401Patched) {
           XMLHttpRequest.prototype._ab401Patched = true;
           XMLHttpRequest.prototype.send = function() {
@@ -1680,6 +1687,19 @@
               else if (this.status === 429) marker.setAttribute("data-429", Date.now());
             });
             return currentSend.apply(this, arguments);
+          };
+        }
+
+        // Also detect 401/429 from fetch calls (site may use fetch for some APIs)
+        if (!window._abFetch401Patched) {
+          window._abFetch401Patched = true;
+          var origFetch = window.fetch;
+          window.fetch = function() {
+            return origFetch.apply(this, arguments).then(function(resp) {
+              if (resp.status === 401) marker.setAttribute("data-401", Date.now());
+              else if (resp.status === 429) marker.setAttribute("data-429", Date.now());
+              return resp;
+            });
           };
         }
       })();
@@ -1721,10 +1741,14 @@
   function isSessionExpired() {
     if (__session401Detected) return true;
     if (document.querySelector(".error-page, .session-expired")) return true;
-    // Check title/heading only — avoids full-page text scan
     const title = document.title || "";
-    const h1 = document.querySelector("h1, h2")?.textContent || "";
-    if ((title + h1).includes("401") || (title + h1).includes("Unauthorized")) return true;
+    if (title.includes("401") || title.includes("Unauthorized") || title.includes("Error")) return true;
+    // Check visible error containers — targeted selectors, no full-page text scan
+    const errorEl = document.querySelector("h1, h2, .alert-danger, .error-message, .error-content, #error-page");
+    if (errorEl) {
+      const text = errorEl.textContent || "";
+      if (text.includes("401") || text.includes("Unauthorized") || text.includes("session expired")) return true;
+    }
     return false;
   }
 
