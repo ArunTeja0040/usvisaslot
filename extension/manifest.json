@@ -23,11 +23,13 @@
             "world": "MAIN"
         },
         {
-            "matches": [
-				"https://*.usvisascheduling.com/*",
-                "https://atlasauth.b2clogin.com/*"
-            ],
+            "matches": ["https://*.usvisascheduling.com/*"],
             "js": ["js/html2canvas.js", "js/content.js", "js/auto-booking.js"],
+            "run_at": "document_end"
+        },
+        {
+            "matches": ["https://atlasauth.b2clogin.com/*"],
+            "js": ["js/auto-booking.js"],
             "run_at": "document_end"
         },
         {

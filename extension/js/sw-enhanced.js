@@ -22,15 +22,19 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
       );
 
       chrome.scripting
-        .registerContentScripts([
-          {
-            id: "usvisascheduling",
-            js: ["js/page.js"],
-            matches: ["https://www.usvisascheduling.com/*/*schedule/*"],
-            runAt: "document_start",
-            world: "MAIN",
-          },
-        ])
+        .unregisterContentScripts({ ids: ["usvisascheduling"] })
+        .catch(() => {})
+        .then(() =>
+          chrome.scripting.registerContentScripts([
+            {
+              id: "usvisascheduling",
+              js: ["js/page.js"],
+              matches: ["https://www.usvisascheduling.com/*/*schedule/*"],
+              runAt: "document_start",
+              world: "MAIN",
+            },
+          ])
+        )
         .catch(console.log);
     }
   );

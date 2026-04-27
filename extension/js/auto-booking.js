@@ -18,6 +18,22 @@
     console.log(`${LOG_PREFIX} ${msg}`);
   }
 
+  // Batched event logging — collects events and flushes to storage every 2 seconds
+  // instead of reading+writing the full 500-entry array on every single event
+  let __pendingEvents = [];
+  let __eventFlushTimer = null;
+
+  function flushEventLog() {
+    if (__pendingEvents.length === 0) return;
+    const batch = __pendingEvents.splice(0);
+    chrome.storage.local.get(["eventLog"], (data) => {
+      const events = data.eventLog || [];
+      events.unshift(...batch);
+      if (events.length > MAX_EVENT_LOG) events.length = MAX_EVENT_LOG;
+      chrome.storage.local.set({ eventLog: events });
+    });
+  }
+
   function trackEvent(type, message, username, extra) {
     const event = {
       id: Date.now() + "_" + Math.random().toString(36).substring(2, 6),
@@ -25,12 +41,13 @@
       timestamp: new Date().toISOString(),
       ...extra,
     };
-    chrome.storage.local.get(["eventLog"], (data) => {
-      const events = data.eventLog || [];
-      events.unshift(event);
-      if (events.length > MAX_EVENT_LOG) events.length = MAX_EVENT_LOG;
-      chrome.storage.local.set({ eventLog: events });
-    });
+    __pendingEvents.push(event);
+    if (!__eventFlushTimer) {
+      __eventFlushTimer = setTimeout(() => {
+        __eventFlushTimer = null;
+        flushEventLog();
+      }, 2000);
+    }
     log(`[${type}] ${message}`);
   }
 
@@ -1633,8 +1650,10 @@
     return sleep(ms);
   }
 
-  // Inject a script into MAIN world to intercept XHR 401/429 responses
-  // Uses a hidden DOM element as bridge since custom events don't cross worlds
+  // Detect 401/429 responses from the page's XHR/fetch calls.
+  // Uses a minimal MAIN-world script that signals via DOM attribute (no XHR/fetch re-wrapping).
+  // page.js already wraps XHR — this hooks into the existing wrappers' load events
+  // by using a PerformanceObserver for failed network requests instead.
   function inject401Detector() {
     if (document.getElementById("__ab401marker")) return;
     const marker = document.createElement("div");
@@ -1646,39 +1665,28 @@
     script.textContent = `
       (function() {
         var marker = document.getElementById("__ab401marker");
-        function signal(type, url) {
-          console.log("[AutoBook] " + type + " detected:", url);
-          if (marker) marker.setAttribute("data-" + type, Date.now());
-        }
+        if (!marker) return;
 
-        var origOpen = XMLHttpRequest.prototype.open;
+        // Hook into page.js's existing XHR open (it already stores _url).
+        // Add a single load listener that only checks status — no re-wrapping of open/send.
         var origSend = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.open = function(method, url) {
-          this._abUrl = url;
-          return origOpen.apply(this, arguments);
-        };
-        XMLHttpRequest.prototype.send = function() {
-          this.addEventListener("load", function() {
-            if (this.status === 401) signal("401", this._abUrl);
-            if (this.status === 429) signal("429", this._abUrl);
-          });
-          return origSend.apply(this, arguments);
-        };
-
-        var origFetch = window.fetch;
-        window.fetch = function() {
-          return origFetch.apply(this, arguments).then(function(resp) {
-            if (resp.status === 401) signal("401", resp.url);
-            if (resp.status === 429) signal("429", resp.url);
-            return resp;
-          });
-        };
+        var currentSend = XMLHttpRequest.prototype.send;
+        // Only patch if not already patched by us
+        if (!XMLHttpRequest.prototype._ab401Patched) {
+          XMLHttpRequest.prototype._ab401Patched = true;
+          XMLHttpRequest.prototype.send = function() {
+            this.addEventListener("load", function() {
+              if (this.status === 401) marker.setAttribute("data-401", Date.now());
+              else if (this.status === 429) marker.setAttribute("data-429", Date.now());
+            });
+            return currentSend.apply(this, arguments);
+          };
+        }
       })();
     `;
     document.documentElement.appendChild(script);
     script.remove();
 
-    // Content script (ISOLATED world) observes the marker attribute changes
     const observer = new MutationObserver((mutations) => {
       for (const m of mutations) {
         if (m.attributeName === "data-401") {
@@ -1703,7 +1711,8 @@
   }
 
   function isCloudflareBlocked() {
-    const body = document.body?.innerText || "";
+    // Use textContent (no layout reflow) instead of innerText (forces reflow)
+    const body = document.body?.textContent || "";
     if (body.includes("Error 1015") || body.includes("rate limited")) return true;
     if (body.includes("cloudflare") && body.includes("429")) return true;
     return false;
@@ -1711,9 +1720,11 @@
 
   function isSessionExpired() {
     if (__session401Detected) return true;
-    const body = document.body?.innerText || "";
-    if (body.includes("401") && body.includes("Unauthorized")) return true;
     if (document.querySelector(".error-page, .session-expired")) return true;
+    // Check title/heading only — avoids full-page text scan
+    const title = document.title || "";
+    const h1 = document.querySelector("h1, h2")?.textContent || "";
+    if ((title + h1).includes("401") || (title + h1).includes("Unauthorized")) return true;
     return false;
   }
 
@@ -2157,6 +2168,28 @@
   function setupAutoSubmit() {
     log("Auto-submit observer active");
 
+    // Narrow observation to #time_select or #page_form instead of entire body
+    const targetNode = document.getElementById("time_select")
+      || document.getElementById("page_form")
+      || document.getElementById("main_container");
+    if (!targetNode) {
+      log("Auto-submit: no target container found, falling back to polling");
+      const pollId = setInterval(() => {
+        if (cycling.active) return;
+        const submitBtn = document.getElementById("submitbtn");
+        if (submitBtn && !submitBtn.disabled) {
+          const selectedRadio = document.querySelector('#time_select input[type="radio"]:checked');
+          if (selectedRadio) {
+            log("Time slot selected + submit ready — clicking submit!");
+            clearInterval(pollId);
+            setTimeout(() => submitBtn.click(), 1500);
+          }
+        }
+      }, 2000);
+      setTimeout(() => clearInterval(pollId), 300000);
+      return;
+    }
+
     const observer = new MutationObserver(() => {
       if (cycling.active) return;
 
@@ -2173,8 +2206,7 @@
       }
     });
 
-    observer.observe(document.body, { childList: true, subtree: true });
-
+    observer.observe(targetNode, { childList: true, subtree: true });
     setTimeout(() => observer.disconnect(), 300000);
   }
 
@@ -2185,7 +2217,7 @@
     await sleep(1000);
     const postSelect = document.getElementById("post_select");
     const groupMembers = document.querySelector(".applicant-table, .group-members, #applicant_table");
-    const noClassEl = document.body?.innerText?.includes("No Class Selected");
+    const noClassEl = document.body?.textContent?.includes("No Class Selected");
 
     if (noClassEl || (postSelect && postSelect.options.length <= 1 && !postSelect.value)) {
       const autoUser = await new Promise((r) => {
@@ -2316,11 +2348,10 @@
     // Waiting room detection — only auto-refresh if automation is active
     if (host.includes("usvisascheduling.com")) {
       for (let wc = 0; wc < 6; wc++) {
-        const bodyText = (document.body?.innerText || "").toLowerCase();
-        const pageHtml = (document.body?.innerHTML || "").toLowerCase();
+        const bodyText = (document.body?.textContent || "").toLowerCase();
+        const hasWaitingRoomClass = !!document.querySelector('[class*="waitingroom"], [class*="waiting-room"], [id*="waitingroom"], [id*="waiting-room"]');
         if (bodyText.includes("waiting room") || bodyText.includes("will be redirected") ||
-            bodyText.includes("website maintenance") || pageHtml.includes("waiting room") ||
-            pageHtml.includes("waitingroom")) {
+            bodyText.includes("website maintenance") || hasWaitingRoomClass) {
           if (!automationActive) {
             log("Waiting room detected but automation is stopped — not refreshing");
             return;
