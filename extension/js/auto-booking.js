@@ -300,6 +300,7 @@
       }
     } else {
       trackEvent(EVENT_TYPES.ERROR, `Only answered ${answered}/2 security questions`, activeUser);
+      sendTelegramNotification("error", `⚠️ <b>SECURITY QUESTIONS FAILED</b>\n\n👤 <b>User:</b> ${activeUser}\n❌ Only answered ${answered}/2 questions\n💡 Check saved answers in settings`);
     }
   }
 
@@ -1340,6 +1341,7 @@
           sessionStorage.removeItem("__abLoginRetryCount");
           log("Login page failed to load after 5 retries");
           trackEvent(EVENT_TYPES.ERROR, "Login page failed to load after 5 retries", autoUser);
+          sendTelegramNotification("error", `🔴 <b>LOGIN FAILED</b>\n\n👤 <b>User:</b> ${autoUser}\n❌ Login page failed to load after 5 retries`);
         }
       }
     }
@@ -1392,6 +1394,7 @@
       } else {
         log("No credentials found for active user — falling back to settings panel");
         trackEvent(EVENT_TYPES.ERROR, "No credentials found for active user — showing settings panel", targetUser || "");
+        sendTelegramNotification("error", `⚠️ <b>NO CREDENTIALS</b>\n\n👤 <b>User:</b> ${targetUser || "unknown"}\n❌ No saved credentials found\n💡 Enter credentials in settings panel`);
         injectSettingsPanel();
       }
     } else {
@@ -1489,8 +1492,9 @@
 
   // ─── BOOKING PANEL UI ──────────────────────────────────────────────
 
-  let cycling = { active: false, timer: null, round: 0, keepAliveTimer: null, lastRefresh: 0, backoffMs: 0 };
-  const SESSION_REFRESH_MS = 8 * 60 * 1000; // 8 minutes
+  let cycling = { active: false, timer: null, round: 0, keepAliveTimer: null, lastRefresh: 0, backoffMs: 0, keepAliveFailCount: 0 };
+  function randomRefreshMs() { return (6 + Math.random() * 6) * 60 * 1000; } // 6-12 minutes random
+  let SESSION_REFRESH_MS = randomRefreshMs();
 
   function injectBookingPanel() {
     if (document.getElementById("ab-panel")) return;
@@ -1713,16 +1717,20 @@
           log("401 detected via DOM bridge");
           __session401Detected = true;
           chrome.storage.local.get(["loginDetails"], (d) => {
-            trackEvent(EVENT_TYPES.ERROR, "401 session expired", d.loginDetails?.username || "");
-            updateUserStatus(d.loginDetails?.username || "", "session_expired");
+            const u = d.loginDetails?.username || "";
+            trackEvent(EVENT_TYPES.ERROR, "401 session expired", u);
+            updateUserStatus(u, "session_expired");
+            sendTelegramNotification("error", `⚠️ <b>401 SESSION EXPIRED</b>\n\n👤 <b>User:</b> ${u}\n🔄 Will attempt auto re-login`);
           });
         }
         if (m.attributeName === "data-429") {
           log("429 rate limit detected via DOM bridge");
           __rateLimited429 = true;
           chrome.storage.local.get(["loginDetails"], (d) => {
-            trackEvent(EVENT_TYPES.ERROR, "429 rate limited", d.loginDetails?.username || "");
-            updateUserStatus(d.loginDetails?.username || "", "rate_limited");
+            const u = d.loginDetails?.username || "";
+            trackEvent(EVENT_TYPES.ERROR, "429 rate limited", u);
+            updateUserStatus(u, "rate_limited");
+            sendTelegramNotification("rate", `🟠 <b>429 RATE LIMITED</b>\n\n👤 <b>User:</b> ${u}\n⏳ Exponential backoff activated`);
           });
         }
       }
@@ -1731,23 +1739,53 @@
   }
 
   function isCloudflareBlocked() {
-    // Use textContent (no layout reflow) instead of innerText (forces reflow)
-    const body = document.body?.textContent || "";
-    if (body.includes("Error 1015") || body.includes("rate limited")) return true;
-    if (body.includes("cloudflare") && body.includes("429")) return true;
+    // Only detect actual Cloudflare block pages — not normal pages with stray keyword matches
+    // Real CF block pages have specific elements and title patterns
+    const title = (document.title || "").toLowerCase();
+    if (title.includes("attention required") || title.includes("access denied") || title.includes("error 1015")) {
+      log("Cloudflare block detected via page title: " + document.title);
+      return true;
+    }
+    // Cloudflare block pages have specific class/id markers
+    const cfMarker = document.querySelector("#cf-error-details, .cf-error-overview, .cf-wrapper, #challenge-running, #challenge-form");
+    if (cfMarker) {
+      log("Cloudflare block detected via CF DOM element: " + cfMarker.id || cfMarker.className);
+      return true;
+    }
+    // Check h1/h2 only (not full body text — avoids false positives from extension UI or page content)
+    const heading = document.querySelector("h1, h2");
+    if (heading) {
+      const hText = heading.textContent.toLowerCase();
+      if (hText.includes("sorry, you have been blocked") || hText.includes("error 1015") || hText.includes("you are being rate limited")) {
+        log("Cloudflare block detected via heading: " + heading.textContent);
+        return true;
+      }
+    }
     return false;
   }
 
   function isSessionExpired() {
-    if (__session401Detected) return true;
-    if (document.querySelector(".error-page, .session-expired")) return true;
-    const title = document.title || "";
-    if (title.includes("401") || title.includes("Unauthorized") || title.includes("Error")) return true;
-    // Check visible error containers — targeted selectors, no full-page text scan
-    const errorEl = document.querySelector("h1, h2, .alert-danger, .error-message, .error-content, #error-page");
+    if (__session401Detected) {
+      log("isSessionExpired: true — __session401Detected flag set");
+      return true;
+    }
+    if (document.querySelector(".session-expired")) {
+      log("isSessionExpired: true — .session-expired element found");
+      return true;
+    }
+    const title = (document.title || "").toLowerCase();
+    if (title.includes("401") || title.includes("unauthorized")) {
+      log("isSessionExpired: true — page title contains 401/unauthorized: " + document.title);
+      return true;
+    }
+    // Only check error-specific containers — not generic h1/h2 which match normal page headings
+    const errorEl = document.querySelector(".alert-danger, .error-message, .error-content, #error-page");
     if (errorEl) {
-      const text = errorEl.textContent || "";
-      if (text.includes("401") || text.includes("Unauthorized") || text.includes("session expired")) return true;
+      const text = (errorEl.textContent || "").toLowerCase();
+      if (text.includes("401") || text.includes("unauthorized") || text.includes("session expired") || text.includes("session has expired")) {
+        log("isSessionExpired: true — error element contains: " + text.substring(0, 100));
+        return true;
+      }
     }
     return false;
   }
@@ -1755,17 +1793,75 @@
   function startKeepAlive() {
     stopKeepAlive();
     cycling.lastRefresh = Date.now();
-    cycling.keepAliveTimer = setInterval(() => {
+    cycling.keepAliveFailCount = 0;
+    SESSION_REFRESH_MS = randomRefreshMs();
+    log(`Keep-alive started — next ping in ${Math.round(SESSION_REFRESH_MS / 1000)}s (${(SESSION_REFRESH_MS / 60000).toFixed(1)}min)`);
+    cycling.keepAliveTimer = setInterval(async () => {
       if (!cycling.active) return;
       const elapsed = Date.now() - cycling.lastRefresh;
-      if (elapsed >= SESSION_REFRESH_MS) {
-        log("Session keep-alive: refreshing page to prevent 401...");
+      const thresholdSec = Math.round(SESSION_REFRESH_MS / 1000);
+      if (elapsed < SESSION_REFRESH_MS) {
+        log(`Keep-alive check: ${Math.round(elapsed / 1000)}s elapsed, threshold ${thresholdSec}s — not yet`);
+        return;
+      }
+
+      log(`Keep-alive triggered at ${Math.round(elapsed / 1000)}s — sending background fetch...`);
+      chrome.storage.local.get(["loginDetails"], (d) => {
+        const u = d.loginDetails?.username || "";
+        trackEvent(EVENT_TYPES.SESSION, `Keep-alive fetch at ${Math.round(elapsed / 1000)}s (threshold was ${thresholdSec}s)`, u);
+      });
+
+      try {
+        const resp = await fetch(window.location.origin + "/en-US/", {
+          credentials: "include",
+          cache: "no-store",
+          headers: { "Accept": "text/html" },
+        });
+
+        if (resp.ok) {
+          log(`Keep-alive fetch OK (${resp.status}) — session alive`);
+          cycling.keepAliveFailCount = 0;
+          cycling.lastRefresh = Date.now();
+          SESSION_REFRESH_MS = randomRefreshMs();
+          log(`Next keep-alive in ${Math.round(SESSION_REFRESH_MS / 1000)}s (${(SESSION_REFRESH_MS / 60000).toFixed(1)}min)`);
+        } else if (resp.status === 401 || resp.status === 403) {
+          cycling.keepAliveFailCount++;
+          log(`Keep-alive fetch got ${resp.status} — fail count: ${cycling.keepAliveFailCount}/2`);
+          chrome.storage.local.get(["loginDetails"], (d) => {
+            const u = d.loginDetails?.username || "";
+            trackEvent(EVENT_TYPES.SESSION, `Keep-alive got ${resp.status} (attempt ${cycling.keepAliveFailCount}/2)`, u);
+          });
+          if (cycling.keepAliveFailCount >= 2) {
+            log("Keep-alive: 2 consecutive failures — falling back to full page reload");
+            chrome.storage.local.get(["loginDetails"], (d) => {
+              const u = d.loginDetails?.username || "";
+              trackEvent(EVENT_TYPES.SESSION, "Keep-alive fallback: full page reload after 2 failed fetches", u);
+            });
+            saveReloginState();
+            window.location.reload();
+          }
+        } else if (resp.status === 429) {
+          log(`Keep-alive fetch got 429 (rate limited) — skipping reload, will retry next cycle`);
+          cycling.lastRefresh = Date.now();
+          SESSION_REFRESH_MS = randomRefreshMs();
+        } else {
+          log(`Keep-alive fetch got unexpected ${resp.status} — treating as OK`);
+          cycling.lastRefresh = Date.now();
+          SESSION_REFRESH_MS = randomRefreshMs();
+        }
+      } catch (err) {
+        cycling.keepAliveFailCount++;
+        log(`Keep-alive fetch failed: ${err.message} — fail count: ${cycling.keepAliveFailCount}/2`);
         chrome.storage.local.get(["loginDetails"], (d) => {
           const u = d.loginDetails?.username || "";
-          trackEvent(EVENT_TYPES.SESSION, "Keep-alive refresh — preventing session expiry", u);
+          trackEvent(EVENT_TYPES.ERROR, `Keep-alive fetch error: ${err.message} (attempt ${cycling.keepAliveFailCount}/2)`, u);
+          sendTelegramNotification("error", `⚠️ <b>KEEP-ALIVE FAILED</b>\n\n👤 <b>User:</b> ${u}\n❌ ${err.message}\n🔁 Attempt ${cycling.keepAliveFailCount}/2`);
         });
-        saveReloginState();
-        window.location.reload();
+        if (cycling.keepAliveFailCount >= 2) {
+          log("Keep-alive: 2 consecutive fetch errors — falling back to full page reload");
+          saveReloginState();
+          window.location.reload();
+        }
       }
     }, 30000); // check every 30s
   }
@@ -2020,16 +2116,123 @@
     });
   }
 
+  // Weighted random delay — mimics human attention patterns
+  function humanDelay() {
+    const r = Math.random();
+    if (r < 0.60) return 4 + Math.random() * 4;       // 60%: 4-8s (normal)
+    if (r < 0.85) return 8 + Math.random() * 7;       // 25%: 8-15s (reading)
+    return 15 + Math.random() * 10;                    // 15%: 15-25s (distracted)
+  }
+
+  // Simulate human browser activity (mouse, scroll, focus) to fool Cloudflare bot detection
+  async function simulateHumanActivity() {
+    const vw = window.innerWidth || 1280;
+    const vh = window.innerHeight || 800;
+
+    // Mouse movements: 3-6 events along a curved path
+    const moveCount = 3 + Math.floor(Math.random() * 4);
+    let cx = Math.floor(Math.random() * vw * 0.8 + vw * 0.1);
+    let cy = Math.floor(Math.random() * vh * 0.8 + vh * 0.1);
+    const tx = Math.floor(Math.random() * vw * 0.8 + vw * 0.1);
+    const ty = Math.floor(Math.random() * vh * 0.8 + vh * 0.1);
+    log(`Human sim: ${moveCount} mouse moves (${cx},${cy})→(${tx},${ty})`);
+
+    for (let m = 0; m < moveCount; m++) {
+      const t = (m + 1) / moveCount;
+      // Bezier-like curve with random offset for natural movement
+      const offsetX = (Math.random() - 0.5) * 80;
+      const offsetY = (Math.random() - 0.5) * 60;
+      const x = Math.floor(cx + (tx - cx) * t + offsetX * Math.sin(t * Math.PI));
+      const y = Math.floor(cy + (ty - cy) * t + offsetY * Math.sin(t * Math.PI));
+      const clampX = Math.max(0, Math.min(vw - 1, x));
+      const clampY = Math.max(0, Math.min(vh - 1, y));
+      document.dispatchEvent(new MouseEvent("mousemove", {
+        clientX: clampX, clientY: clampY, bubbles: true, cancelable: true,
+      }));
+      await sleep(80 + Math.random() * 200);
+    }
+
+    // Scroll: 40% chance of a small scroll
+    if (Math.random() < 0.40) {
+      const scrollAmt = Math.floor((Math.random() - 0.3) * 200); // bias downward
+      log(`Human sim: scroll ${scrollAmt > 0 ? "down" : "up"} ${Math.abs(scrollAmt)}px`);
+      window.scrollBy({ top: scrollAmt, behavior: "smooth" });
+      await sleep(200 + Math.random() * 400);
+    }
+
+    // Focus/blur (tab switch): 15% chance per call
+    if (Math.random() < 0.15) {
+      const blurSec = 2 + Math.random() * 3;
+      log(`Human sim: tab blur for ${blurSec.toFixed(1)}s`);
+      document.dispatchEvent(new Event("blur", { bubbles: true }));
+      window.dispatchEvent(new Event("blur"));
+      Object.defineProperty(document, "hidden", { value: true, writable: true, configurable: true });
+      document.dispatchEvent(new Event("visibilitychange"));
+      await sleep(blurSec * 1000);
+      document.dispatchEvent(new Event("focus", { bubbles: true }));
+      window.dispatchEvent(new Event("focus"));
+      Object.defineProperty(document, "hidden", { value: false, writable: true, configurable: true });
+      document.dispatchEvent(new Event("visibilitychange"));
+      log("Human sim: tab focus restored");
+    }
+  }
+
+  // Track when next idle gap / long break should trigger
+  if (!cycling.nextIdleAt) cycling.nextIdleAt = 0;
+  if (!cycling.nextBreakAt) cycling.nextBreakAt = 0;
+
   async function runCycleLoop() {
     if (!cycling.active || __abortAll) return;
     if (await checkStopSignal()) return;
 
     cycling.round++;
-    cycling.lastRefresh = Date.now(); // reset keep-alive timer on each round
+    cycling.lastRefresh = Date.now();
+
+    // Schedule idle gap and long break thresholds on first round
+    if (cycling.nextIdleAt === 0) cycling.nextIdleAt = cycling.round + 4 + Math.floor(Math.random() * 5);   // 4-8 rounds
+    if (cycling.nextBreakAt === 0) cycling.nextBreakAt = cycling.round + 15 + Math.floor(Math.random() * 11); // 15-25 rounds
+
+    // Layer 2: Idle gap (30-90s every 4-8 rounds)
+    if (cycling.round >= cycling.nextIdleAt) {
+      const idleSec = 30 + Math.floor(Math.random() * 61);
+      setStatus(`Idle pause ${idleSec}s (human-like)...`);
+      log(`Idle gap: pausing ${idleSec}s at round ${cycling.round}`);
+      await sleep(idleSec * 1000);
+      if (!cycling.active || await checkStopSignal()) return;
+      cycling.nextIdleAt = cycling.round + 4 + Math.floor(Math.random() * 5);
+    }
+
+    // Layer 3: Long break (2-5 min every 15-25 rounds)
+    if (cycling.round >= cycling.nextBreakAt) {
+      const breakSec = 120 + Math.floor(Math.random() * 181);
+      setStatus(`Taking a break ${Math.round(breakSec / 60)}m ${breakSec % 60}s...`);
+      log(`Long break: pausing ${breakSec}s at round ${cycling.round}`);
+      chrome.storage.local.get(["loginDetails"], (d) => {
+        const u = d.loginDetails?.username || "";
+        trackEvent(EVENT_TYPES.CYCLING, `Long break ${breakSec}s at round ${cycling.round} (anti-detection)`, u);
+      });
+      await sleep(breakSec * 1000);
+      if (!cycling.active || await checkStopSignal()) return;
+      cycling.nextBreakAt = cycling.round + 15 + Math.floor(Math.random() * 11);
+    }
+
     const startDate = document.getElementById("ab-start-date")?.value || "";
     const endDate = document.getElementById("ab-end-date")?.value || "";
     const interval =
       parseInt(document.getElementById("ab-interval")?.value || "30") * 1000;
+
+    // On first round, wait for page to be fully ready (no "Loading..." state)
+    if (cycling.round === 1) {
+      let loadWait = 0;
+      while (loadWait < 20) {
+        const calText = document.querySelector(".col-sm-8, .atlas_section, #page_form")?.textContent || "";
+        if (!calText.includes("Loading")) break;
+        log(`Waiting for page to finish loading... (${loadWait + 1}/20)`);
+        await sleep(500);
+        loadWait++;
+      }
+      log("Page ready — starting first cycle");
+    }
 
     const checked = document.querySelectorAll(".ab-loc-cb:checked");
     const locations = Array.from(checked).map((cb) => ({
@@ -2037,21 +2240,29 @@
       name: cb.dataset.name,
     }));
 
+    // Shuffle locations each round (break sequential pattern)
+    for (let i = locations.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [locations[i], locations[j]] = [locations[j], locations[i]];
+    }
+
     setCycleInfo(`Round ${cycling.round}`);
 
     for (let i = 0; i < locations.length; i++) {
       if (!cycling.active) return;
 
-      // Check stop signal from dashboard between each location
       if (await checkStopSignal()) return;
 
-      // Random delay between locations (3-6 sec) to avoid rate limiting
+      // Layer 1: Human-like weighted random delay between locations
       if (i > 0) {
-        const delaySec = 3 + Math.random() * 3;
+        const delaySec = humanDelay();
         setStatus(`Waiting ${delaySec.toFixed(0)}s before next location...`);
         await sleep(delaySec * 1000);
         if (!cycling.active || await checkStopSignal()) return;
       }
+
+      // Simulate human activity (mouse, scroll, focus) between location checks
+      await simulateHumanActivity();
 
       // Check for 429 rate limit — exponential backoff
       if (__rateLimited429) {
@@ -2063,6 +2274,7 @@
         chrome.storage.local.get(["loginDetails"], (d) => {
           const u = d.loginDetails?.username || "";
           trackEvent(EVENT_TYPES.ERROR, `429 rate limited — backoff ${waitSec}s (round ${cycling.round})`, u);
+          sendTelegramNotification("rate", `🟠 <b>429 RATE LIMITED</b>\n\n👤 <b>User:</b> ${u}\n⏳ Backoff ${waitSec}s\n🔁 Round ${cycling.round}`);
         });
         await sleep(cycling.backoffMs);
         if (!cycling.active) return;
@@ -2100,6 +2312,7 @@
         chrome.storage.local.get(["loginDetails"], (d) => {
           const u = d.loginDetails?.username || "";
           trackEvent(EVENT_TYPES.ERROR, `429 rate limited after fetch — backoff ${waitSec}s at ${loc.name}`, u);
+          sendTelegramNotification("rate", `🟠 <b>429 RATE LIMITED</b>\n\n👤 <b>User:</b> ${u}\n📍 ${loc.name}\n⏳ Backoff ${waitSec}s`);
         });
         await sleep(cycling.backoffMs);
         if (!cycling.active) return;
@@ -2180,11 +2393,12 @@
       await sleep(2000);
     }
 
-    // All locations checked — wait and repeat
+    // All locations checked — wait and repeat with ±20% jitter
     if (!cycling.active) return;
-    const sec = Math.round(interval / 1000);
+    const jitter = interval * (0.8 + Math.random() * 0.4);
+    const sec = Math.round(jitter / 1000);
     setStatus(`All locations checked. Next round in ${sec}s...`);
-    cycling.timer = setTimeout(() => runCycleLoop(), interval);
+    cycling.timer = setTimeout(() => runCycleLoop(), jitter);
   }
 
   // ─── AUTO-SUBMIT OBSERVER (standalone, without cycling) ────────────
@@ -2237,13 +2451,69 @@
   // ─── BOOKING PAGE HANDLER ──────────────────────────────────────────
 
   async function handleBookingPage(settings) {
-    // Check for error state: "No Class Selected" or empty post_select means page errored
-    await sleep(1000);
-    const postSelect = document.getElementById("post_select");
-    const groupMembers = document.querySelector(".applicant-table, .group-members, #applicant_table");
-    const noClassEl = document.body?.textContent?.includes("No Class Selected");
+    // Wait for applicant name label to appear inside #gm_select
+    // "No Class Selected" (alert-warning) is a loading state, NOT an error — we must wait past it
+    let memberAttempts = 0;
+    let pageReady = false;
+    while (memberAttempts < 40) {
+      const nameLabel = document.querySelector("#gm_select li.list-group-item label");
+      const alertWarning = document.querySelector("#gm_select .alert-warning");
+      const hasRealName = nameLabel && nameLabel.textContent.trim().length > 0;
+      const hasNoClass = alertWarning && alertWarning.textContent.includes("No Class Selected");
 
-    if (noClassEl || (postSelect && postSelect.options.length <= 1 && !postSelect.value)) {
+      if (hasRealName) {
+        log(`Applicant loaded after ${memberAttempts * 500}ms: "${nameLabel.textContent.trim()}"`);
+        pageReady = true;
+        break;
+      }
+
+      if (hasNoClass) {
+        log(`"No Class Selected" showing — page still loading (attempt ${memberAttempts + 1}/40)`);
+      } else {
+        log(`Waiting for applicant name... (attempt ${memberAttempts + 1}/40)`);
+      }
+      await sleep(500);
+      memberAttempts++;
+    }
+
+    // If applicant name never loaded after 20 seconds, check if it's a real error
+    if (!pageReady) {
+      log("Applicant name did not load after 20 seconds — checking if page is genuinely broken");
+      const alertWarning = document.querySelector("#gm_select .alert-warning");
+      const stillNoClass = alertWarning && alertWarning.textContent.includes("No Class Selected");
+      if (!stillNoClass) {
+        // No "No Class Selected" and no name — might just be a slow page, try to continue
+        log("No alert-warning either — attempting to continue anyway");
+      }
+    }
+
+    // Wait for dropdown to appear and populate
+    let attempts = 0;
+    while (!document.getElementById("post_select") && attempts < 20) {
+      log(`Waiting for post_select dropdown... (attempt ${attempts + 1}/20)`);
+      await sleep(500);
+      attempts++;
+    }
+
+    const postSelect = document.getElementById("post_select");
+    if (postSelect) {
+      let optAttempts = 0;
+      while (postSelect.options.length <= 1 && optAttempts < 10) {
+        log(`Waiting for dropdown options to populate... (${postSelect.options.length} options, attempt ${optAttempts + 1}/10)`);
+        await sleep(500);
+        optAttempts++;
+      }
+      log(`Dropdown ready: ${postSelect.options.length} options, value="${postSelect.value}"`);
+    }
+
+    // Only treat as error if BOTH: applicant never loaded AND dropdown is empty after full wait
+    const nameLabel = document.querySelector("#gm_select li.list-group-item label");
+    const hasRealName = nameLabel && nameLabel.textContent.trim().length > 0;
+    const isEmptyPage = !postSelect || (postSelect.options.length <= 1 && !postSelect.value);
+    const isGenuineError = !hasRealName && isEmptyPage;
+
+    if (isGenuineError) {
+      log(`Booking page error detected — hasName: ${hasRealName}, emptyPage: ${isEmptyPage}, options: ${postSelect?.options?.length || 0}, value: "${postSelect?.value || ''}"`);
       const autoUser = await new Promise((r) => {
         chrome.storage.local.get(["activeAutomationUser"], (d) => r(d.activeAutomationUser || null));
       });
@@ -2264,6 +2534,7 @@
 
         log(`Booking page error (${errorCount}/3) — going back to dashboard...`);
         trackEvent(EVENT_TYPES.ERROR, `Booking page error — No Class Selected (attempt ${errorCount}/3)`, activeUser);
+        sendTelegramNotification("error", `⚠️ <b>BOOKING PAGE ERROR</b>\n\n👤 <b>User:</b> ${activeUser}\n❌ No Class Selected (attempt ${errorCount}/3)\n🔄 Redirecting to dashboard`);
         await sleep(3000);
         window.location.href = window.location.origin + "/en-US/";
         return;
@@ -2271,13 +2542,8 @@
     }
 
     // Page loaded successfully — clear error counter
+    log("Booking page loaded OK — injecting panel");
     sessionStorage.removeItem("__abOFCErrorCount");
-
-    let attempts = 0;
-    while (!document.getElementById("post_select") && attempts < 20) {
-      await sleep(500);
-      attempts++;
-    }
 
     injectBookingPanel();
 
@@ -2350,6 +2616,7 @@
         log("Alert auto-dismissed: " + e.detail);
         const activeUser = settings.loginDetails?.username || "";
         trackEvent(EVENT_TYPES.ERROR, "Alert dismissed: " + e.detail, activeUser);
+        sendTelegramNotification("error", `⚠️ <b>ALERT DISMISSED</b>\n\n👤 <b>User:</b> ${activeUser}\n📋 ${e.detail}`);
       });
     }
 
