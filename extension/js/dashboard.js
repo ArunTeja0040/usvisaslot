@@ -58,11 +58,14 @@
   function loadData() {
     return new Promise((resolve) => {
       chrome.storage.local.get(
-        ["userProfilesList", "userStatuses", "eventLog"],
+        ["userProfilesList", "userStatuses", "eventLog", "slotHistory", "dailyStats", "__storageStats"],
         (data) => resolve({
           profiles: data.userProfilesList || [],
           statuses: data.userStatuses || {},
           events: data.eventLog || [],
+          slotHistory: data.slotHistory || [],
+          dailyStats: data.dailyStats || {},
+          storageStats: data.__storageStats || null,
         })
       );
     });
@@ -93,17 +96,53 @@
 
   // ─── USER CARDS ────────────────────────────────────────────────────
 
-  function renderUserCards(profiles, statuses) {
+  function renderUserCards(profiles, statuses, slotHistory) {
     const container = document.getElementById("user-cards");
     const filterStatus = document.getElementById("filter-status").value;
+    const filterVisa = document.getElementById("filter-visa")?.value || "all";
+
+    // Build slot stats per user
+    const slotStats = {};
+    (slotHistory || []).forEach((s) => {
+      const u = s.username;
+      if (!slotStats[u]) {
+        slotStats[u] = {
+          total: 0, inRange: 0, outRange: 0,
+          confirmed: 0, submitted: 0, selected: 0, detected: 0,
+          lastFoundAt: null, lastLocation: null, lastDate: null,
+        };
+      }
+      slotStats[u].total++;
+      if (s.inRange) slotStats[u].inRange++;
+      else slotStats[u].outRange++;
+      if (slotStats[u][s.action] !== undefined) slotStats[u][s.action]++;
+      if (!slotStats[u].lastFoundAt || new Date(s.foundAt) > new Date(slotStats[u].lastFoundAt)) {
+        slotStats[u].lastFoundAt = s.foundAt;
+        slotStats[u].lastLocation = s.location;
+        slotStats[u].lastDate = s.date;
+      }
+    });
 
     const filtered = profiles.filter((p) => {
-      if (filterStatus === "all") return true;
-      const userStatus = statuses[p.username]?.status || "idle";
-      if (filterStatus === "error") {
-        return ["rate_limited", "session_expired", "error"].includes(userStatus);
+      // Status filter
+      if (filterStatus !== "all") {
+        const userStatus = statuses[p.username]?.status || "idle";
+        if (filterStatus === "error") {
+          if (!["rate_limited", "session_expired", "error"].includes(userStatus)) return false;
+        } else if (userStatus !== filterStatus) {
+          return false;
+        }
       }
-      return userStatus === filterStatus;
+      // Visa filter
+      if (filterVisa !== "all") {
+        const visa = (p.visaType || "").trim().toUpperCase();
+        if (filterVisa === "__unset__") {
+          if (visa) return false;
+        } else if (visa !== filterVisa.toUpperCase()) {
+          return false;
+        }
+      }
+      return true;
     });
 
     if (filtered.length === 0) {
@@ -154,15 +193,54 @@
             </div>
           </div>
           ${locs ? `<div class="card-locations">${locs}</div>` : ""}
+
+          ${(() => {
+            const st = slotStats[profile.username];
+            if (!st) return `<div class="card-slots-summary" style="margin-top:8px;padding:6px 8px;background:#0f1923;border-radius:4px;font-size:11px;color:#78909c;">📜 No slot history yet</div>`;
+            const lastInfo = st.lastFoundAt
+              ? `· Last: <b>${esc(st.lastLocation)}</b> ${esc(st.lastDate)} (${timeAgo(st.lastFoundAt)})`
+              : "";
+            return `
+              <div class="card-slots-summary" style="margin-top:8px;padding:6px 8px;background:#0f1923;border-radius:4px;font-size:11px;color:#cfd8dc;">
+                🎯 <b>${st.total}</b> slots seen
+                · ✅ <b style="color:#27ae60;">${st.inRange}</b> in range
+                · ⚪ ${st.outRange} out
+                ${st.confirmed > 0 ? `· 🎉 <b style="color:#27ae60;">${st.confirmed} confirmed</b>` : ""}
+                ${st.submitted > 0 && st.confirmed === 0 ? `· ⏳ ${st.submitted} submitted` : ""}
+                <div style="margin-top:3px;color:#78909c;">${lastInfo}</div>
+              </div>`;
+          })()}
+
           <div class="card-actions">
             ${isActive
               ? `<button class="btn btn-small btn-red btn-stop" data-user="${safeUser}">Stop</button>
                  <button class="btn btn-small btn-orange btn-logout" data-user="${safeUser}">Logout</button>`
               : `<button class="btn btn-small btn-green btn-start" data-user="${safeUser}">Start Now</button>`}
             <button class="btn btn-small btn-gray btn-edit" data-user="${safeUser}">Edit</button>
+            <button class="btn btn-small btn-blue btn-history" data-user="${safeUser}" style="background:#3498db;color:white;">📜 History</button>
           </div>
+          ${(() => {
+            const r = status.roundCount || 0;
+            const e = status.errorCount || 0;
+            const inR = status.slotsInRangeFound || 0;
+            const outR = status.slotsOutOfRangeFound || 0;
+            const last429 = status.last429At ? `· 🟠 429 ${timeAgo(status.last429At)} ` : "";
+            const last401 = status.last401At ? `· 🔴 401 ${timeAgo(status.last401At)} ` : "";
+            // Hide only if user never started cycling AND no errors AND no slots
+            const hasAnyData = r > 0 || e > 0 || inR > 0 || outR > 0 || status.cycleStartedAt || isActive;
+            if (!hasAnyData) return "";
+            return `
+              <div class="card-counters" style="margin-top:6px;padding:5px 8px;background:#0a1119;border-radius:4px;font-size:11px;color:#b0bec5;display:flex;flex-wrap:wrap;gap:8px;">
+                <span>🔁 Round <b>${r}</b></span>
+                <span style="color:${e > 0 ? '#e74c3c' : '#78909c'};">⚠️ <b>${e}</b> errors</span>
+                <span style="color:#27ae60;">✅ <b>${inR}</b> in</span>
+                <span style="color:#90a4ae;">⚪ ${outR} out</span>
+                ${last429}${last401}
+              </div>`;
+          })()}
           <div class="card-footer">
             ${status.updatedAt ? "Updated " + timeAgo(status.updatedAt) : "No activity yet"}
+            ${status.cycleStartedAt ? " · Started " + timeAgo(status.cycleStartedAt) : ""}
             ${status.foundAt ? " · Slot found " + timeAgo(status.foundAt) : ""}
             ${status.confirmedAt ? " · Confirmed " + timeAgo(status.confirmedAt) : ""}
           </div>
@@ -210,6 +288,213 @@
       opts.push(`<option value="${p.username}"${p.username === current ? " selected" : ""}>${name}</option>`);
     });
     select.innerHTML = opts.join("");
+
+    // Slot history user filter mirror
+    const sselect = document.getElementById("slot-filter-user");
+    if (sselect) {
+      const cur2 = sselect.value;
+      const opts2 = ['<option value="all">All Users</option>'];
+      profiles.forEach((p) => {
+        const name = p.name || deriveProfileName(p.username);
+        opts2.push(`<option value="${p.username}"${p.username === cur2 ? " selected" : ""}>${name}</option>`);
+      });
+      sselect.innerHTML = opts2.join("");
+    }
+  }
+
+  // ─── DAILY/WEEKLY STATS ────────────────────────────────────────────
+
+  function istDayKeyFromDate(d) {
+    const istOffsetMs = 5.5 * 60 * 60 * 1000;
+    const ist = new Date(d.getTime() + istOffsetMs);
+    return ist.toISOString().substring(0, 10);
+  }
+
+  function renderStats(dailyStats, storageStats) {
+    const container = document.getElementById("stats-pane");
+    if (!container) return;
+
+    const days = [];
+    for (let i = 0; i < 14; i++) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const key = istDayKeyFromDate(d);
+      const s = dailyStats[key] || null;
+      days.push({ key, label: i === 0 ? "Today" : i === 1 ? "Yesterday" : key, stats: s });
+    }
+
+    const last7 = days.slice(0, 7).map(d => d.stats).filter(Boolean);
+    const weekTotal = {
+      slotsFound: 0, slotsInRange: 0, booked: 0, missed: 0, errors: 0,
+      byLocation: {}, byHour: {},
+    };
+    last7.forEach(s => {
+      weekTotal.slotsFound += s.slotsFound || 0;
+      weekTotal.slotsInRange += s.slotsInRange || 0;
+      weekTotal.booked += s.booked || 0;
+      weekTotal.missed += s.missed || 0;
+      weekTotal.errors += s.errors || 0;
+      for (const [k, v] of Object.entries(s.byLocation || {})) {
+        weekTotal.byLocation[k] = (weekTotal.byLocation[k] || 0) + v;
+      }
+      for (const [k, v] of Object.entries(s.byHour || {})) {
+        weekTotal.byHour[k] = (weekTotal.byHour[k] || 0) + v;
+      }
+    });
+
+    const topLocs = Object.entries(weekTotal.byLocation).sort((a, b) => b[1] - a[1]);
+    const topHours = Object.entries(weekTotal.byHour).sort((a, b) => b[1] - a[1]);
+
+    // Hour heatmap (24 hours)
+    const maxHour = Math.max(...Object.values(weekTotal.byHour), 1);
+    const hourBars = Array.from({ length: 24 }, (_, h) => {
+      const key = String(h).padStart(2, "0");
+      const v = weekTotal.byHour[key] || 0;
+      const pct = (v / maxHour) * 100;
+      const color = pct > 60 ? "#27ae60" : pct > 30 ? "#f39c12" : pct > 0 ? "#3498db" : "#2d3e50";
+      return `<div style="display:inline-block;width:20px;height:${Math.max(pct * 0.6, 2)}px;background:${color};margin:0 1px;vertical-align:bottom;" title="${key}:00 → ${v}"></div>`;
+    }).join("");
+
+    const dayBars = days.slice(0, 14).reverse().map(d => {
+      const total = d.stats?.slotsFound || 0;
+      const inR = d.stats?.slotsInRange || 0;
+      const max = Math.max(...days.map(x => x.stats?.slotsFound || 0), 1);
+      const h = (total / max) * 80;
+      const inH = (inR / max) * 80;
+      return `
+        <div style="display:inline-block;width:36px;text-align:center;margin:0 2px;vertical-align:bottom;">
+          <div style="position:relative;height:80px;display:flex;flex-direction:column;justify-content:flex-end;">
+            <div style="height:${h - inH}px;background:#90a4ae;border-radius:2px 2px 0 0;"></div>
+            <div style="height:${inH}px;background:#27ae60;"></div>
+          </div>
+          <div style="font-size:9px;color:#78909c;margin-top:2px;">${d.label.substring(5) || d.label.substring(0, 3)}</div>
+          <div style="font-size:10px;color:#cfd8dc;font-weight:bold;">${total}</div>
+        </div>`;
+    }).join("");
+
+    const storageBar = storageStats ? `
+      <div style="margin-top:14px;padding:8px;background:#0a1119;border-radius:6px;">
+        <div style="font-size:11px;color:#78909c;margin-bottom:4px;">Storage: ${storageStats.mb} MB / 10 MB</div>
+        <div style="height:6px;background:#1a2733;border-radius:3px;overflow:hidden;">
+          <div style="height:100%;width:${(storageStats.mb / 10) * 100}%;background:${storageStats.mb > 8 ? '#e74c3c' : storageStats.mb > 6 ? '#f39c12' : '#27ae60'};"></div>
+        </div>
+        ${storageStats.lastPrune ? `<div style="font-size:10px;color:#78909c;margin-top:4px;">Last prune: ${timeAgo(storageStats.lastPrune.at)} (${storageStats.lastPrune.pruned.join(", ")})</div>` : ""}
+      </div>` : "";
+
+    container.innerHTML = `
+      <div style="padding:14px;color:#cfd8dc;">
+        <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px;">
+          <div style="background:#0a1119;padding:10px;border-radius:6px;text-align:center;">
+            <div style="font-size:22px;font-weight:bold;color:#3498db;">${weekTotal.slotsFound}</div>
+            <div style="font-size:10px;color:#78909c;">Slots (7d)</div>
+          </div>
+          <div style="background:#0a1119;padding:10px;border-radius:6px;text-align:center;">
+            <div style="font-size:22px;font-weight:bold;color:#27ae60;">${weekTotal.slotsInRange}</div>
+            <div style="font-size:10px;color:#78909c;">In Range</div>
+          </div>
+          <div style="background:#0a1119;padding:10px;border-radius:6px;text-align:center;">
+            <div style="font-size:22px;font-weight:bold;color:#27ae60;">${weekTotal.booked}</div>
+            <div style="font-size:10px;color:#78909c;">Booked</div>
+          </div>
+          <div style="background:#0a1119;padding:10px;border-radius:6px;text-align:center;">
+            <div style="font-size:22px;font-weight:bold;color:#e67e22;">${weekTotal.missed}</div>
+            <div style="font-size:10px;color:#78909c;">Missed</div>
+          </div>
+          <div style="background:#0a1119;padding:10px;border-radius:6px;text-align:center;">
+            <div style="font-size:22px;font-weight:bold;color:#e74c3c;">${weekTotal.errors}</div>
+            <div style="font-size:10px;color:#78909c;">Errors</div>
+          </div>
+        </div>
+
+        <div style="background:#0a1119;padding:12px;border-radius:6px;margin-bottom:14px;">
+          <div style="font-size:12px;color:#78909c;margin-bottom:8px;font-weight:bold;">📅 LAST 14 DAYS</div>
+          <div style="display:flex;align-items:flex-end;justify-content:flex-start;flex-wrap:nowrap;overflow-x:auto;">
+            ${dayBars}
+          </div>
+          <div style="font-size:10px;color:#78909c;margin-top:6px;">
+            <span style="color:#27ae60;">■</span> In range
+            <span style="color:#90a4ae;margin-left:10px;">■</span> Out of range
+          </div>
+        </div>
+
+        <div style="background:#0a1119;padding:12px;border-radius:6px;margin-bottom:14px;">
+          <div style="font-size:12px;color:#78909c;margin-bottom:8px;font-weight:bold;">🕐 HOUR HEATMAP (IST, last 7 days)</div>
+          <div style="white-space:nowrap;overflow-x:auto;">${hourBars}</div>
+          <div style="font-size:9px;color:#78909c;margin-top:4px;display:flex;justify-content:space-between;">
+            <span>00</span><span>06</span><span>12</span><span>18</span><span>23</span>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+          <div style="background:#0a1119;padding:12px;border-radius:6px;">
+            <div style="font-size:12px;color:#78909c;margin-bottom:8px;font-weight:bold;">📍 TOP LOCATIONS</div>
+            ${topLocs.length === 0 ? '<div style="color:#78909c;font-size:11px;">No data</div>' :
+              topLocs.slice(0, 5).map(([loc, c]) => `
+                <div style="font-size:12px;display:flex;justify-content:space-between;padding:3px 0;">
+                  <span>${loc}</span><b>${c}</b>
+                </div>`).join("")}
+          </div>
+          <div style="background:#0a1119;padding:12px;border-radius:6px;">
+            <div style="font-size:12px;color:#78909c;margin-bottom:8px;font-weight:bold;">🔥 HOT HOURS</div>
+            ${topHours.length === 0 ? '<div style="color:#78909c;font-size:11px;">No data</div>' :
+              topHours.slice(0, 5).map(([h, c]) => `
+                <div style="font-size:12px;display:flex;justify-content:space-between;padding:3px 0;">
+                  <span>${h}:00 IST</span><b>${c}</b>
+                </div>`).join("")}
+          </div>
+        </div>
+
+        ${storageBar}
+      </div>
+    `;
+  }
+
+  // ─── SLOT HISTORY ──────────────────────────────────────────────────
+
+  function renderSlotHistory(history, profiles) {
+    const container = document.getElementById("slot-history");
+    if (!container) return;
+
+    const fUser = document.getElementById("slot-filter-user")?.value || "all";
+    const fLoc = document.getElementById("slot-filter-loc")?.value || "all";
+    const fAct = document.getElementById("slot-filter-action")?.value || "all";
+    const fRange = document.getElementById("slot-filter-range")?.value || "all";
+
+    let filtered = history;
+    if (fUser !== "all") filtered = filtered.filter((e) => e.username === fUser);
+    if (fLoc !== "all") filtered = filtered.filter((e) => e.location === fLoc);
+    if (fAct !== "all") filtered = filtered.filter((e) => e.action === fAct);
+    if (fRange === "in") filtered = filtered.filter((e) => e.inRange);
+    else if (fRange === "out") filtered = filtered.filter((e) => !e.inRange);
+
+    const display = filtered.slice(0, 200);
+
+    if (display.length === 0) {
+      container.innerHTML = '<div class="log-empty">No slot history yet</div>';
+      return;
+    }
+
+    const esc = (s) => (s || "").toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+    const actionColor = {
+      detected: "#78909c",
+      selected: "#3498db",
+      submitted: "#f39c12",
+      confirmed: "#27ae60",
+      missed: "#e74c3c",
+    };
+
+    container.innerHTML = display.map((e) => {
+      const color = actionColor[e.action] || "#78909c";
+      const rangeIcon = e.inRange ? "✅" : "⚪";
+      return `
+      <div class="log-entry" style="border-left:3px solid ${color};">
+        <span class="log-time">${formatTime(e.foundAt)}</span>
+        <span class="log-type" style="background:${color};color:white;">${esc(e.action)}</span>
+        <span class="log-user">${esc(deriveProfileName(e.username))}</span>
+        <span class="log-message">${rangeIcon} ${esc(e.location)} → <b>${esc(e.date)}</b></span>
+      </div>`;
+    }).join("");
   }
 
   // ─── USER ACTIONS ──────────────────────────────────────────────────
@@ -426,6 +711,12 @@
       logoutUser(username);
     } else if (btn.classList.contains("btn-edit")) {
       openEditModal(username);
+    } else if (btn.classList.contains("btn-history")) {
+      // Switch to slot history tab + auto-filter to this user
+      const userSel = document.getElementById("slot-filter-user");
+      if (userSel) userSel.value = username;
+      switchTab("slots");
+      refresh();
     }
   });
 
@@ -434,8 +725,10 @@
   async function refresh() {
     const data = await loadData();
     updateStats(data.profiles, data.statuses, data.events);
-    renderUserCards(data.profiles, data.statuses);
+    renderUserCards(data.profiles, data.statuses, data.slotHistory);
     renderActivityLog(data.events);
+    renderSlotHistory(data.slotHistory, data.profiles);
+    renderStats(data.dailyStats, data.storageStats);
     updateLogUserFilter(data.profiles);
 
     // Update header with active user
@@ -454,8 +747,56 @@
   }
 
   document.getElementById("filter-status").addEventListener("change", refresh);
+  document.getElementById("filter-visa")?.addEventListener("change", refresh);
   document.getElementById("log-filter-user").addEventListener("change", refresh);
   document.getElementById("log-filter-type").addEventListener("change", refresh);
+
+  // Slot history filters
+  ["slot-filter-user", "slot-filter-loc", "slot-filter-action", "slot-filter-range"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("change", refresh);
+  });
+
+  // Clear slot history button
+  document.getElementById("clear-slots-btn")?.addEventListener("click", () => {
+    if (!confirm("Clear all slot history?")) return;
+    chrome.storage.local.set({ slotHistory: [] }, refresh);
+  });
+
+  // Tab switching: Activity Log <-> Slot History <-> Stats
+  function switchTab(tab) {
+    const tabLog = document.getElementById("tab-log");
+    const tabSlots = document.getElementById("tab-slots");
+    const tabStats = document.getElementById("tab-stats");
+    const ctrlA = document.getElementById("log-controls-activity");
+    const ctrlS = document.getElementById("log-controls-slots");
+    const paneA = document.getElementById("activity-log");
+    const paneS = document.getElementById("slot-history");
+    const paneStats = document.getElementById("stats-pane");
+
+    // Reset all
+    [tabLog, tabSlots, tabStats].forEach(el => el && (el.style.opacity = "0.5"));
+    if (ctrlA) ctrlA.style.display = "none";
+    if (ctrlS) ctrlS.style.display = "none";
+    if (paneA) paneA.style.display = "none";
+    if (paneS) paneS.style.display = "none";
+    if (paneStats) paneStats.style.display = "none";
+
+    if (tab === "slots") {
+      tabSlots.style.opacity = "1";
+      ctrlS.style.display = "flex";
+      paneS.style.display = "block";
+    } else if (tab === "stats") {
+      tabStats.style.opacity = "1";
+      paneStats.style.display = "block";
+    } else {
+      tabLog.style.opacity = "1";
+      ctrlA.style.display = "flex";
+      paneA.style.display = "block";
+    }
+  }
+  document.getElementById("tab-log")?.addEventListener("click", () => switchTab("log"));
+  document.getElementById("tab-slots")?.addEventListener("click", () => switchTab("slots"));
+  document.getElementById("tab-stats")?.addEventListener("click", () => switchTab("stats"));
 
   // ─── EDIT MODAL ────────────────────────────────────────────────────
 

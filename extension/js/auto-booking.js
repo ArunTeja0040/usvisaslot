@@ -6,7 +6,21 @@
   const DASHBOARD_CLICK_DELAY = 2000;
   const MAX_EVENT_LOG = 500;
   const RELOGIN_FLAG = "__autoBookingRelogin";
+  // Observation delay before auto-recovery (so operator can see real error on page)
+  const ERROR_OBSERVE_SEC = 15;
   let __abortAll = false;
+
+  // Helper: pause with countdown status before recovery action
+  async function observeBeforeRecovery(reason, totalSec = ERROR_OBSERVE_SEC) {
+    log(`Pausing ${totalSec}s for error observation: ${reason}`);
+    for (let s = totalSec; s > 0; s--) {
+      if (__abortAll) return;
+      // Update status bar (if booking panel exists)
+      const statusEl = document.getElementById("ab-status");
+      if (statusEl) statusEl.textContent = `⚠️ ${reason} — recovery in ${s}s...`;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
 
   const EVENT_TYPES = {
     LOGIN: "login", CAPTCHA: "captcha", SECURITY: "security",
@@ -23,6 +37,7 @@
   let __pendingEvents = [];
   let __eventFlushTimer = null;
 
+  let __flushCount = 0;
   function flushEventLog() {
     if (__pendingEvents.length === 0) return;
     const batch = __pendingEvents.splice(0);
@@ -30,7 +45,15 @@
       const events = data.eventLog || [];
       events.unshift(...batch);
       if (events.length > MAX_EVENT_LOG) events.length = MAX_EVENT_LOG;
-      chrome.storage.local.set({ eventLog: events });
+      chrome.storage.local.set({ eventLog: events }, () => {
+        // Trigger quota check every 20 flushes (not every flush — avoid spam)
+        __flushCount++;
+        if (__flushCount % 20 === 0) {
+          chrome.runtime.sendMessage({ action: "checkQuota" }, () => {
+            if (chrome.runtime.lastError) {} // ignore — sw may be inactive
+          });
+        }
+      });
     });
   }
 
@@ -58,6 +81,16 @@
       }, 2000);
     }
     log(`[${type}] ${message}`);
+
+    // Auto-increment per-user counters based on event type
+    if (username) {
+      if (type === EVENT_TYPES.ERROR) {
+        incrementUserCounter(username, "errorCount", 1);
+        if (/429|rate.?limit/i.test(message)) setUserCounter(username, "last429At", new Date().toISOString());
+        if (/401|session.+expired|unauthorized/i.test(message)) setUserCounter(username, "last401At", new Date().toISOString());
+        bumpDailyStat({ key: "errors", delta: 1 });
+      }
+    }
   }
 
   function updateUserStatus(username, status, extra) {
@@ -74,11 +107,216 @@
     });
   }
 
+  // Atomic counter increment for per-user metrics
+  function incrementUserCounter(username, key, delta = 1) {
+    if (!username || !key) return;
+    chrome.storage.local.get(["userStatuses"], (data) => {
+      const statuses = data.userStatuses || {};
+      statuses[username] = statuses[username] || {};
+      statuses[username][key] = (statuses[username][key] || 0) + delta;
+      statuses[username].updatedAt = new Date().toISOString();
+      chrome.storage.local.set({ userStatuses: statuses });
+    });
+  }
+
+  // Set timestamp counter (e.g. last429At)
+  function setUserCounter(username, key, value) {
+    if (!username || !key) return;
+    chrome.storage.local.get(["userStatuses"], (data) => {
+      const statuses = data.userStatuses || {};
+      statuses[username] = statuses[username] || {};
+      statuses[username][key] = value;
+      statuses[username].updatedAt = new Date().toISOString();
+      chrome.storage.local.set({ userStatuses: statuses });
+    });
+  }
+
+  // ─── DAILY STATS AGGREGATOR ─────────────────────────────────────
+  // Aggregates per-day metrics for daily/weekly summary reports.
+  // Day key = IST date (Asia/Kolkata) "YYYY-MM-DD".
+
+  function istDayKey(d) {
+    const date = d || new Date();
+    // IST = UTC+5:30 → adjust UTC to IST then take date portion
+    const istOffsetMs = 5.5 * 60 * 60 * 1000;
+    const ist = new Date(date.getTime() + istOffsetMs);
+    return ist.toISOString().substring(0, 10);
+  }
+
+  function istHour(d) {
+    const date = d || new Date();
+    const istOffsetMs = 5.5 * 60 * 60 * 1000;
+    const ist = new Date(date.getTime() + istOffsetMs);
+    return ist.getUTCHours(); // 0-23 in IST
+  }
+
+  function bumpDailyStat({ key, delta = 1, location, hour, username }) {
+    const dayKey = istDayKey();
+    chrome.storage.local.get(["dailyStats"], (data) => {
+      const stats = data.dailyStats || {};
+      const today = stats[dayKey] || {
+        slotsFound: 0,
+        slotsInRange: 0,
+        slotsOutOfRange: 0,
+        booked: 0,
+        missed: 0,
+        errors: 0,
+        byLocation: {},
+        byHour: {},
+        activeUsers: {},
+      };
+
+      if (key) today[key] = (today[key] || 0) + delta;
+      if (location) today.byLocation[location] = (today.byLocation[location] || 0) + delta;
+      if (hour !== undefined) {
+        const hKey = String(hour).padStart(2, "0");
+        today.byHour[hKey] = (today.byHour[hKey] || 0) + delta;
+      }
+      if (username) today.activeUsers[username] = (today.activeUsers[username] || 0) + delta;
+
+      stats[dayKey] = today;
+      chrome.storage.local.set({ dailyStats: stats });
+    });
+  }
+
+  // Reset cycling counters (called on startCycling)
+  function resetUserCycleCounters(username) {
+    if (!username) return;
+    chrome.storage.local.get(["userStatuses"], (data) => {
+      const statuses = data.userStatuses || {};
+      statuses[username] = {
+        ...(statuses[username] || {}),
+        roundCount: 0,
+        errorCount: 0,
+        slotsInRangeFound: 0,
+        slotsOutOfRangeFound: 0,
+        cycleStartedAt: new Date().toISOString(),
+        last429At: null,
+        last401At: null,
+        updatedAt: new Date().toISOString(),
+      };
+      chrome.storage.local.set({ userStatuses: statuses });
+    });
+  }
+
   function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
   }
 
-  function sendTelegramNotification(type, message) {
+  // ─── SLOT HISTORY TRACKER ─────────────────────────────────────────
+  // Records every detected slot for analytics/pattern detection.
+  // Dedup: same (username, location, date) only logged once per 30 min window.
+
+  const SLOT_HISTORY_DEDUP_MS = 30 * 60 * 1000; // 30 min
+
+  function recordSlotHistory(entry) {
+    // entry: { username, location, date, inRange, action }
+    if (!entry.username || !entry.location || !entry.date) return;
+
+    chrome.storage.local.get(["slotHistory"], (data) => {
+      const history = data.slotHistory || [];
+      const now = Date.now();
+
+      // Dedup: skip if same key logged in last 30 min with same action
+      const dupIdx = history.findIndex((e) =>
+        e.username === entry.username &&
+        e.location === entry.location &&
+        e.date === entry.date &&
+        e.action === (entry.action || "detected") &&
+        now - new Date(e.foundAt).getTime() < SLOT_HISTORY_DEDUP_MS
+      );
+      if (dupIdx !== -1) return;
+
+      const record = {
+        id: now + "_" + Math.random().toString(36).substring(2, 6),
+        username: entry.username,
+        location: entry.location,
+        date: entry.date,
+        foundAt: new Date(now).toISOString(),
+        inRange: !!entry.inRange,
+        action: entry.action || "detected",
+      };
+
+      history.unshift(record);
+      // Soft cap (quota prune in sw-enhanced enforces hard cap)
+      if (history.length > 1500) history.length = 1500;
+      chrome.storage.local.set({ slotHistory: history });
+    });
+  }
+
+  // Update existing slot history record's action (e.g. detected → selected → submitted)
+  function updateSlotHistoryAction(username, location, date, newAction) {
+    if (!username || !location || !date) return;
+    chrome.storage.local.get(["slotHistory"], (data) => {
+      const history = data.slotHistory || [];
+      // Find most recent matching entry
+      const idx = history.findIndex((e) =>
+        e.username === username && e.location === location && e.date === date
+      );
+      if (idx !== -1) {
+        history[idx].action = newAction;
+        history[idx].actionAt = new Date().toISOString();
+        chrome.storage.local.set({ slotHistory: history });
+      } else {
+        // No prior detected entry — create fresh one with new action
+        recordSlotHistory({ username, location, date, action: newAction });
+      }
+    });
+  }
+
+  // Capture booking page screenshot using html2canvas (already loaded by manifest)
+  async function captureBookingScreenshot() {
+    if (typeof html2canvas !== "function") {
+      log("html2canvas not available — skipping screenshot");
+      return null;
+    }
+    try {
+      // Capture main container (booking panel + calendar + group members)
+      const target = document.getElementById("main_container") || document.body;
+      const canvas = await html2canvas(target, {
+        logging: false,
+        useCORS: true,
+        backgroundColor: "#ffffff",
+        scale: 0.7, // Reduce file size for Telegram (max ~10MB photo)
+        windowWidth: target.scrollWidth,
+        windowHeight: target.scrollHeight,
+      });
+      // JPEG at 0.7 quality balances size vs readability
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
+      return dataUrl.split(",")[1]; // base64 only
+    } catch (e) {
+      log("Screenshot capture failed: " + e.message);
+      return null;
+    }
+  }
+
+  // Send screenshot via service worker → Telegram sendPhoto
+  async function sendSlotScreenshot(caption) {
+    try {
+      const photoBase64 = await captureBookingScreenshot();
+      if (!photoBase64) {
+        log("No screenshot to send");
+        return;
+      }
+      chrome.runtime.sendMessage({
+        action: "sendTelegramPhoto",
+        photoBase64,
+        caption,
+      }, (resp) => {
+        if (chrome.runtime.lastError) {
+          log("Screenshot send failed: " + chrome.runtime.lastError.message);
+        } else if (resp && !resp.ok) {
+          log("Screenshot Telegram error: " + (resp.error || "unknown"));
+        } else {
+          log("Slot screenshot sent to Telegram");
+        }
+      });
+    } catch (e) {
+      log("sendSlotScreenshot error: " + e.message);
+    }
+  }
+
+  function sendTelegramNotification(type, message, replyMarkup) {
     chrome.storage.local.get(["telegramBotToken", "telegramChatId", "telegramNotify"], (data) => {
       if (!data.telegramBotToken || !data.telegramChatId) return;
       const notify = data.telegramNotify || { slot: true, confirmed: true, error: true, rate: true, login: true, cycling: true, stopped: true };
@@ -87,7 +325,10 @@
       const ts = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true, hour: "2-digit", minute: "2-digit", second: "2-digit", day: "2-digit", month: "short" });
       const fullMessage = message + `\n\n🕐 <i>${ts} IST</i>`;
 
-      chrome.runtime.sendMessage({ action: "sendTelegram", text: fullMessage }, (resp) => {
+      const payload = { action: "sendTelegram", text: fullMessage };
+      if (replyMarkup) payload.replyMarkup = replyMarkup;
+
+      chrome.runtime.sendMessage(payload, (resp) => {
         if (chrome.runtime.lastError) {
           log("Telegram send failed: " + chrome.runtime.lastError.message);
         } else if (resp && !resp.ok) {
@@ -1492,7 +1733,25 @@
 
   // ─── BOOKING PANEL UI ──────────────────────────────────────────────
 
-  let cycling = { active: false, timer: null, round: 0, keepAliveTimer: null, lastRefresh: 0, backoffMs: 0, keepAliveFailCount: 0 };
+  let cycling = {
+    active: false, timer: null, round: 0,
+    keepAliveTimer: null, lastRefresh: 0, backoffMs: 0, keepAliveFailCount: 0,
+    // Grace period: after failed submit, retry same location quickly
+    gracePeriod: {
+      active: false,
+      location: null,
+      roundsRemaining: 0,
+      fastIntervalMs: 10000,
+      missedDate: null,
+    },
+  };
+  const GRACE_PERIOD_ROUNDS = 5;
+  const GRACE_PERIOD_INTERVAL_MS = 10000;
+
+  // Smart range expansion config
+  const EXPAND_OFFER_ENABLED = false;       // ← disabled per user request
+  const EXPAND_OFFER_MIN_ROUNDS = 30;        // wait this many rounds before offering
+  const EXPAND_OFFER_COOLDOWN_MS = 30 * 60 * 1000; // re-offer at most every 30 min
   function randomRefreshMs() { return (6 + Math.random() * 6) * 60 * 1000; } // 6-12 minutes random
   let SESSION_REFRESH_MS = randomRefreshMs();
 
@@ -1573,6 +1832,9 @@
 
     mainContainer.parentNode.insertBefore(panel, mainContainer);
 
+    // Inject activity log panel below booking panel
+    injectActivityLogPanel(panel);
+
     // Auto-populate from active user's profile
     chrome.storage.local.get(
       ["loginDetails", "userProfilesList"],
@@ -1645,6 +1907,135 @@
     if (el) el.textContent = msg;
     log(msg);
   }
+
+  // ─── ACTIVITY LOG PANEL (on booking page) ──────────────────────────
+  // Shows last 15 events directly on /ofc-schedule and /schedule pages
+  // so operator sees activity without opening dashboard
+
+  let __activityLogTimer = null;
+
+  function injectActivityLogPanel(anchorEl) {
+    if (document.getElementById("ab-log-panel")) return;
+    if (!anchorEl) return;
+
+    const logPanel = document.createElement("div");
+    logPanel.id = "ab-log-panel";
+    logPanel.style.cssText =
+      "margin:10px auto 15px;max-width:1000px;box-shadow:0 2px 8px rgba(0,0,0,0.15);border-radius:8px;font-family:inherit;";
+    logPanel.innerHTML = `
+      <div id="ab-log-header" style="background:#2c3e50;color:white;padding:8px 14px;border-radius:8px 8px 0 0;display:flex;justify-content:space-between;align-items:center;cursor:pointer;">
+        <strong style="font-size:13px;">📋 Activity Log <span id="ab-log-count" style="background:#34495e;padding:2px 8px;border-radius:10px;font-size:10px;margin-left:6px;">0</span></strong>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <select id="ab-log-filter" style="background:#34495e;color:white;border:none;font-size:11px;padding:3px 6px;border-radius:3px;">
+            <option value="all">All</option>
+            <option value="cycling">Cycling</option>
+            <option value="slot_found">Slot</option>
+            <option value="booking">Booking</option>
+            <option value="error">Errors</option>
+            <option value="session">Session</option>
+            <option value="captcha">CAPTCHA</option>
+          </select>
+          <span id="ab-log-toggle" style="font-size:14px;line-height:1;">▼</span>
+        </div>
+      </div>
+      <div id="ab-log-body" style="background:#0f1923;padding:8px;border:1px solid #2d3e50;border-top:none;border-radius:0 0 8px 8px;max-height:280px;overflow-y:auto;font-family:monospace;font-size:11px;color:#cfd8dc;">
+        <div style="text-align:center;color:#78909c;padding:10px;">Loading...</div>
+      </div>`;
+
+    anchorEl.parentNode.insertBefore(logPanel, anchorEl.nextSibling);
+
+    // Toggle collapse
+    document.getElementById("ab-log-header").addEventListener("click", (e) => {
+      // Don't toggle when clicking the filter dropdown
+      if (e.target.id === "ab-log-filter") return;
+      const body = document.getElementById("ab-log-body");
+      const arrow = document.getElementById("ab-log-toggle");
+      if (body.style.display === "none") {
+        body.style.display = "block";
+        arrow.textContent = "▼";
+      } else {
+        body.style.display = "none";
+        arrow.textContent = "▶";
+      }
+    });
+
+    // Filter change
+    document.getElementById("ab-log-filter").addEventListener("change", () => {
+      renderActivityLogPanel();
+    });
+
+    // Initial render + periodic refresh
+    renderActivityLogPanel();
+    if (__activityLogTimer) clearInterval(__activityLogTimer);
+    __activityLogTimer = setInterval(renderActivityLogPanel, 3000);
+  }
+
+  function renderActivityLogPanel() {
+    const body = document.getElementById("ab-log-body");
+    const countEl = document.getElementById("ab-log-count");
+    const filterEl = document.getElementById("ab-log-filter");
+    if (!body) return;
+
+    const filter = filterEl?.value || "all";
+
+    chrome.storage.local.get(["eventLog", "loginDetails"], (data) => {
+      let events = data.eventLog || [];
+      const activeUser = data.loginDetails?.username || "";
+
+      // Filter by current user if known (avoid noise from other users)
+      if (activeUser) {
+        events = events.filter((e) => !e.username || e.username === activeUser);
+      }
+
+      // Filter by type
+      if (filter !== "all") {
+        events = events.filter((e) => e.type === filter);
+      }
+
+      const display = events.slice(0, 15);
+
+      if (countEl) countEl.textContent = events.length;
+
+      if (display.length === 0) {
+        body.innerHTML = '<div style="text-align:center;color:#78909c;padding:10px;">No events yet</div>';
+        return;
+      }
+
+      const typeColors = {
+        login: "#3498db",
+        captcha: "#9b59b6",
+        security: "#9b59b6",
+        dashboard: "#1abc9c",
+        cycling: "#16a085",
+        slot_found: "#27ae60",
+        booking: "#f39c12",
+        error: "#e74c3c",
+        queue: "#7f8c8d",
+        session: "#e67e22",
+      };
+
+      const esc = (s) => (s || "").toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+      body.innerHTML = display.map((e) => {
+        const color = typeColors[e.type] || "#78909c";
+        const time = new Date(e.timestamp).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: true, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+        return `
+          <div style="display:flex;gap:8px;padding:3px 4px;border-bottom:1px solid #1a2733;align-items:flex-start;">
+            <span style="color:#78909c;flex-shrink:0;width:75px;">${time}</span>
+            <span style="background:${color};color:white;padding:1px 6px;border-radius:3px;font-size:9px;text-transform:uppercase;flex-shrink:0;min-width:60px;text-align:center;">${esc(e.type)}</span>
+            <span style="color:#cfd8dc;flex:1;word-break:break-word;">${esc(e.message)}</span>
+          </div>`;
+      }).join("");
+    });
+  }
+
+  // Cleanup timer on page unload
+  window.addEventListener("beforeunload", () => {
+    if (__activityLogTimer) {
+      clearInterval(__activityLogTimer);
+      __activityLogTimer = null;
+    }
+  });
 
   function setCycleInfo(msg) {
     const el = document.getElementById("ab-cycle-info");
@@ -1949,6 +2340,7 @@
     chrome.storage.local.get(["loginDetails"], (d) => {
       const u = d.loginDetails?.username || "";
       trackEvent(EVENT_TYPES.CYCLING, `Cycling started — locations: ${locs}`, u);
+      resetUserCycleCounters(u);
       updateUserStatus(u, "cycling", { locations: locs, startedAt: new Date().toISOString() });
       sendTelegramNotification("cycling", `🔄 <b>CYCLING STARTED</b>\n\n👤 <b>User:</b> ${u}\n📍 <b>Locations:</b> ${locs}\n📅 <b>Date Range:</b> ${startDate} → ${endDate}`);
     });
@@ -1977,6 +2369,106 @@
     runCycleLoop();
   }
 
+  // Smart range expansion offer — sends Telegram with inline buttons
+  // when user has cycled X+ rounds with 0 in-range slots but slots exist out of range
+  // FIX: re-evaluates slot history against CURRENT DOM date range (not stale stored flags)
+  async function maybeOfferRangeExpansion() {
+    if (!EXPAND_OFFER_ENABLED) return; // disabled per user request
+    if (!cycling.active || cycling.gracePeriod.active) return;
+
+    const data = await new Promise((r) => {
+      chrome.storage.local.get(["loginDetails", "userStatuses", "slotHistory"], r);
+    });
+    const u = data.loginDetails?.username;
+    if (!u) return;
+
+    const status = (data.userStatuses || {})[u] || {};
+    const roundCount = status.roundCount || 0;
+
+    // Conditions: gate on rounds first
+    if (roundCount < EXPAND_OFFER_MIN_ROUNDS) return;
+
+    // Cooldown
+    const lastOffer = status.lastExpansionOfferAt ? new Date(status.lastExpansionOfferAt).getTime() : 0;
+    if (Date.now() - lastOffer < EXPAND_OFFER_COOLDOWN_MS) return;
+
+    // Read CURRENT date range from DOM (NOT stale counter)
+    const curStart = document.getElementById("ab-start-date")?.value || "";
+    const curEnd = document.getElementById("ab-end-date")?.value || "";
+
+    // Re-evaluate slot history against CURRENT range
+    // Dedup by (location, date) so each unique slot counts once
+    const userHistory = (data.slotHistory || []).filter((e) => e.username === u);
+    const seenKeys = new Set();
+    let inRangeCount = 0;
+    let outOfRangeCount = 0;
+    const outOfRangeSlots = []; // for "nearest available" suggestion
+
+    userHistory.forEach((e) => {
+      const key = `${e.location}|${e.date}`;
+      if (seenKeys.has(key)) return;
+      seenKeys.add(key);
+
+      const inR = isDateInRange(e.date, curStart, curEnd);
+      if (inR) {
+        inRangeCount++;
+      } else {
+        outOfRangeCount++;
+        outOfRangeSlots.push({ location: e.location, date: e.date });
+      }
+    });
+
+    // Don't offer if there are slots actually in current range
+    if (inRangeCount > 0) {
+      log(`Range expansion skipped: ${inRangeCount} slots actually in current range (counter was stale)`);
+      return;
+    }
+    if (outOfRangeCount === 0) return;
+
+    // Group out-of-range by location → earliest date per location
+    const byLoc = {};
+    outOfRangeSlots.forEach((s) => {
+      if (!byLoc[s.location] || s.date < byLoc[s.location]) {
+        byLoc[s.location] = s.date;
+      }
+    });
+    const nearestList = Object.entries(byLoc)
+      .sort((a, b) => a[1].localeCompare(b[1]))
+      .slice(0, 5);
+
+    if (nearestList.length === 0) return;
+
+    const nearestText = nearestList.map(([loc, date]) => `• <b>${loc}:</b> ${date}`).join("\n");
+
+    const msg =
+      `⚠️ <b>NO SLOTS IN RANGE</b>\n\n` +
+      `👤 <b>User:</b> ${u}\n` +
+      `🔁 <b>Round:</b> ${roundCount}\n` +
+      `📅 <b>Current range:</b> ${curStart || "—"} → ${curEnd || "—"}\n` +
+      `✅ In range: <b>0</b>\n` +
+      `⚪ Out of range: <b>${outOfRangeCount}</b>\n\n` +
+      `<b>Nearest available:</b>\n${nearestText}\n\n` +
+      `Expand date range?`;
+
+    const replyMarkup = {
+      inline_keyboard: [
+        [
+          { text: "+30 days", callback_data: `expand:${u}:30` },
+          { text: "+60 days", callback_data: `expand:${u}:60` },
+          { text: "+90 days", callback_data: `expand:${u}:90` },
+        ],
+        [
+          { text: "✖️ Ignore", callback_data: `expand_ignore:${u}` },
+        ],
+      ],
+    };
+
+    sendTelegramNotification("error", msg, replyMarkup);
+    setUserCounter(u, "lastExpansionOfferAt", new Date().toISOString());
+    trackEvent(EVENT_TYPES.CYCLING, `Range expansion offered (round ${roundCount}, ${outOfRangeCount} out of range)`, u);
+    log(`Range expansion offer sent for ${u}`);
+  }
+
   function stopCycling(reason) {
     const roundsCompleted = cycling.round;
     cycling.active = false;
@@ -1984,6 +2476,11 @@
       clearTimeout(cycling.timer);
       cycling.timer = null;
     }
+    // Reset grace period state
+    cycling.gracePeriod = {
+      active: false, location: null, roundsRemaining: 0,
+      fastIntervalMs: GRACE_PERIOD_INTERVAL_MS, missedDate: null,
+    };
     stopKeepAlive();
 
     const startBtn = document.getElementById("ab-start-btn");
@@ -2076,6 +2573,66 @@
       return true;
     }
     return false;
+  }
+
+  // After submit click, detect outcome:
+  // - "confirmed":     URL = /appointment-confirmation (final success — interview submitted)
+  // - "ofc_submitted": URL transitioned from /ofc-schedule → /schedule (mid-flow success)
+  // - "failed":        error alert/text on page (slot taken, no longer available, etc.)
+  // - "timeout":       no clear signal within timeout window
+  async function waitForBookingOutcome(timeout = 15000) {
+    const start = Date.now();
+    const originPath = window.location.pathname.toLowerCase();
+    const wasOnOfc = originPath.includes("/ofc-schedule");
+    const wasOnInterview = !wasOnOfc && originPath.includes("/schedule");
+
+    const failPatterns = [
+      /no\s+longer\s+available/i,
+      /slot\s+(is\s+)?(no\s+longer\s+|not\s+)?available/i,
+      /already\s+(been\s+)?booked/i,
+      /please\s+select\s+(a\s+)?different/i,
+      /unable\s+to\s+(book|schedule|reserve)/i,
+      /try\s+again/i,
+      /booking\s+failed/i,
+      /appointment\s+could\s+not\s+be\s+(scheduled|booked)/i,
+      /someone\s+else\s+(has\s+)?booked/i,
+    ];
+
+    while (Date.now() - start < timeout) {
+      const currentPath = window.location.pathname.toLowerCase();
+
+      // FINAL success: appointment-confirmation page
+      if (currentPath.includes("appointment-confirmation")) {
+        return "confirmed";
+      }
+
+      // MID-FLOW success: OFC submitted, page navigating to /schedule/ (interview)
+      // OFC URL: /en-US/ofc-schedule/    Interview URL: /en-US/schedule/
+      if (wasOnOfc && currentPath.includes("/schedule") && !currentPath.includes("ofc-schedule")) {
+        return "ofc_submitted";
+      }
+
+      // Check for known error containers
+      const errorEls = document.querySelectorAll(
+        ".alert-danger, .error-message, .error-content, .swal2-popup, .swal2-html-container, .toast-error"
+      );
+      for (const el of errorEls) {
+        const txt = (el.textContent || "").trim();
+        if (!txt) continue;
+        for (const re of failPatterns) {
+          if (re.test(txt)) return "failed";
+        }
+      }
+
+      // Generic page-wide pattern check (last resort)
+      const bodyTxt = (document.body?.textContent || "").substring(0, 5000);
+      for (const re of failPatterns) {
+        if (re.test(bodyTxt)) return "failed";
+      }
+
+      await sleep(500);
+    }
+    return "timeout";
   }
 
   async function waitForTimeSlotAndSelect(timeout = 12000) {
@@ -2188,33 +2745,50 @@
     cycling.round++;
     cycling.lastRefresh = Date.now();
 
+    // Increment per-user round counter
+    chrome.storage.local.get(["loginDetails"], (d) => {
+      const u = d.loginDetails?.username || "";
+      if (u) incrementUserCounter(u, "roundCount", 1);
+    });
+
     // Schedule idle gap and long break thresholds on first round
     if (cycling.nextIdleAt === 0) cycling.nextIdleAt = cycling.round + 4 + Math.floor(Math.random() * 5);   // 4-8 rounds
     if (cycling.nextBreakAt === 0) cycling.nextBreakAt = cycling.round + 15 + Math.floor(Math.random() * 11); // 15-25 rounds
 
+    // Skip idle gap + long break during grace period (don't waste recovery window)
+    if (!cycling.gracePeriod.active) {
     // Layer 2: Idle gap (30-90s every 4-8 rounds)
     if (cycling.round >= cycling.nextIdleAt) {
       const idleSec = 30 + Math.floor(Math.random() * 61);
-      setStatus(`Idle pause ${idleSec}s (human-like)...`);
       log(`Idle gap: pausing ${idleSec}s at round ${cycling.round}`);
-      await sleep(idleSec * 1000);
-      if (!cycling.active || await checkStopSignal()) return;
+      for (let s = idleSec; s > 0; s--) {
+        if (!cycling.active || __abortAll) return;
+        if (await checkStopSignal()) return;
+        setStatus(`Idle pause ${s}s (human-like)...`);
+        await sleep(1000);
+      }
       cycling.nextIdleAt = cycling.round + 4 + Math.floor(Math.random() * 5);
     }
 
     // Layer 3: Long break (2-5 min every 15-25 rounds)
     if (cycling.round >= cycling.nextBreakAt) {
       const breakSec = 120 + Math.floor(Math.random() * 181);
-      setStatus(`Taking a break ${Math.round(breakSec / 60)}m ${breakSec % 60}s...`);
       log(`Long break: pausing ${breakSec}s at round ${cycling.round}`);
       chrome.storage.local.get(["loginDetails"], (d) => {
         const u = d.loginDetails?.username || "";
         trackEvent(EVENT_TYPES.CYCLING, `Long break ${breakSec}s at round ${cycling.round} (anti-detection)`, u);
       });
-      await sleep(breakSec * 1000);
-      if (!cycling.active || await checkStopSignal()) return;
+      for (let s = breakSec; s > 0; s--) {
+        if (!cycling.active || __abortAll) return;
+        if (await checkStopSignal()) return;
+        const m = Math.floor(s / 60);
+        const r = s % 60;
+        setStatus(`Taking a break ${m}m ${r}s...`);
+        await sleep(1000);
+      }
       cycling.nextBreakAt = cycling.round + 15 + Math.floor(Math.random() * 11);
     }
+    } // end !grace skip
 
     const startDate = document.getElementById("ab-start-date")?.value || "";
     const endDate = document.getElementById("ab-end-date")?.value || "";
@@ -2234,19 +2808,33 @@
       log("Page ready — starting first cycle");
     }
 
-    const checked = document.querySelectorAll(".ab-loc-cb:checked");
-    const locations = Array.from(checked).map((cb) => ({
+    const allChecked = document.querySelectorAll(".ab-loc-cb:checked");
+    let locations = Array.from(allChecked).map((cb) => ({
       value: cb.value,
       name: cb.dataset.name,
     }));
 
-    // Shuffle locations each round (break sequential pattern)
-    for (let i = locations.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [locations[i], locations[j]] = [locations[j], locations[i]];
+    // Grace period: focus only on missed location, skip shuffle
+    if (cycling.gracePeriod.active) {
+      const graceLoc = locations.find((l) => l.name === cycling.gracePeriod.location);
+      if (graceLoc) {
+        locations = [graceLoc];
+        setCycleInfo(`Round ${cycling.round} · 🔥 Grace ${cycling.gracePeriod.roundsRemaining}/${GRACE_PERIOD_ROUNDS} on ${graceLoc.name}`);
+      } else {
+        // Location no longer checked — exit grace period
+        log("Grace period location not selected — exiting grace");
+        cycling.gracePeriod.active = false;
+      }
     }
 
-    setCycleInfo(`Round ${cycling.round}`);
+    if (!cycling.gracePeriod.active) {
+      // Shuffle locations each round (break sequential pattern)
+      for (let i = locations.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [locations[i], locations[j]] = [locations[j], locations[i]];
+      }
+      setCycleInfo(`Round ${cycling.round}`);
+    }
 
     for (let i = 0; i < locations.length; i++) {
       if (!cycling.active) return;
@@ -2256,9 +2844,13 @@
       // Layer 1: Human-like weighted random delay between locations
       if (i > 0) {
         const delaySec = humanDelay();
-        setStatus(`Waiting ${delaySec.toFixed(0)}s before next location...`);
-        await sleep(delaySec * 1000);
-        if (!cycling.active || await checkStopSignal()) return;
+        const totalSec = Math.ceil(delaySec);
+        for (let s = totalSec; s > 0; s--) {
+          if (!cycling.active || __abortAll) return;
+          if (await checkStopSignal()) return;
+          setStatus(`Waiting ${s}s before next location...`);
+          await sleep(1000);
+        }
       }
 
       // Simulate human activity (mouse, scroll, focus) between location checks
@@ -2329,16 +2921,120 @@
       }
 
       if (!data || !data.ScheduleDays || data.ScheduleDays.length === 0) {
+        // Diagnostic: check if DOM shows enabled calendar dates that XHR intercept missed
+        const enabledDateLinks = document.querySelectorAll(".ui-datepicker-calendar td:not(.ui-state-disabled) a[data-date]");
+        if (enabledDateLinks.length > 0) {
+          // XHR intercept missed slots that ARE visible in DOM
+          const visibleDates = Array.from(enabledDateLinks).slice(0, 10).map(a => a.getAttribute("data-date"));
+          log(`⚠️ DOM shows ${enabledDateLinks.length} enabled dates at ${loc.name} but XHR data was empty! Days: ${visibleDates.join(", ")}`);
+          chrome.storage.local.get(["loginDetails"], (d) => {
+            const u = d.loginDetails?.username || "";
+            trackEvent(EVENT_TYPES.ERROR, `XHR data empty but ${enabledDateLinks.length} dates visible in DOM at ${loc.name}`, u);
+            sendTelegramNotification("error",
+              `🐛 <b>XHR INTERCEPT MISSED — ${loc.name}</b>\n\n` +
+              `👤 <b>User:</b> ${u}\n` +
+              `📊 DOM shows ${enabledDateLinks.length} enabled dates\n` +
+              `📅 Visible days: ${visibleDates.slice(0, 5).join(", ")}\n` +
+              `❌ But XHR intercept got 0 dates — page.js (MAIN world) may have failed\n` +
+              `💡 Try reloading page`
+            );
+          });
+        }
         setStatus(`No slots at ${loc.name}`);
         await sleep(2000);
         if (isSessionExpired()) { await handle401Recovery(); return; }
         continue;
       }
 
-      // Filter dates within user's preferred range
+      // Record every detected slot to history for analytics + counters
+      {
+        const histUser = (await getSettings()).loginDetails?.username || "";
+        if (histUser) {
+          let inCount = 0, outCount = 0;
+          data.ScheduleDays.forEach((d) => {
+            const inR = isDateInRange(d.Date, startDate, endDate);
+            if (inR) inCount++; else outCount++;
+            recordSlotHistory({
+              username: histUser,
+              location: loc.name,
+              date: d.Date,
+              inRange: inR,
+              action: "detected",
+            });
+          });
+          if (inCount > 0) incrementUserCounter(histUser, "slotsInRangeFound", inCount);
+          if (outCount > 0) incrementUserCounter(histUser, "slotsOutOfRangeFound", outCount);
+
+          // Daily stats
+          const total = data.ScheduleDays.length;
+          if (total > 0) {
+            bumpDailyStat({ key: "slotsFound", delta: total });
+            bumpDailyStat({ key: "slotsInRange", delta: inCount });
+            bumpDailyStat({ key: "slotsOutOfRange", delta: outCount });
+            bumpDailyStat({ delta: total, location: loc.name });
+            bumpDailyStat({ delta: total, hour: istHour() });
+            bumpDailyStat({ delta: 1, username: histUser });
+          }
+        }
+      }
+
+      // Separate in-range and out-of-range dates
       const inRange = data.ScheduleDays.filter((d) =>
         isDateInRange(d.Date, startDate, endDate)
       ).sort((a, b) => new Date(a.Date) - new Date(b.Date));
+
+      const outOfRange = data.ScheduleDays.filter((d) =>
+        !isDateInRange(d.Date, startDate, endDate)
+      ).sort((a, b) => new Date(a.Date) - new Date(b.Date));
+
+      // Group by month (in-range)
+      const inRangeByMonth = {};
+      inRange.forEach(d => {
+        const date = new Date(d.Date);
+        const monthKey = date.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+        if (!inRangeByMonth[monthKey]) {
+          inRangeByMonth[monthKey] = [];
+        }
+        inRangeByMonth[monthKey].push(date.getDate());
+      });
+
+      // Group by month (out-of-range)
+      const outOfRangeByMonth = {};
+      outOfRange.forEach(d => {
+        const date = new Date(d.Date);
+        const monthKey = date.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+        if (!outOfRangeByMonth[monthKey]) {
+          outOfRangeByMonth[monthKey] = [];
+        }
+        outOfRangeByMonth[monthKey].push(date.getDate());
+      });
+
+      // Format in-range section
+      let inRangeText = "";
+      for (const [month, days] of Object.entries(inRangeByMonth)) {
+        inRangeText += `${month}: ${days.sort((a, b) => a - b).join(", ")}\n`;
+      }
+
+      // Format out-of-range section
+      let outOfRangeText = "";
+      for (const [month, days] of Object.entries(outOfRangeByMonth)) {
+        outOfRangeText += `${month}: ${days.sort((a, b) => a - b).join(", ")}\n`;
+      }
+
+      // Send Telegram overview
+      chrome.storage.local.get(["loginDetails"], (d) => {
+        const u = d.loginDetails?.username || "";
+        const msg =
+          `📍 <b>SLOTS OVERVIEW: ${loc.name}</b>\n` +
+          `📅 <b>Available:</b> ${data.ScheduleDays.length} dates\n\n` +
+          `✅ <b>IN RANGE (${inRange.length}):</b>\n` +
+          (inRangeText || "None\n") +
+          `\n❌ <b>OUT OF RANGE (${outOfRange.length}):</b>\n` +
+          (outOfRangeText || "None\n");
+
+        trackEvent(EVENT_TYPES.CYCLING, `Slots overview sent for ${loc.name}: ${inRange.length} in range, ${outOfRange.length} out of range`, u);
+        sendTelegramNotification("availability", msg);
+      });
 
       if (inRange.length === 0) {
         setStatus(
@@ -2348,57 +3044,235 @@
         continue;
       }
 
-      // Dates in range found!
+      // Dates in range found! Try each date in order until one yields time slots.
+      const MAX_DATE_TRIES = Math.min(inRange.length, 5);
       setStatus(
-        `${loc.name}: ${inRange.length} dates in range! Selecting ${inRange[0].Date}...`
+        `${loc.name}: ${inRange.length} dates in range! Will try up to ${MAX_DATE_TRIES} dates...`
       );
 
       // Let content.js finish processing (it auto-selects first date)
       await sleep(2000);
 
-      // Select the first in-range date explicitly
-      const targetDate = new Date(inRange[0].Date + "T00:00:00");
-      const selected = await selectDateInCalendar(targetDate);
+      let bookedSuccessfully = false;
+      let datesAttempted = [];
 
-      if (!selected) {
-        setStatus(`Could not click date at ${loc.name}`);
-        await sleep(2000);
-        continue;
-      }
+      for (let dateIdx = 0; dateIdx < MAX_DATE_TRIES; dateIdx++) {
+        if (!cycling.active || __abortAll) return;
+        if (await checkStopSignal()) return;
 
-      // Wait for time slots to load
-      await sleep(1500);
-      const slotReady = await waitForTimeSlotAndSelect(12000);
+        const tryDate = inRange[dateIdx];
+        datesAttempted.push(tryDate.Date);
+        setStatus(`${loc.name}: Trying date ${dateIdx + 1}/${MAX_DATE_TRIES}: ${tryDate.Date}...`);
+        log(`Trying date ${dateIdx + 1}/${MAX_DATE_TRIES} at ${loc.name}: ${tryDate.Date}`);
 
-      if (slotReady) {
+        const targetDate = new Date(tryDate.Date + "T00:00:00");
+        const selected = await selectDateInCalendar(targetDate);
+
+        if (!selected) {
+          log(`Could not click ${tryDate.Date} at ${loc.name} — trying next date`);
+          await sleep(1000);
+          continue; // try next date in same location
+        }
+
+        // Update slot history: this specific date was selected
+        {
+          const histUser = (await getSettings()).loginDetails?.username || "";
+          if (histUser) updateSlotHistoryAction(histUser, loc.name, tryDate.Date, "selected");
+        }
+
+        // Wait for time slots to load for this date
+        await sleep(1500);
+        const slotReady = await waitForTimeSlotAndSelect(12000);
+
+        if (!slotReady) {
+          // Diagnostic: check what's actually on page
+          const timeSelectEl = document.getElementById("time_select");
+          const radioCount = document.querySelectorAll('#time_select input[type="radio"]').length;
+          const submitBtn = document.getElementById("submitbtn");
+          const submitDisabled = submitBtn ? submitBtn.disabled : "no_submit_btn";
+          const visibleText = (timeSelectEl?.textContent || "").trim().substring(0, 100);
+          log(`No time slots for ${tryDate.Date} at ${loc.name} — radios:${radioCount}, submit disabled:${submitDisabled}, time_select text:"${visibleText}"`);
+          trackEvent(EVENT_TYPES.BOOKING, `No time slots for ${tryDate.Date} (radios=${radioCount}, submit=${submitDisabled})`, (await getSettings()).loginDetails?.username || "");
+          setStatus(`${loc.name}: ${tryDate.Date} no time slots — trying next...`);
+          await sleep(1500);
+          continue; // try next date
+        }
+
+        // SLOT IS READY — submit
         const settings = await getSettings();
         const u = settings.loginDetails?.username || "";
-        trackEvent(EVENT_TYPES.SLOT_FOUND, `Slot found at ${loc.name} — date: ${inRange[0].Date}`, u, { location: loc.name, date: inRange[0].Date });
-        sendTelegramNotification("slot", `🟢 <b>SLOT FOUND!</b>\n\n👤 <b>User:</b> ${u}\n📍 <b>Location:</b> ${loc.name}\n📅 <b>Date:</b> ${inRange[0].Date}\n\n${settings["is_auto-submit"] ? "⏳ Auto-submitting..." : "⚠️ Manual submit needed — go to the tab NOW!"}`);
+        trackEvent(EVENT_TYPES.SLOT_FOUND, `Slot found at ${loc.name} — date: ${tryDate.Date} (attempt ${dateIdx + 1}/${MAX_DATE_TRIES})`, u, { location: loc.name, date: tryDate.Date });
+        sendTelegramNotification("slot",
+          `🟢 <b>SLOT FOUND!</b>\n\n` +
+          `👤 <b>User:</b> ${u}\n` +
+          `📍 <b>Location:</b> ${loc.name}\n` +
+          `📅 <b>Date:</b> ${tryDate.Date}\n` +
+          (datesAttempted.length > 1 ? `🔁 Tried ${datesAttempted.length - 1} earlier date(s) first\n` : "") +
+          `\n${settings["is_auto-submit"] ? "⏳ Auto-submitting..." : "⚠️ Manual submit needed — go to the tab NOW!"}`
+        );
+
+        // Screenshot
+        sendSlotScreenshot(
+          `🟢 <b>Slot found at ${loc.name}</b> — ${tryDate.Date}\n` +
+          `👤 ${u} · 🕐 ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true, hour: "2-digit", minute: "2-digit", day: "2-digit", month: "short" })} IST`
+        );
+
         if (settings["is_auto-submit"]) {
-          setStatus(`${loc.name}: Slot found — auto-submitting!`);
+          setStatus(`${loc.name}: Slot found on ${tryDate.Date} — auto-submitting!`);
           await sleep(1000);
           const submitBtn = document.getElementById("submitbtn");
           if (submitBtn && !submitBtn.disabled) submitBtn.click();
-          trackEvent(EVENT_TYPES.BOOKING, `Auto-submitted booking at ${loc.name}`, u);
-          sendTelegramNotification("confirmed", `✅ <b>BOOKING SUBMITTED!</b>\n\n👤 <b>User:</b> ${u}\n📍 <b>Location:</b> ${loc.name}\n📅 <b>Date:</b> ${inRange[0].Date}\n\n🎉 Check the confirmation page!`);
-          stopCycling("Booking submitted!");
+          trackEvent(EVENT_TYPES.BOOKING, `Auto-submitted ${loc.name} ${tryDate.Date}`, u);
+          updateSlotHistoryAction(u, loc.name, tryDate.Date, "submitted");
+
+          // Wait for outcome
+          setStatus(`${loc.name}: Submitted ${tryDate.Date} — waiting for confirmation...`);
+          const outcome = await waitForBookingOutcome(15000);
+
+          if (outcome === "confirmed") {
+            bumpDailyStat({ key: "booked", delta: 1 });
+            sendTelegramNotification("confirmed",
+              `✅ <b>BOOKING SUBMITTED!</b>\n\n` +
+              `👤 <b>User:</b> ${u}\n` +
+              `📍 <b>Location:</b> ${loc.name}\n` +
+              `📅 <b>Date:</b> ${tryDate.Date}\n\n🎉 Confirmed!`
+            );
+            stopCycling("Booking submitted!");
+            return;
+          }
+
+          if (outcome === "ofc_submitted") {
+            // OFC submitted successfully — page navigating to interview booking
+            bumpDailyStat({ key: "booked", delta: 1 });  // count OFC as a booking step
+            updateSlotHistoryAction(u, loc.name, tryDate.Date, "submitted");
+            log(`OFC submitted at ${loc.name} ${tryDate.Date} — page navigating to interview`);
+            trackEvent(EVENT_TYPES.BOOKING, `OFC submitted ${loc.name} ${tryDate.Date} — navigating to interview`, u);
+            sendTelegramNotification("confirmed",
+              `✅ <b>OFC SUBMITTED!</b>\n\n` +
+              `👤 <b>User:</b> ${u}\n` +
+              `📍 <b>Location:</b> ${loc.name}\n` +
+              `📅 <b>OFC Date:</b> ${tryDate.Date}\n\n` +
+              `🔄 Page navigating to interview booking...\n` +
+              `Cycling will auto-resume on interview page.`
+            );
+            // Page is navigating to /schedule/ (interview). Don't stop cycling —
+            // new page will run init() → handleBookingPage → auto-start cycling
+            // for interview if activeAutomationUser is still set.
+            // Just exit gracefully; navigation kills this script anyway.
+            return;
+          }
+
+          if (outcome === "failed" || outcome === "timeout") {
+            const reason = outcome === "failed" ? "slot taken / error" : "no confirmation page after 15s";
+            log(`Submit outcome: ${outcome} (${reason}) for ${tryDate.Date}`);
+            trackEvent(EVENT_TYPES.BOOKING, `Submit ${outcome} for ${tryDate.Date} (${reason})`, u);
+            updateSlotHistoryAction(u, loc.name, tryDate.Date, "missed");
+            bumpDailyStat({ key: "missed", delta: 1 });
+
+            // If more in-range dates remain, try them (faster than waiting grace period)
+            const remainingDates = MAX_DATE_TRIES - dateIdx - 1;
+            if (remainingDates > 0) {
+              log(`${remainingDates} more in-range date(s) to try — continuing without grace period`);
+              sendTelegramNotification("error",
+                `⚠️ <b>SUBMIT FAILED — TRYING NEXT DATE</b>\n\n` +
+                `👤 <b>User:</b> ${u}\n` +
+                `📍 <b>Location:</b> ${loc.name}\n` +
+                `❌ ${tryDate.Date} — ${reason}\n` +
+                `🔄 Trying next in-range date (${remainingDates} remaining)`
+              );
+              await sleep(2000);
+              continue; // try next in-range date in same location
+            }
+
+            // Last in-range date also failed — enter grace period
+            cycling.gracePeriod = {
+              active: true,
+              location: loc.name,
+              roundsRemaining: GRACE_PERIOD_ROUNDS,
+              fastIntervalMs: GRACE_PERIOD_INTERVAL_MS,
+              missedDate: tryDate.Date,
+            };
+
+            sendTelegramNotification("error",
+              `⚠️ <b>SUBMIT FAILED — GRACE PERIOD</b>\n\n` +
+              `👤 <b>User:</b> ${u}\n` +
+              `📍 <b>Location:</b> ${loc.name}\n` +
+              `📅 <b>Last attempt:</b> ${tryDate.Date}\n` +
+              `🔁 Tried ${datesAttempted.length} dates: ${datesAttempted.join(", ")}\n` +
+              `❌ All failed — entering grace period (${GRACE_PERIOD_ROUNDS} rounds @ ${GRACE_PERIOD_INTERVAL_MS / 1000}s)`
+            );
+            bookedSuccessfully = true; // exit outer date loop, fall to next location iteration via continue
+            break;
+          }
+        } else {
+          // Manual submit mode — slot ready, stop cycling for user to submit
+          stopCycling(`${loc.name}: Slot found on ${tryDate.Date}! Review and click Submit.`);
           return;
         }
-        stopCycling(`${loc.name}: Slot found! Review and click Submit.`);
-        return;
+      } // end for date loop
+
+      if (bookedSuccessfully) {
+        // Grace period set, continue to next location iteration
+        continue;
       }
 
-      setStatus(`${loc.name}: Date selected but no time slots appeared`);
+      // All in-range dates tried, none yielded time slots
+      setStatus(`${loc.name}: Tried ${datesAttempted.length} dates, none had time slots — next location`);
+      log(`${loc.name}: Exhausted ${datesAttempted.length} in-range dates without time slots: ${datesAttempted.join(", ")}`);
+      sendTelegramNotification("error",
+        `ℹ️ <b>NO TIME SLOTS — ${loc.name}</b>\n\n` +
+        `Tried ${datesAttempted.length} in-range dates:\n` +
+        datesAttempted.map(d => `• ${d}`).join("\n") +
+        `\n\nNone had available time slots. Moving to next location.`
+      );
       await sleep(2000);
     }
 
-    // All locations checked — wait and repeat with ±20% jitter
+    // Smart range expansion offer — check at end of round
+    await maybeOfferRangeExpansion();
+
+    // Grace period round counting
+    if (cycling.gracePeriod.active) {
+      cycling.gracePeriod.roundsRemaining--;
+      if (cycling.gracePeriod.roundsRemaining <= 0) {
+        log("Grace period ended — resuming normal cycling");
+        chrome.storage.local.get(["loginDetails"], (d) => {
+          const u = d.loginDetails?.username || "";
+          trackEvent(EVENT_TYPES.BOOKING, `Grace period ended — slot ${cycling.gracePeriod.missedDate} at ${cycling.gracePeriod.location} not recovered`, u);
+          sendTelegramNotification("error",
+            `ℹ️ <b>GRACE PERIOD ENDED</b>\n\n` +
+            `👤 <b>User:</b> ${u}\n` +
+            `📍 <b>Location:</b> ${cycling.gracePeriod.location}\n` +
+            `📅 <b>Missed:</b> ${cycling.gracePeriod.missedDate}\n` +
+            `🔄 Resuming normal cycling`
+          );
+        });
+        cycling.gracePeriod = {
+          active: false, location: null, roundsRemaining: 0,
+          fastIntervalMs: GRACE_PERIOD_INTERVAL_MS, missedDate: null,
+        };
+      }
+    }
+
+    // All locations checked — wait and repeat
     if (!cycling.active) return;
-    const jitter = interval * (0.8 + Math.random() * 0.4);
-    const sec = Math.round(jitter / 1000);
-    setStatus(`All locations checked. Next round in ${sec}s...`);
-    cycling.timer = setTimeout(() => runCycleLoop(), jitter);
+
+    // Use fast interval during grace period, normal jitter otherwise
+    let waitMs;
+    if (cycling.gracePeriod.active) {
+      waitMs = cycling.gracePeriod.fastIntervalMs;
+    } else {
+      waitMs = interval * (0.8 + Math.random() * 0.4);
+    }
+    const sec = Math.round(waitMs / 1000);
+    for (let s = sec; s > 0; s--) {
+      if (!cycling.active || __abortAll) return;
+      if (await checkStopSignal()) return;
+      const prefix = cycling.gracePeriod.active ? `🔥 Grace ${cycling.gracePeriod.roundsRemaining}/${GRACE_PERIOD_ROUNDS}` : "All locations checked";
+      setStatus(`${prefix}. Next round in ${s}s...`);
+      await sleep(1000);
+    }
+    if (cycling.active) runCycleLoop();
   }
 
   // ─── AUTO-SUBMIT OBSERVER (standalone, without cycling) ────────────
@@ -2451,11 +3325,34 @@
   // ─── BOOKING PAGE HANDLER ──────────────────────────────────────────
 
   async function handleBookingPage(settings) {
+    const isInterviewPage = window.location.pathname.toLowerCase().includes("/schedule") &&
+                            !window.location.pathname.toLowerCase().includes("/ofc-schedule");
+
+    // SGA error on interview page = OFC not yet booked → redirect to /ofc-schedule
+    if (isInterviewPage) {
+      await sleep(1500);
+      const errorRow = document.querySelector("#error_row .alert-danger");
+      const errorText = (errorRow?.textContent || "").trim();
+      if (errorRow && /^SGA\d+$/i.test(errorText)) {
+        const activeUser = settings.loginDetails?.username || "";
+        log(`SGA error "${errorText}" on interview page — OFC booking required first, redirecting to /ofc-schedule`);
+        trackEvent(EVENT_TYPES.ERROR, `${errorText} on interview — redirecting to OFC schedule`, activeUser);
+        sendTelegramNotification("error",
+          `⚠️ <b>${errorText} — OFC REQUIRED</b>\n\n` +
+          `👤 <b>User:</b> ${activeUser}\n` +
+          `📋 Interview page shows ${errorText} error\n` +
+          `🔄 Redirecting to OFC schedule page`
+        );
+        window.location.href = window.location.origin + "/en-US/ofc-schedule/";
+        return;
+      }
+    }
+
     // Wait for applicant name label to appear inside #gm_select
     // "No Class Selected" (alert-warning) is a loading state, NOT an error — we must wait past it
     let memberAttempts = 0;
     let pageReady = false;
-    while (memberAttempts < 40) {
+    while (memberAttempts < 120) {
       const nameLabel = document.querySelector("#gm_select li.list-group-item label");
       const alertWarning = document.querySelector("#gm_select .alert-warning");
       const hasRealName = nameLabel && nameLabel.textContent.trim().length > 0;
@@ -2476,9 +3373,9 @@
       memberAttempts++;
     }
 
-    // If applicant name never loaded after 20 seconds, check if it's a real error
+    // If applicant name never loaded after 60 seconds, check if it's a real error
     if (!pageReady) {
-      log("Applicant name did not load after 20 seconds — checking if page is genuinely broken");
+      log("Applicant name did not load after 60 seconds — checking if page is genuinely broken");
       const alertWarning = document.querySelector("#gm_select .alert-warning");
       const stillNoClass = alertWarning && alertWarning.textContent.includes("No Class Selected");
       if (!stillNoClass) {
@@ -2506,14 +3403,15 @@
       log(`Dropdown ready: ${postSelect.options.length} options, value="${postSelect.value}"`);
     }
 
-    // Only treat as error if BOTH: applicant never loaded AND dropdown is empty after full wait
+    // Treat as error if applicant never loaded AND (dropdown empty OR "No Class Selected" warning still showing)
     const nameLabel = document.querySelector("#gm_select li.list-group-item label");
     const hasRealName = nameLabel && nameLabel.textContent.trim().length > 0;
     const isEmptyPage = !postSelect || (postSelect.options.length <= 1 && !postSelect.value);
-    const isGenuineError = !hasRealName && isEmptyPage;
+    const persistentNoClass = !!document.querySelector('#gm_select .alert-warning')?.textContent?.includes("No Class Selected");
+    const isGenuineError = !hasRealName && (isEmptyPage || persistentNoClass);
 
     if (isGenuineError) {
-      log(`Booking page error detected — hasName: ${hasRealName}, emptyPage: ${isEmptyPage}, options: ${postSelect?.options?.length || 0}, value: "${postSelect?.value || ''}"`);
+      log(`Booking page error detected — hasName: ${hasRealName}, emptyPage: ${isEmptyPage}, persistentNoClass: ${persistentNoClass}, options: ${postSelect?.options?.length || 0}, value: "${postSelect?.value || ''}"`);
       const autoUser = await new Promise((r) => {
         chrome.storage.local.get(["activeAutomationUser"], (d) => r(d.activeAutomationUser || null));
       });
@@ -2532,11 +3430,16 @@
           return;
         }
 
-        log(`Booking page error (${errorCount}/3) — going back to dashboard...`);
-        trackEvent(EVENT_TYPES.ERROR, `Booking page error — No Class Selected (attempt ${errorCount}/3)`, activeUser);
-        sendTelegramNotification("error", `⚠️ <b>BOOKING PAGE ERROR</b>\n\n👤 <b>User:</b> ${activeUser}\n❌ No Class Selected (attempt ${errorCount}/3)\n🔄 Redirecting to dashboard`);
-        await sleep(3000);
-        window.location.href = window.location.origin + "/en-US/";
+        const reason = persistentNoClass ? "No Class Selected (persistent)" : "Empty page";
+        log(`Booking page error (${errorCount}/3, ${reason}) — observing ${ERROR_OBSERVE_SEC}s before recovery...`);
+        trackEvent(EVENT_TYPES.ERROR, `Booking page error — ${reason} (attempt ${errorCount}/3)`, activeUser);
+        sendTelegramNotification("error", `⚠️ <b>BOOKING PAGE ERROR</b>\n\n👤 <b>User:</b> ${activeUser}\n❌ ${reason} (attempt ${errorCount}/3)\n👀 Observing ${ERROR_OBSERVE_SEC}s before reload (check the page!)\n🔄 Then ${errorCount < 3 ? "reload" : "redirect to dashboard"}`);
+        await observeBeforeRecovery(`Booking error: ${reason}`);
+        if (errorCount < 3) {
+          window.location.reload();
+        } else {
+          window.location.href = window.location.origin + "/en-US/";
+        }
         return;
       }
     }
@@ -2636,6 +3539,205 @@
       return;
     }
 
+    // Generic site error page detection ("We're sorry, but something went wrong")
+    if (host.includes("usvisascheduling.com")) {
+      const errorDialog = document.querySelector('div.dialog[role="main"]');
+      const errorBodyText = (errorDialog?.textContent || "").toLowerCase();
+      if (errorDialog && (errorBodyText.includes("we're sorry") || errorBodyText.includes("something went wrong"))) {
+        if (!automationActive) {
+          log("Site error page detected but automation stopped — not retrying");
+          return;
+        }
+
+        const errIdMatch = errorDialog.textContent.match(/Error ID #\s*\[([^\]]+)\]/i);
+        const errId = errIdMatch ? errIdMatch[1] : "unknown";
+        const retryCount = parseInt(sessionStorage.getItem("__abSiteErrorCount") || "0") + 1;
+        sessionStorage.setItem("__abSiteErrorCount", String(retryCount));
+
+        const errUser = settings.loginDetails?.username || activeAutoUser || "";
+
+        if (retryCount > 5) {
+          log(`Site error max retries (5) — stopping. Error ID: ${errId}`);
+          trackEvent(EVENT_TYPES.ERROR, `Site error max retries — Error ID: ${errId}`, errUser);
+          sessionStorage.removeItem("__abSiteErrorCount");
+          sendTelegramNotification("error",
+            `🔴 <b>SITE ERROR — STOPPED</b>\n\n` +
+            `👤 <b>User:</b> ${errUser}\n` +
+            `❌ Error ID: <code>${errId}</code>\n` +
+            `⚠️ 5 retries failed — needs manual intervention`
+          );
+          chrome.storage.local.remove("activeAutomationUser");
+          return;
+        }
+
+        const waitSec = 30 * retryCount;
+        log(`Site error (${retryCount}/5) — retry in ${waitSec}s — Error ID: ${errId}`);
+        trackEvent(EVENT_TYPES.ERROR, `Site error retry ${retryCount}/5 — Error ID: ${errId}`, errUser);
+        sendTelegramNotification("error",
+          `⚠️ <b>SITE ERROR</b>\n\n` +
+          `👤 <b>User:</b> ${errUser}\n` +
+          `❌ Error ID: <code>${errId}</code>\n` +
+          `👀 Observing ${waitSec}s (check the page for real error!)\n` +
+          `🔁 Then retry ${retryCount}/5`
+        );
+        for (let s = waitSec; s > 0; s--) {
+          if (sessionStorage.getItem("__abortAll") === "true") return;
+          const statusEl = document.getElementById("ab-status");
+          if (statusEl) statusEl.textContent = `⚠️ Site error — recovery in ${s}s...`;
+          log(`Site error countdown: ${s}s`);
+          await sleep(1000);
+        }
+        window.location.reload();
+        return;
+      }
+      // Clear counter on successful (non-error) page load
+      sessionStorage.removeItem("__abSiteErrorCount");
+    }
+
+    // Sign-in failed page detection (/Account/Login/ExternalAuthenticationFailed)
+    if (host.includes("usvisascheduling.com")) {
+      const bodyTextLower = (document.body?.textContent || "").toLowerCase();
+      const isSignInFailed = path.includes("externalauthenticationfailed") ||
+                             path.includes("/account/login/") && bodyTextLower.includes("sign in failed");
+      if (isSignInFailed) {
+        if (!automationActive) {
+          log("Sign-in failed page but automation stopped — not retrying");
+          return;
+        }
+
+        const failUser = settings.loginDetails?.username || activeAutoUser || "";
+        const retryCount = parseInt(sessionStorage.getItem("__abSignInFailCount") || "0") + 1;
+        sessionStorage.setItem("__abSignInFailCount", String(retryCount));
+
+        if (retryCount > 3) {
+          log(`Sign-in failed max retries (3) — stopping`);
+          trackEvent(EVENT_TYPES.ERROR, "Sign-in failed max retries — ExternalAuthenticationFailed", failUser);
+          sessionStorage.removeItem("__abSignInFailCount");
+          sendTelegramNotification("error",
+            `🔴 <b>SIGN-IN FAILED — STOPPED</b>\n\n` +
+            `👤 <b>User:</b> ${failUser}\n` +
+            `❌ ExternalAuthenticationFailed 3 times\n` +
+            `⚠️ Needs manual login`
+          );
+          chrome.storage.local.remove("activeAutomationUser");
+          return;
+        }
+
+        log(`Sign-in failed (${retryCount}/3) — observing ${ERROR_OBSERVE_SEC}s before clicking Sign in`);
+        trackEvent(EVENT_TYPES.LOGIN, `Sign-in failed retry ${retryCount}/3 — ExternalAuthenticationFailed`, failUser);
+        sendTelegramNotification("error",
+          `⚠️ <b>SIGN-IN FAILED</b>\n\n` +
+          `👤 <b>User:</b> ${failUser}\n` +
+          `🔁 Retry ${retryCount}/3\n` +
+          `👀 Observing ${ERROR_OBSERVE_SEC}s before recovery (check the page!)\n` +
+          `🔄 Then click Sign in button`
+        );
+
+        await observeBeforeRecovery("Sign-in failed");
+
+        // Find Sign in button — anchor with text "Sign in" or button
+        let signInBtn = null;
+        const allLinks = document.querySelectorAll('a, button');
+        for (const el of allLinks) {
+          const txt = (el.textContent || "").trim().toLowerCase();
+          if (txt === "sign in" || txt.includes("sign in")) {
+            signInBtn = el;
+            break;
+          }
+        }
+
+        if (signInBtn) {
+          log("Clicking Sign in button");
+          clickSafe(signInBtn);
+        } else {
+          log("Sign in button not found — redirecting to home");
+          window.location.href = window.location.origin + "/en-US/";
+        }
+        return;
+      }
+      // Clear counter on successful page load
+      sessionStorage.removeItem("__abSignInFailCount");
+    }
+
+    // Bare 401 Unauthorized response page detection
+    // Server returns minimal HTML with just "401 Unauthorized" text when session/cookies invalid
+    if (host.includes("usvisascheduling.com")) {
+      const bodyTextRaw = (document.body?.textContent || "").trim();
+      const titleLower = (document.title || "").toLowerCase();
+      const isBare401 = /^401(\s+unauthorized)?$/i.test(bodyTextRaw) ||
+                        (bodyTextRaw.length < 50 && /^401\b/i.test(bodyTextRaw)) ||
+                        titleLower.includes("401") ||
+                        titleLower.includes("unauthorized");
+
+      if (isBare401) {
+        if (!automationActive) {
+          log("Bare 401 page but automation stopped — not retrying");
+          return;
+        }
+
+        const u401 = settings.loginDetails?.username || activeAutoUser || "";
+        const retry401 = parseInt(sessionStorage.getItem("__abBare401Count") || "0") + 1;
+        sessionStorage.setItem("__abBare401Count", String(retry401));
+        const isOfcSchedule = path.includes("/ofc-schedule") || path.includes("/schedule");
+
+        if (retry401 > 5) {
+          log("Bare 401 max retries (5) — stopping");
+          trackEvent(EVENT_TYPES.ERROR, "Bare 401 page max retries reached", u401);
+          sessionStorage.removeItem("__abBare401Count");
+          sendTelegramNotification("error",
+            `🔴 <b>401 UNAUTHORIZED — STOPPED</b>\n\n` +
+            `👤 <b>User:</b> ${u401}\n` +
+            `❌ Session re-login failed 5 times\n` +
+            `⚠️ Needs manual login`
+          );
+          chrome.storage.local.remove("activeAutomationUser");
+          return;
+        }
+
+        // Strategy: at /ofc-schedule attempt 1-2 = reload (transient 401 sometimes recovers)
+        // attempt 3+ = full re-login flow via /en-US/
+        const useReload = isOfcSchedule && retry401 <= 2;
+        const action = useReload ? "reload page" : "full re-login";
+
+        log(`Bare 401 page (${retry401}/5) — ${action} after ${ERROR_OBSERVE_SEC}s observation`);
+        trackEvent(EVENT_TYPES.SESSION, `Bare 401 detected — ${action} (${retry401}/5)`, u401);
+        sendTelegramNotification("error",
+          `⚠️ <b>401 UNAUTHORIZED</b>\n\n` +
+          `👤 <b>User:</b> ${u401}\n` +
+          `📍 <b>URL:</b> ${path}\n` +
+          `👀 Observing ${ERROR_OBSERVE_SEC}s before recovery (check the page!)\n` +
+          `🔄 Then: ${action} (attempt ${retry401}/5)`
+        );
+
+        await observeBeforeRecovery(`401 Unauthorized at ${path}`);
+
+        if (useReload) {
+          window.location.reload();
+          return;
+        }
+
+        // Full re-login flow
+        sessionStorage.setItem(RELOGIN_FLAG, "true");
+        const existingState = sessionStorage.getItem("ab-cycling-state");
+        if (!existingState) {
+          sessionStorage.setItem("ab-cycling-state", JSON.stringify({
+            active: true,
+            round: 0,
+            startDate: "",
+            endDate: "",
+            interval: "30",
+            locations: [],
+            timestamp: Date.now()
+          }));
+        }
+
+        window.location.href = window.location.origin + "/en-US/";
+        return;
+      }
+      // Clear counter on successful (non-401) page load
+      sessionStorage.removeItem("__abBare401Count");
+    }
+
     // Waiting room detection — only auto-refresh if automation is active
     if (host.includes("usvisascheduling.com")) {
       for (let wc = 0; wc < 6; wc++) {
@@ -2707,6 +3809,16 @@
     if (path.includes("appointment-confirmation")) {
       log("On confirmation page");
       trackEvent(EVENT_TYPES.BOOKING, "Reached appointment confirmation page", routerUser);
+      // Update most recent submitted slot for this user → confirmed
+      chrome.storage.local.get(["slotHistory"], (data) => {
+        const history = data.slotHistory || [];
+        const idx = history.findIndex((e) => e.username === routerUser && e.action === "submitted");
+        if (idx !== -1) {
+          history[idx].action = "confirmed";
+          history[idx].confirmedAt = new Date().toISOString();
+          chrome.storage.local.set({ slotHistory: history });
+        }
+      });
       sendTelegramNotification("confirmed", `✅ <b>BOOKING CONFIRMED</b>\n\n👤 <b>User:</b> ${routerUser}\n🎉 Appointment confirmation page reached!`);
       return;
     }
@@ -2739,6 +3851,32 @@
         startCycling();
       }
       sendResponse({ ok: true });
+    }
+    if (msg.action === "updateDateRange") {
+      // Auto-apply expanded date range from Telegram callback
+      const targetUser = msg.username;
+      const newEndDate = msg.endDate;
+      chrome.storage.local.get(["loginDetails"], (d) => {
+        const currentUser = d.loginDetails?.username;
+        // Only apply if this tab is for the same user
+        if (targetUser && currentUser && targetUser !== currentUser) {
+          sendResponse({ applied: false, reason: "different_user" });
+          return;
+        }
+        const endInput = document.getElementById("ab-end-date");
+        if (endInput && newEndDate) {
+          const oldVal = endInput.value;
+          endInput.value = newEndDate;
+          endInput.dispatchEvent(new Event("change", { bubbles: true }));
+          log(`Date range auto-extended: ${oldVal} → ${newEndDate}`);
+          trackEvent(EVENT_TYPES.CYCLING, `Date range auto-extended via Telegram: ${oldVal} → ${newEndDate}`, currentUser || "");
+          setStatus(`✨ Range extended to ${newEndDate}`);
+          sendResponse({ applied: true });
+        } else {
+          sendResponse({ applied: false, reason: "no_input" });
+        }
+      });
+      return true;
     }
     if (msg.action === "logout") {
       log("LOGOUT command received — clearing session and redirecting to login...");

@@ -62,6 +62,21 @@
             <option value="idle">Idle</option>
             <option value="error">Error</option>
           </select>
+          <select id="filter-visa">
+            <option value="all">Visa Category</option>
+            <option value="H1B">H1B</option>
+            <option value="H4">H4</option>
+            <option value="L1">L1</option>
+            <option value="L2">L2</option>
+            <option value="B1/B2">B1/B2</option>
+            <option value="F1">F1</option>
+            <option value="F2">F2</option>
+            <option value="J1">J1</option>
+            <option value="J2">J2</option>
+            <option value="O1">O1</option>
+            <option value="Other">Other</option>
+            <option value="__unset__">Unspecified</option>
+          </select>
         </div>
       </div>
       <div id="user-cards" class="user-cards-grid"></div>
@@ -69,8 +84,12 @@
 
     <div class="right-panel">
       <div class="section-header">
-        <h2>Activity Log</h2>
-        <div class="log-controls">
+        <div style="display:flex;gap:8px;align-items:center;">
+          <h2 id="tab-log" class="tab-h2 tab-active" style="cursor:pointer;">Activity Log</h2>
+          <h2 id="tab-slots" class="tab-h2" style="cursor:pointer;opacity:0.5;">Slot History</h2>
+          <h2 id="tab-stats" class="tab-h2" style="cursor:pointer;opacity:0.5;">Stats</h2>
+        </div>
+        <div class="log-controls" id="log-controls-activity">
           <select id="log-filter-user">
             <option value="all">All Users</option>
           </select>
@@ -88,8 +107,36 @@
           </select>
           <button id="clear-log-btn" class="btn btn-small btn-gray">Clear</button>
         </div>
+        <div class="log-controls" id="log-controls-slots" style="display:none;">
+          <select id="slot-filter-user">
+            <option value="all">All Users</option>
+          </select>
+          <select id="slot-filter-loc">
+            <option value="all">All Locations</option>
+            <option value="Mumbai">Mumbai</option>
+            <option value="New Delhi">New Delhi</option>
+            <option value="Chennai">Chennai</option>
+            <option value="Kolkata">Kolkata</option>
+            <option value="Hyderabad">Hyderabad</option>
+          </select>
+          <select id="slot-filter-action">
+            <option value="all">All Actions</option>
+            <option value="detected">Detected</option>
+            <option value="selected">Selected</option>
+            <option value="submitted">Submitted</option>
+            <option value="confirmed">Confirmed</option>
+          </select>
+          <select id="slot-filter-range">
+            <option value="all">In + Out</option>
+            <option value="in">In Range</option>
+            <option value="out">Out of Range</option>
+          </select>
+          <button id="clear-slots-btn" class="btn btn-small btn-gray">Clear</button>
+        </div>
       </div>
       <div id="activity-log" class="activity-log"></div>
+      <div id="slot-history" class="activity-log" style="display:none;"></div>
+      <div id="stats-pane" class="activity-log" style="display:none;"></div>
     </div>
   </div>
 

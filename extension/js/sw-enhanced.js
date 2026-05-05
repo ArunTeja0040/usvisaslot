@@ -108,9 +108,26 @@ function flattenScheduleDays(e) {
 
 const TG_POLL_ALARM = "telegram-poll";
 const TG_POLL_INTERVAL = 0.25; // minutes (15 seconds)
+const QUOTA_CHECK_ALARM = "quota-check";
+const QUOTA_CHECK_INTERVAL = 5; // minutes
+const DAILY_REPORT_ALARM = "daily-report";
+const DAILY_REPORT_HOUR_IST = 9; // 9 AM IST
+const WEEKLY_REPORT_DAY = 0;     // Sunday (0=Sun)
+
+// Quota thresholds (bytes). Chrome local default = 10MB.
+const QUOTA_WARN_BYTES = 6 * 1024 * 1024;   // 6 MB
+const QUOTA_PRUNE_BYTES = 8 * 1024 * 1024;  // 8 MB
+const MAX_EVENT_LOG = 500;
+const MAX_SLOT_HISTORY = 1000;
+const MAX_DAILY_STATS_DAYS = 30;
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === TG_POLL_ALARM) pollTelegramCommands();
+  else if (alarm.name === QUOTA_CHECK_ALARM) checkStorageQuota();
+  else if (alarm.name === DAILY_REPORT_ALARM) {
+    sendDailyReport();
+    scheduleDailyReport(); // re-arm for tomorrow
+  }
 });
 
 function startTelegramPolling() {
@@ -127,10 +144,298 @@ function stopTelegramPolling() {
   console.log("Telegram polling stopped");
 }
 
-chrome.runtime.onStartup.addListener(startTelegramPolling);
-chrome.runtime.onInstalled.addListener(() => {
-  setTimeout(startTelegramPolling, 2000);
+function startQuotaMonitor() {
+  chrome.alarms.create(QUOTA_CHECK_ALARM, { periodInMinutes: QUOTA_CHECK_INTERVAL });
+  console.log("Storage quota monitor started");
+  // Run once immediately
+  checkStorageQuota();
+}
+
+// Compute next 9 AM IST timestamp (in ms)
+function nextISTHourTimestamp(hourIST) {
+  const now = new Date();
+  // IST = UTC+5:30
+  const istOffsetMin = 5 * 60 + 30;
+  // Convert "now" to IST
+  const nowUtcMs = now.getTime();
+  const nowIstMs = nowUtcMs + istOffsetMin * 60 * 1000;
+  const nowIst = new Date(nowIstMs);
+
+  // Build target IST date with desired hour
+  const targetIst = new Date(Date.UTC(
+    nowIst.getUTCFullYear(),
+    nowIst.getUTCMonth(),
+    nowIst.getUTCDate(),
+    hourIST, 0, 0, 0
+  ));
+  // If target already passed today (in IST), schedule for tomorrow
+  if (targetIst.getTime() <= nowIstMs) {
+    targetIst.setUTCDate(targetIst.getUTCDate() + 1);
+  }
+  // Convert IST target back to UTC ms (subtract offset)
+  return targetIst.getTime() - istOffsetMin * 60 * 1000;
+}
+
+function scheduleDailyReport() {
+  const when = nextISTHourTimestamp(DAILY_REPORT_HOUR_IST);
+  chrome.alarms.create(DAILY_REPORT_ALARM, { when });
+  const dt = new Date(when);
+  console.log(`Daily report scheduled for ${dt.toISOString()} (${DAILY_REPORT_HOUR_IST}:00 IST)`);
+}
+
+// IST helpers (mirror auto-booking)
+function istDayKeyFromDate(d) {
+  const istOffsetMs = 5.5 * 60 * 60 * 1000;
+  const ist = new Date(d.getTime() + istOffsetMs);
+  return ist.toISOString().substring(0, 10);
+}
+
+function topEntries(obj, n) {
+  return Object.entries(obj || {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n);
+}
+
+async function sendDailyReport() {
+  try {
+    const data = await new Promise((r) => {
+      chrome.storage.local.get(["dailyStats", "telegramBotToken", "telegramChatId", "telegramNotify"], r);
+    });
+    if (!data.telegramBotToken || !data.telegramChatId) return;
+
+    const stats = data.dailyStats || {};
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yKey = istDayKeyFromDate(yesterday);
+    const yStats = stats[yKey];
+
+    if (!yStats) {
+      console.log(`No daily stats for ${yKey} — skipping report`);
+      return;
+    }
+
+    const topLocs = topEntries(yStats.byLocation, 5);
+    const topHours = topEntries(yStats.byHour, 3);
+    const userCount = Object.keys(yStats.activeUsers || {}).length;
+
+    const locText = topLocs.length > 0
+      ? topLocs.map(([l, c]) => `  • ${l}: ${c}`).join("\n")
+      : "  • —";
+    const hourText = topHours.length > 0
+      ? topHours.map(([h, c]) => `  • ${h}:00 IST → ${c}`).join("\n")
+      : "  • —";
+
+    let msg =
+      `📊 <b>DAILY SUMMARY — ${yKey}</b>\n\n` +
+      `🎯 <b>Slots found:</b> ${yStats.slotsFound || 0}\n` +
+      `✅ <b>In range:</b> ${yStats.slotsInRange || 0}\n` +
+      `⚪ <b>Out of range:</b> ${yStats.slotsOutOfRange || 0}\n` +
+      `🎉 <b>Booked:</b> ${yStats.booked || 0}\n` +
+      `❌ <b>Missed:</b> ${yStats.missed || 0}\n` +
+      `⚠️ <b>Errors:</b> ${yStats.errors || 0}\n` +
+      `👥 <b>Active users:</b> ${userCount}\n\n` +
+      `📍 <b>Top locations:</b>\n${locText}\n\n` +
+      `🕐 <b>Hot hours (IST):</b>\n${hourText}`;
+
+    // Weekly report on Sundays — append last 7 days summary
+    const today = new Date();
+    if (today.getDay() === WEEKLY_REPORT_DAY) {
+      const weekly = buildWeeklyAggregate(stats);
+      msg +=
+        `\n\n━━━━━━━━━━━━━━━━━━\n` +
+        `📅 <b>WEEKLY (last 7 days)</b>\n\n` +
+        `🎯 <b>Total slots:</b> ${weekly.slotsFound}\n` +
+        `✅ <b>In range:</b> ${weekly.slotsInRange}\n` +
+        `🎉 <b>Booked:</b> ${weekly.booked}\n` +
+        `❌ <b>Missed:</b> ${weekly.missed}\n` +
+        `⚠️ <b>Errors:</b> ${weekly.errors}\n\n` +
+        `📍 <b>Best location:</b> ${weekly.bestLocation || "—"}\n` +
+        `🕐 <b>Best hour:</b> ${weekly.bestHour || "—"}`;
+    }
+
+    await fetch(`https://api.telegram.org/bot${data.telegramBotToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: data.telegramChatId,
+        text: msg,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      }),
+    });
+    console.log("Daily report sent");
+  } catch (e) {
+    console.log("Daily report error:", e);
+  }
+}
+
+function buildWeeklyAggregate(stats) {
+  const result = {
+    slotsFound: 0, slotsInRange: 0, slotsOutOfRange: 0,
+    booked: 0, missed: 0, errors: 0,
+    byLocation: {}, byHour: {},
+  };
+  const today = new Date();
+  for (let i = 1; i <= 7; i++) {
+    const d = new Date(today);
+    d.setDate(today.getDate() - i);
+    const key = istDayKeyFromDate(d);
+    const s = stats[key];
+    if (!s) continue;
+    result.slotsFound += s.slotsFound || 0;
+    result.slotsInRange += s.slotsInRange || 0;
+    result.slotsOutOfRange += s.slotsOutOfRange || 0;
+    result.booked += s.booked || 0;
+    result.missed += s.missed || 0;
+    result.errors += s.errors || 0;
+    for (const [k, v] of Object.entries(s.byLocation || {})) {
+      result.byLocation[k] = (result.byLocation[k] || 0) + v;
+    }
+    for (const [k, v] of Object.entries(s.byHour || {})) {
+      result.byHour[k] = (result.byHour[k] || 0) + v;
+    }
+  }
+  const bestLoc = topEntries(result.byLocation, 1)[0];
+  const bestHr = topEntries(result.byHour, 1)[0];
+  result.bestLocation = bestLoc ? `${bestLoc[0]} (${bestLoc[1]})` : null;
+  result.bestHour = bestHr ? `${bestHr[0]}:00 IST (${bestHr[1]})` : null;
+  return result;
+}
+
+chrome.runtime.onStartup.addListener(() => {
+  startTelegramPolling();
+  startQuotaMonitor();
+  scheduleDailyReport();
 });
+chrome.runtime.onInstalled.addListener(() => {
+  setTimeout(() => {
+    startTelegramPolling();
+    startQuotaMonitor();
+    scheduleDailyReport();
+  }, 2000);
+});
+
+// ─── STORAGE QUOTA MONITORING ─────────────────────────────────
+
+async function checkStorageQuota() {
+  try {
+    const bytesInUse = await new Promise((resolve) => {
+      chrome.storage.local.getBytesInUse(null, (b) => resolve(b || 0));
+    });
+
+    const mb = (bytesInUse / 1024 / 1024).toFixed(2);
+    console.log(`Storage usage: ${mb} MB / 10 MB`);
+
+    // Persist last-known size for dashboard display
+    chrome.storage.local.set({
+      __storageStats: {
+        bytesInUse,
+        mb: parseFloat(mb),
+        checkedAt: new Date().toISOString(),
+      },
+    });
+
+    if (bytesInUse >= QUOTA_PRUNE_BYTES) {
+      console.log("Storage > 8MB — auto-pruning");
+      await pruneStorage();
+    } else if (bytesInUse >= QUOTA_WARN_BYTES) {
+      await sendQuotaWarning(bytesInUse);
+    }
+  } catch (e) {
+    console.log("Quota check error:", e);
+  }
+}
+
+async function sendQuotaWarning(bytesInUse) {
+  // Only warn once per day
+  const today = new Date().toISOString().substring(0, 10);
+  const data = await new Promise((r) => {
+    chrome.storage.local.get(["__lastQuotaWarnDate", "telegramBotToken", "telegramChatId"], r);
+  });
+
+  if (data.__lastQuotaWarnDate === today) return;
+  if (!data.telegramBotToken || !data.telegramChatId) return;
+
+  const mb = (bytesInUse / 1024 / 1024).toFixed(2);
+  const text =
+    `⚠️ <b>STORAGE WARNING</b>\n\n` +
+    `📦 Used: <b>${mb} MB</b> / 10 MB\n` +
+    `⚡ Auto-prune triggers at 8 MB\n` +
+    `💡 Export logs if needed`;
+
+  try {
+    await fetch(`https://api.telegram.org/bot${data.telegramBotToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: data.telegramChatId, text, parse_mode: "HTML" }),
+    });
+    chrome.storage.local.set({ __lastQuotaWarnDate: today });
+  } catch (e) {
+    console.log("Quota warn send error:", e);
+  }
+}
+
+async function pruneStorage() {
+  const data = await new Promise((r) => {
+    chrome.storage.local.get(["eventLog", "slotHistory", "dailyStats"], r);
+  });
+
+  const updates = {};
+  let pruned = [];
+
+  // 1. Trim eventLog to MAX_EVENT_LOG
+  if (Array.isArray(data.eventLog) && data.eventLog.length > MAX_EVENT_LOG) {
+    updates.eventLog = data.eventLog.slice(0, MAX_EVENT_LOG);
+    pruned.push(`eventLog ${data.eventLog.length} → ${MAX_EVENT_LOG}`);
+  }
+
+  // 2. Trim slotHistory to MAX_SLOT_HISTORY
+  if (Array.isArray(data.slotHistory) && data.slotHistory.length > MAX_SLOT_HISTORY) {
+    // Keep newest entries
+    const sorted = [...data.slotHistory].sort((a, b) =>
+      new Date(b.foundAt || 0) - new Date(a.foundAt || 0)
+    );
+    updates.slotHistory = sorted.slice(0, MAX_SLOT_HISTORY);
+    pruned.push(`slotHistory ${data.slotHistory.length} → ${MAX_SLOT_HISTORY}`);
+  }
+
+  // 3. Drop dailyStats older than MAX_DAILY_STATS_DAYS
+  if (data.dailyStats && typeof data.dailyStats === "object") {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - MAX_DAILY_STATS_DAYS);
+    const cutoffKey = cutoff.toISOString().substring(0, 10);
+    const trimmed = {};
+    let dropped = 0;
+    for (const [day, stats] of Object.entries(data.dailyStats)) {
+      if (day >= cutoffKey) trimmed[day] = stats;
+      else dropped++;
+    }
+    if (dropped > 0) {
+      updates.dailyStats = trimmed;
+      pruned.push(`dailyStats dropped ${dropped} days`);
+    }
+  }
+
+  if (Object.keys(updates).length > 0) {
+    await new Promise((r) => chrome.storage.local.set(updates, r));
+    console.log("Pruned: " + pruned.join(", "));
+  }
+
+  // Re-check after prune
+  const newBytes = await new Promise((resolve) => {
+    chrome.storage.local.getBytesInUse(null, (b) => resolve(b || 0));
+  });
+  const newMb = (newBytes / 1024 / 1024).toFixed(2);
+  console.log(`Storage after prune: ${newMb} MB`);
+  chrome.storage.local.set({
+    __storageStats: {
+      bytesInUse: newBytes,
+      mb: parseFloat(newMb),
+      checkedAt: new Date().toISOString(),
+      lastPrune: { at: new Date().toISOString(), pruned },
+    },
+  });
+}
 
 async function sendTelegramReply(token, chatId, text) {
   try {
@@ -190,7 +495,7 @@ async function pollTelegramCommands() {
   const offset = data.tgLastUpdateId + 1;
 
   try {
-    const resp = await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=${offset}&timeout=1&allowed_updates=["message"]`);
+    const resp = await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=${offset}&timeout=1&allowed_updates=["message","callback_query"]`);
     if (!resp.ok) return;
     const result = await resp.json();
     if (!result.ok || !result.result || result.result.length === 0) return;
@@ -198,6 +503,17 @@ async function pollTelegramCommands() {
     let maxId = data.tgLastUpdateId || 0;
     for (const update of result.result) {
       if (update.update_id > maxId) maxId = update.update_id;
+
+      // Inline button callback
+      if (update.callback_query) {
+        const cb = update.callback_query;
+        if (String(cb.message?.chat?.id) === String(chatId)) {
+          await handleTelegramCallback(token, chatId, cb);
+        }
+        continue;
+      }
+
+      // Text message command
       const msg = update.message;
       if (!msg || !msg.text || String(msg.chat.id) !== String(chatId)) continue;
       await handleTelegramCommand(token, chatId, msg.text.trim());
@@ -206,6 +522,96 @@ async function pollTelegramCommands() {
   } catch (e) {
     console.log("Telegram poll error:", e);
   }
+}
+
+// Acknowledge callback (removes loading spinner on Telegram client)
+async function answerCallbackQuery(token, callbackQueryId, text) {
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, text: text || "OK" }),
+    });
+  } catch (e) {
+    console.log("answerCallbackQuery error:", e);
+  }
+}
+
+async function handleTelegramCallback(token, chatId, callbackQuery) {
+  const cbData = callbackQuery.data || "";
+  const cbId = callbackQuery.id;
+  console.log("Callback received:", cbData);
+
+  // Format: "expand:<username>:<days>" OR "expand_ignore:<username>"
+  if (cbData.startsWith("expand:")) {
+    const parts = cbData.split(":");
+    const username = parts[1];
+    const days = parseInt(parts[2] || "0");
+    if (!username || !days) {
+      await answerCallbackQuery(token, cbId, "Invalid request");
+      return;
+    }
+
+    const data = await new Promise((r) => chrome.storage.local.get(["userProfilesList"], r));
+    const profiles = data.userProfilesList || [];
+    const idx = profiles.findIndex((p) => p.username === username);
+    if (idx < 0) {
+      await answerCallbackQuery(token, cbId, "User not found");
+      return;
+    }
+
+    const profile = profiles[idx];
+    const oldEnd = profile.endDate || new Date().toISOString().substring(0, 10);
+    const newEndDate = new Date(oldEnd + "T00:00:00");
+    newEndDate.setDate(newEndDate.getDate() + days);
+    const newEndStr = newEndDate.toISOString().substring(0, 10);
+
+    profiles[idx].endDate = newEndStr;
+    await new Promise((r) => chrome.storage.local.set({ userProfilesList: profiles }, r));
+
+    // Auto-apply to active cycling tab(s) — no manual reload needed
+    let appliedToTab = false;
+    await new Promise((resolve) => {
+      chrome.tabs.query({ url: "https://*.usvisascheduling.com/*" }, (tabs) => {
+        if (!tabs || tabs.length === 0) { resolve(); return; }
+        let pending = tabs.length;
+        tabs.forEach((tab) => {
+          chrome.tabs.sendMessage(tab.id, {
+            action: "updateDateRange",
+            username: username,
+            endDate: newEndStr,
+          }, (resp) => {
+            if (!chrome.runtime.lastError && resp?.applied) appliedToTab = true;
+            if (--pending === 0) resolve();
+          });
+        });
+      });
+    });
+
+    await answerCallbackQuery(token, cbId, `Extended +${days} days`);
+    await sendTelegramReply(token, chatId,
+      `✅ <b>RANGE EXPANDED</b>\n\n` +
+      `👤 <b>User:</b> ${deriveProfileName(username)}\n` +
+      `📅 <b>Old end:</b> ${oldEnd}\n` +
+      `📅 <b>New end:</b> ${newEndStr}\n` +
+      `➕ Added ${days} days\n\n` +
+      (appliedToTab
+        ? `✨ <b>Auto-applied to active cycling tab</b>\n🔁 Next round will use new range`
+        : `🔁 Reload booking tab to apply new range`)
+    );
+    return;
+  }
+
+  if (cbData.startsWith("expand_ignore:")) {
+    const username = cbData.split(":")[1];
+    await answerCallbackQuery(token, cbId, "Ignored");
+    await sendTelegramReply(token, chatId,
+      `✖️ Range expansion ignored for <b>${deriveProfileName(username || "user")}</b>`
+    );
+    return;
+  }
+
+  await answerCallbackQuery(token, cbId, "Unknown action");
 }
 
 async function handleTelegramCommand(token, chatId, text) {
@@ -459,6 +865,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
     return true;
   }
+  if (msg.action === "checkQuota") {
+    checkStorageQuota();
+    sendResponse({ ok: true });
+    return true;
+  }
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -499,15 +910,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         const url = `https://api.telegram.org/bot${telegramBotToken}/sendMessage`;
+        const body = {
+          chat_id: telegramChatId,
+          text: msg.text,
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+        };
+        if (msg.replyMarkup) body.reply_markup = msg.replyMarkup;
         const resp = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chat_id: telegramChatId,
-            text: msg.text,
-            parse_mode: "HTML",
-            disable_web_page_preview: true,
-          }),
+          body: JSON.stringify(body),
         });
         const data = await resp.json();
         if (data.ok) {
@@ -519,6 +932,64 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
       } catch (e) {
         console.log("Telegram send error:", e);
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
+  // Telegram photo (slot screenshot)
+  if (msg.action === "sendTelegramPhoto") {
+    (async () => {
+      try {
+        const { telegramBotToken, telegramChatId } = await new Promise((r) => {
+          chrome.storage.local.get(["telegramBotToken", "telegramChatId"], r);
+        });
+        if (!telegramBotToken || !telegramChatId) {
+          sendResponse({ ok: false, error: "Telegram not configured" });
+          return;
+        }
+        if (!msg.photoBase64) {
+          sendResponse({ ok: false, error: "No photo data" });
+          return;
+        }
+
+        // Decode base64 → Uint8Array → Blob
+        const binary = atob(msg.photoBase64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const blob = new Blob([bytes], { type: "image/jpeg" });
+
+        // Telegram photo limit: 10MB. Warn if approaching.
+        const sizeMB = (blob.size / 1024 / 1024).toFixed(2);
+        console.log(`Sending Telegram photo (${sizeMB} MB)`);
+        if (blob.size > 10 * 1024 * 1024) {
+          sendResponse({ ok: false, error: `Photo too large: ${sizeMB} MB > 10 MB` });
+          return;
+        }
+
+        const formData = new FormData();
+        formData.append("chat_id", telegramChatId);
+        formData.append("photo", blob, "slot.jpg");
+        if (msg.caption) {
+          formData.append("caption", msg.caption);
+          formData.append("parse_mode", "HTML");
+        }
+
+        const resp = await fetch(`https://api.telegram.org/bot${telegramBotToken}/sendPhoto`, {
+          method: "POST",
+          body: formData,
+        });
+        const data = await resp.json();
+        if (data.ok) {
+          console.log("Telegram photo sent");
+          sendResponse({ ok: true });
+        } else {
+          console.log("Telegram photo error:", data.description);
+          sendResponse({ ok: false, error: data.description });
+        }
+      } catch (e) {
+        console.log("Telegram photo error:", e);
         sendResponse({ ok: false, error: e.message });
       }
     })();
