@@ -420,7 +420,9 @@
     const activeUser = (await getSettings()).loginDetails?.username || "";
     trackEvent(EVENT_TYPES.CAPTCHA, "Auto-solving CAPTCHA", activeUser);
 
-    for (let attempt = 1; attempt <= CAPTCHA_MAX_RETRIES; attempt++) {
+    let attempt = 0;
+    while (true) {
+      attempt++;
       if (__abortAll) { log("CAPTCHA aborted"); return; }
       await sleep(1000);
 
@@ -463,10 +465,6 @@
       log("CAPTCHA appears solved or page navigated");
       return;
     }
-
-    log("CAPTCHA max retries reached — falling back to manual");
-    trackEvent(EVENT_TYPES.CAPTCHA, `Failed after ${CAPTCHA_MAX_RETRIES} attempts — manual input needed`, activeUser);
-    captchaInput.focus();
   }
 
   // ─── SECURITY QUESTIONS ─────────────────────────────────────────────
@@ -3045,7 +3043,7 @@
       }
 
       // Dates in range found! Try each date in order until one yields time slots.
-      const MAX_DATE_TRIES = Math.min(inRange.length, 5);
+      let MAX_DATE_TRIES = Math.min(inRange.length, 5);
       setStatus(
         `${loc.name}: ${inRange.length} dates in range! Will try up to ${MAX_DATE_TRIES} dates...`
       );
@@ -3169,22 +3167,52 @@
             updateSlotHistoryAction(u, loc.name, tryDate.Date, "missed");
             bumpDailyStat({ key: "missed", delta: 1 });
 
-            // If more in-range dates remain, try them (faster than waiting grace period)
-            const remainingDates = MAX_DATE_TRIES - dateIdx - 1;
-            if (remainingDates > 0) {
-              log(`${remainingDates} more in-range date(s) to try — continuing without grace period`);
-              sendTelegramNotification("error",
-                `⚠️ <b>SUBMIT FAILED — TRYING NEXT DATE</b>\n\n` +
-                `👤 <b>User:</b> ${u}\n` +
-                `📍 <b>Location:</b> ${loc.name}\n` +
-                `❌ ${tryDate.Date} — ${reason}\n` +
-                `🔄 Trying next in-range date (${remainingDates} remaining)`
-              );
-              await sleep(2000);
-              continue; // try next in-range date in same location
+            // Re-fetch fresh dates for same location before trying next date
+            log(`Refreshing available dates at ${loc.name} after failed submit...`);
+            setStatus(`${loc.name}: Refreshing dates after failed submit...`);
+            const refreshSelect = document.getElementById("post_select");
+            if (refreshSelect) {
+              const refreshPromise = waitForScheduleData(15000);
+              refreshSelect.dispatchEvent(new Event("change", { bubbles: true }));
+              const freshData = await refreshPromise;
+
+              if (freshData && freshData.ScheduleDays && freshData.ScheduleDays.length > 0) {
+                const startDate = document.getElementById("fromDate")?.value || "";
+                const endDate = document.getElementById("toDate")?.value || "";
+                const freshInRange = freshData.ScheduleDays.filter((d) =>
+                  isDateInRange(d.Date, startDate, endDate)
+                );
+                const freshUntried = freshInRange.filter(
+                  (d) => !datesAttempted.includes(d.Date)
+                );
+
+                if (freshUntried.length > 0) {
+                  const freshMax = Math.min(freshUntried.length, 5);
+                  log(`Fresh data: ${freshInRange.length} in range, ${freshUntried.length} untried — trying up to ${freshMax}`);
+                  sendTelegramNotification("error",
+                    `⚠️ <b>SUBMIT FAILED — REFRESHED DATES</b>\n\n` +
+                    `👤 <b>User:</b> ${u}\n` +
+                    `📍 <b>Location:</b> ${loc.name}\n` +
+                    `❌ ${tryDate.Date} — ${reason}\n` +
+                    `🔄 Refreshed: ${freshUntried.length} new dates to try`
+                  );
+
+                  // Replace remaining iterations with fresh untried dates
+                  inRange.length = 0;
+                  for (let fi = 0; fi < freshMax; fi++) inRange.push(freshUntried[fi]);
+                  dateIdx = -1; // reset so next iteration starts at 0
+                  MAX_DATE_TRIES = freshMax;
+                  await sleep(1500);
+                  continue;
+                }
+
+                log(`No untried in-range dates after refresh at ${loc.name} (tried: ${datesAttempted.join(", ")})`);
+              } else {
+                log(`No dates available after refresh at ${loc.name}`);
+              }
             }
 
-            // Last in-range date also failed — enter grace period
+            // No fresh dates available — enter grace period
             cycling.gracePeriod = {
               active: true,
               location: loc.name,
