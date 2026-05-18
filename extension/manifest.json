@@ -39,15 +39,20 @@
             "run_at": "document_start"
         }
     ],
-    "permissions": ["storage", "activeTab", "scripting", "tabs", "alarms"],
+    "permissions": ["storage", "activeTab", "scripting", "tabs", "alarms", "identity"],
     "host_permissions": [
         "https://*.usvisascheduling.com/*",
         "https://atlasauth.b2clogin.com/*",
         "http://localhost/*",
         "https://docs.google.com/*",
-        "https://api.telegram.org/*"
+        "https://api.telegram.org/*",
+        "https://sheets.googleapis.com/*"
     ],
-"externally_connectable": {
+    "oauth2": {
+        "client_id": "245548528538-lsok9hd7ons1tt97v4e7ftlrpqnqgec1.apps.googleusercontent.com",
+        "scopes": ["https://www.googleapis.com/auth/spreadsheets"]
+    },
+    "externally_connectable": {
         "matches": ["https://*.checkvisaslots.com/*"]
     }
 }

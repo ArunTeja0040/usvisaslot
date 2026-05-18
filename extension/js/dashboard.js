@@ -2,7 +2,13 @@
   "use strict";
 
   const REFRESH_INTERVAL = 2000;
+  const SUPABASE_POLL_INTERVAL = 30000;
+  const STALE_DEVICE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
   const esc = (s) => (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+  // Supabase-sourced profiles + device map (shared across all Chromes)
+  let cloudProfiles = [];
+  let cloudDevices = {};  // deviceId → { device_name, last_seen }
 
   function sendDashboardTelegram(type, message) {
     chrome.storage.local.get(["telegramBotToken", "telegramChatId", "telegramNotify"], (data) => {
@@ -100,6 +106,7 @@
     const container = document.getElementById("user-cards");
     const filterStatus = document.getElementById("filter-status").value;
     const filterVisa = document.getElementById("filter-visa")?.value || "all";
+    const filterMonth = document.getElementById("filter-month")?.value || "all";
 
     // Build slot stats per user
     const slotStats = {};
@@ -142,6 +149,22 @@
           return false;
         }
       }
+      // Month filter — show user if selected month falls within their date range
+      if (filterMonth !== "all") {
+        const m = parseInt(filterMonth);
+        const start = p.startDate ? new Date(p.startDate + "T00:00:00") : null;
+        const end = p.endDate ? new Date(p.endDate + "T00:00:00") : null;
+        if (!start && !end) return false;
+        const startMonth = start ? start.getFullYear() * 12 + start.getMonth() + 1 : 0;
+        const endMonth = end ? end.getFullYear() * 12 + end.getMonth() + 1 : 9999;
+        // Check all possible years the user's range spans
+        let monthInRange = false;
+        for (let y = (start ? start.getFullYear() : 2026); y <= (end ? end.getFullYear() : 2027); y++) {
+          const check = y * 12 + m;
+          if (check >= startMonth && check <= endMonth) { monthInRange = true; break; }
+        }
+        if (!monthInRange) return false;
+      }
       return true;
     });
 
@@ -150,11 +173,30 @@
       return;
     }
 
+    // Build cloud status map: username → { status, activeDeviceId, isActive }
+    const cloudStatusMap = {};
+    cloudProfiles.forEach(cp => {
+      cloudStatusMap[cp.username] = { status: cp.status, activeDeviceId: cp.activeDeviceId, isActive: cp.isActive };
+    });
+
+    const myDeviceId = SUPA ? SUPA.getDeviceId() : null;
+
     container.innerHTML = filtered.map((profile) => {
       const status = statuses[profile.username] || {};
-      const userStatus = status.status || "idle";
+      const cloud = cloudStatusMap[profile.username] || {};
+      // Use local status if active, otherwise prefer cloud
+      const ACTIVE_STATES = ["cycling", "logging_in", "security_questions", "on_dashboard", "slot_found"];
+      const localSt = status.status || "";
+      const cloudSt = cloud.status || "";
+      const userStatus = ACTIVE_STATES.includes(localSt) ? localSt : (ACTIVE_STATES.includes(cloudSt) ? cloudSt : (localSt || cloudSt || "idle"));
       const name = esc(profile.name || deriveProfileName(profile.username));
       const isActive = ["cycling", "logging_in", "security_questions", "on_dashboard"].includes(userStatus);
+      const cloudIsRunning = cloud.isActive || ["cycling", "logging_in", "security_questions", "on_dashboard", "slot_found"].includes(cloud.status);
+      const activeOnOtherDevice = cloudIsRunning && cloud.activeDeviceId && cloud.activeDeviceId !== myDeviceId;
+      const activeDevice = cloud.activeDeviceId ? cloudDevices[cloud.activeDeviceId] : null;
+      const activeDeviceName = activeDevice ? activeDevice.name : null;
+      const deviceLastSeen = activeDevice && activeDevice.lastSeen ? timeAgo(activeDevice.lastSeen) : null;
+      const isStaleDevice = activeDevice && activeDevice.lastSeen && (Date.now() - new Date(activeDevice.lastSeen).getTime() > STALE_DEVICE_THRESHOLD_MS);
 
       let cardClass = "user-card";
       if (isActive) cardClass += " active";
@@ -174,6 +216,8 @@
             </div>
             <span class="status-badge status-${userStatus}">${statusLabel(userStatus)}</span>
           </div>
+          ${activeOnOtherDevice ? `<div style="background:#e74c3c22;border:1px solid #e74c3c55;border-radius:4px;padding:4px 8px;margin:4px 0;font-size:11px;color:#ef5350;">⚠️ Active on <b>${esc(activeDeviceName || "another device")}</b> ${deviceLastSeen ? `(${deviceLastSeen})` : ""} ${isStaleDevice ? '<span style="color:#f39c12;"> — stale</span>' : ""}</div>` : ""}
+          ${isActive && activeDeviceName && !activeOnOtherDevice ? `<div style="font-size:11px;color:#3ecf8e;margin:2px 0;">📍 Running on <b>${esc(activeDeviceName)}</b> ${deviceLastSeen ? `(${deviceLastSeen})` : ""}</div>` : ""}
           <div class="card-details">
             <div class="card-detail">
               <span class="detail-label">Dates:</span>
@@ -184,8 +228,12 @@
               <span class="detail-value">${esc(profile.visaType) || "—"}</span>
             </div>
             <div class="card-detail">
+              <span class="detail-label">Applicants:</span>
+              <span class="detail-value">${profile.applicantCount || 1}</span>
+            </div>
+            <div class="card-detail">
               <span class="detail-label">Price:</span>
-              <span class="detail-value">${profile.agreedPrice ? "₹" + Number(profile.agreedPrice).toLocaleString() : "—"}</span>
+              <span class="detail-value">${profile.agreedPrice ? "₹" + Number(profile.agreedPrice).toLocaleString() + (profile.applicantCount > 1 ? " (" + (profile.pricePerPerson || profile.agreedPrice) + "/pp)" : "") : "—"}</span>
             </div>
             <div class="card-detail">
               <span class="detail-label">CAPTCHA:</span>
@@ -212,10 +260,13 @@
           })()}
 
           <div class="card-actions">
-            ${isActive
-              ? `<button class="btn btn-small btn-red btn-stop" data-user="${safeUser}">Stop</button>
-                 <button class="btn btn-small btn-orange btn-logout" data-user="${safeUser}">Logout</button>`
-              : `<button class="btn btn-small btn-green btn-start" data-user="${safeUser}">Start Now</button>`}
+            ${activeOnOtherDevice
+              ? `<span style="font-size:11px;color:#ef5350;font-weight:bold;">Running on ${esc(activeDeviceName || "other device")}</span>
+                 <button class="btn btn-small btn-force-start" data-user="${safeUser}" data-device="${esc(activeDeviceName || "other device")}" style="background:#7f8c8d;color:white;font-size:10px;" title="Hold Shift+Click to force start">Force Start</button>`
+              : isActive
+                ? `<button class="btn btn-small btn-red btn-stop" data-user="${safeUser}">Stop</button>
+                   <button class="btn btn-small btn-orange btn-logout" data-user="${safeUser}">Logout</button>`
+                : `<button class="btn btn-small btn-green btn-start" data-user="${safeUser}">Start Now</button>`}
             <button class="btn btn-small btn-gray btn-edit" data-user="${safeUser}">Edit</button>
             <button class="btn btn-small btn-blue btn-history" data-user="${safeUser}" style="background:#3498db;color:white;">📜 History</button>
           </div>
@@ -541,6 +592,29 @@
     });
   }
 
+  async function preStartCheck(username) {
+    if (!SUPA || !SUPA.isReady()) return true;
+    try {
+      const profiles = await SUPA.pullProfiles();
+      const match = profiles.find(p => p.username === username);
+      if (match && match.isActive && match.activeDeviceId && match.activeDeviceId !== SUPA.getDeviceId()) {
+        const devName = cloudDevices[match.activeDeviceId]?.name || "another device";
+        alert(`Cannot start "${username}".\n\nAlready running on "${devName}".\nStop it there first, or Shift+Click "Force Start".`);
+        return false;
+      }
+    } catch (e) {
+      console.warn("Pre-start check failed:", e.message);
+    }
+    return true;
+  }
+
+  async function forceStartUser(username) {
+    if (SUPA && SUPA.isReady()) {
+      await SUPA.updateProfileStatus(username, "idle", false);
+    }
+    startUser(username);
+  }
+
   function startUser(username) {
     activateUser(username, () => {
       chrome.storage.local.remove("__stopSignal", () => {
@@ -548,6 +622,7 @@
           const statuses = d.userStatuses || {};
           statuses[username] = { ...(statuses[username] || {}), status: "logging_in", updatedAt: new Date().toISOString() };
           chrome.storage.local.set({ userStatuses: statuses, activeAutomationUser: username }, () => {
+            if (SUPA && SUPA.isReady()) SUPA.updateProfileStatus(username, "logging_in", true);
             sendDashboardTelegram("login", `🚀 <b>STARTED</b>\n\n👤 <b>User:</b> ${username}\n🔄 Opening visa site & logging in...`);
             openVisaSite();
           });
@@ -558,6 +633,7 @@
 
   function stopUser(username) {
     sendDashboardTelegram("stopped", `⏹ <b>STOPPED</b>\n\n👤 <b>User:</b> ${username}\n📍 Stopped from dashboard`);
+    if (SUPA && SUPA.isReady()) SUPA.updateProfileStatus(username, "idle", false);
     // Clear persistent automation flag FIRST so page reloads won't restart
     chrome.storage.local.remove("activeAutomationUser");
     // Set a storage flag that the content script checks on its own
@@ -588,6 +664,7 @@
 
   function logoutUser(username) {
     sendDashboardTelegram("logout", `🚪 <b>LOGGED OUT</b>\n\n👤 <b>User:</b> ${username}\n🔒 Session cleared from dashboard\n✅ Ready for next user`);
+    if (SUPA && SUPA.isReady()) SUPA.updateProfileStatus(username, "idle", false);
     chrome.storage.local.remove(["activeAutomationUser", "loginDetails", "securityQuestions"]);
     chrome.storage.local.set({ __stopSignal: Date.now() });
     chrome.tabs.query({}, (tabs) => {
@@ -632,6 +709,113 @@
       a.click();
       URL.revokeObjectURL(url);
     });
+  });
+
+  document.getElementById("export-csv-btn").addEventListener("click", () => {
+    if (!confirm("Export includes passwords in plaintext. Keep the file secure.\n\nContinue?")) return;
+    chrome.storage.local.get(["userProfilesList"], (data) => {
+      const profiles = data.userProfilesList || [];
+      const headers = ["S.No", "Username", "Password", "Dates (From to To)", "Location", "Security Que Ans 1", "Security Que Ans 2", "Security Que Ans 3", "No of Applicants", "Price Agreed", "Category"];
+      const csvEsc = (v) => {
+        const s = String(v ?? "");
+        return s.includes(",") || s.includes('"') || s.includes("\n") ? '"' + s.replace(/"/g, '""') + '"' : s;
+      };
+      const rows = [headers.join(",")];
+      profiles.forEach((p, i) => {
+        const qas = Object.entries(p.securityQuestions || {});
+        const qa1 = qas[0] ? qas[0][0] + ": " + qas[0][1] : "";
+        const qa2 = qas[1] ? qas[1][0] + ": " + qas[1][1] : "";
+        const qa3 = qas[2] ? qas[2][0] + ": " + qas[2][1] : "";
+        const locations = (p.locations || []).join(", ");
+        const dates = (p.startDate && p.endDate) ? p.startDate + " to " + p.endDate : (p.startDate || p.endDate || "");
+        rows.push([
+          i + 1,
+          csvEsc(p.username),
+          csvEsc(p.password),
+          csvEsc(dates),
+          csvEsc(locations),
+          csvEsc(qa1),
+          csvEsc(qa2),
+          csvEsc(qa3),
+          p.applicantCount || 1,
+          p.agreedPrice || "",
+          csvEsc(p.visaType || ""),
+        ].join(","));
+      });
+      const bom = "﻿";
+      const blob = new Blob([bom + rows.join("\n")], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "visa-profiles-" + new Date().toISOString().slice(0, 10) + ".csv";
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  });
+
+  // ─── GOOGLE SHEETS SYNC ────────────────────────────────────────────
+  const SHEETS_ENABLED = typeof SheetsSync !== "undefined";
+
+  async function sheetsAutoSync() {
+    if (!SHEETS_ENABLED) return;
+    try {
+      const connected = await SheetsSync.isConnected();
+      if (!connected) return;
+      const profiles = await new Promise(r => chrome.storage.local.get(["userProfilesList"], d => r(d.userProfilesList || [])));
+      await SheetsSync.fullSync(profiles);
+      console.log("[Dashboard] Auto-synced to Google Sheets");
+    } catch (e) {
+      console.warn("[Dashboard] Sheets auto-sync failed:", e.message);
+    }
+  }
+
+  async function updateSheetsUI() {
+    if (!SHEETS_ENABLED) return;
+    const btn = document.getElementById("sheets-sync-btn");
+    const link = document.getElementById("sheets-link");
+    const urlInput = document.getElementById("sheets-url-input");
+    try {
+      const connected = await SheetsSync.isConnected();
+      if (connected) {
+        btn.textContent = "🔄 Sync Sheets";
+        btn.style.background = "#0f9d58";
+        urlInput.style.display = "none";
+        const sheetId = await SheetsSync.getSpreadsheetId();
+        if (sheetId) {
+          link.href = SheetsSync.getSheetUrl(sheetId);
+          link.style.display = "inline";
+        }
+      } else {
+        btn.textContent = "📊 Sheets Sync";
+        btn.style.background = "#4285f4";
+        link.style.display = "none";
+        urlInput.style.display = "inline-block";
+      }
+    } catch { /* not connected */ }
+  }
+
+  updateSheetsUI();
+
+  document.getElementById("sheets-sync-btn").addEventListener("click", async () => {
+    const btn = document.getElementById("sheets-sync-btn");
+    const urlInput = document.getElementById("sheets-url-input");
+    const origText = btn.textContent;
+    btn.textContent = "Connecting...";
+    btn.disabled = true;
+    try {
+      const sheetUrl = urlInput.value.trim() || null;
+      await SheetsSync.connect(sheetUrl);
+      const profiles = await new Promise(r => chrome.storage.local.get(["userProfilesList"], d => r(d.userProfilesList || [])));
+      btn.textContent = "Syncing...";
+      const sheetId = await SheetsSync.fullSync(profiles);
+      alert(`Synced ${profiles.length} profiles to Google Sheets!`);
+      await updateSheetsUI();
+      window.open(SheetsSync.getSheetUrl(sheetId), "_blank");
+    } catch (e) {
+      alert("Sheets sync failed: " + e.message);
+      btn.textContent = origText;
+    }
+    btn.disabled = false;
   });
 
   document.getElementById("import-btn").addEventListener("click", () => {
@@ -688,6 +872,7 @@
           chrome.storage.local.set(updates, () => {
             alert(`Imported ${profiles.length} profiles successfully!`);
             refresh();
+            scheduleSheetsSync();
           });
         });
       } catch (err) {
@@ -704,7 +889,15 @@
     if (!btn) return;
     const username = btn.dataset.user;
     if (btn.classList.contains("btn-start")) {
-      startUser(username);
+      preStartCheck(username).then(ok => { if (ok) startUser(username); });
+    } else if (btn.classList.contains("btn-force-start")) {
+      const deviceName = btn.dataset.device || "other device";
+      if (!e.shiftKey) {
+        alert(`This user is running on "${deviceName}".\n\nHold Shift + Click to force start.`);
+        return;
+      }
+      if (!confirm(`Force start "${username}"?\n\nThis will mark it as stopped on "${deviceName}" and start it here.`)) return;
+      forceStartUser(username);
     } else if (btn.classList.contains("btn-stop")) {
       stopUser(username);
     } else if (btn.classList.contains("btn-logout")) {
@@ -746,8 +939,45 @@
     }
   }
 
+  let __sheetsSyncTimer = null;
+  function scheduleSheetsSync() {
+    if (__sheetsSyncTimer) clearTimeout(__sheetsSyncTimer);
+    __sheetsSyncTimer = setTimeout(() => { __sheetsSyncTimer = null; sheetsAutoSync(); }, 3000);
+  }
+
+  // ─── TOGGLE LOGS PANEL ─────────────────────────────────────────────
+  const toggleBtn = document.getElementById("toggle-logs-btn");
+  const rightPanel = document.querySelector(".right-panel");
+  const leftPanel = document.querySelector(".left-panel");
+
+  function applyLogsToggle(show) {
+    if (show) {
+      rightPanel.style.display = "";
+      leftPanel.style.flex = "";
+      leftPanel.style.maxWidth = "";
+      toggleBtn.textContent = "Logs ◀";
+    } else {
+      rightPanel.style.display = "none";
+      leftPanel.style.flex = "1 1 100%";
+      leftPanel.style.maxWidth = "100%";
+      toggleBtn.textContent = "Logs ▶";
+    }
+  }
+
+  chrome.storage.local.get(["__dashboardShowLogs"], (d) => {
+    const show = d.__dashboardShowLogs !== false;
+    applyLogsToggle(show);
+  });
+
+  toggleBtn.addEventListener("click", () => {
+    const isHidden = rightPanel.style.display === "none";
+    applyLogsToggle(isHidden);
+    chrome.storage.local.set({ __dashboardShowLogs: isHidden });
+  });
+
   document.getElementById("filter-status").addEventListener("change", refresh);
   document.getElementById("filter-visa")?.addEventListener("change", refresh);
+  document.getElementById("filter-month")?.addEventListener("change", refresh);
   document.getElementById("log-filter-user").addEventListener("change", refresh);
   document.getElementById("log-filter-type").addEventListener("change", refresh);
 
@@ -861,7 +1091,9 @@
 
       // Other fields
       document.getElementById("edit-visa-type").value = profile.visaType || "";
-      document.getElementById("edit-price").value = profile.agreedPrice || "";
+      document.getElementById("edit-applicants").value = profile.applicantCount || 1;
+      document.getElementById("edit-price").value = profile.pricePerPerson || profile.agreedPrice || "";
+      calcTotalPrice();
 
       // Automation
       document.getElementById("edit-auto-login").checked = profile.autoLogin !== false;
@@ -907,7 +1139,9 @@
       endDate: document.getElementById("edit-end-date").value,
       locations,
       visaType: document.getElementById("edit-visa-type").value.trim(),
-      agreedPrice: document.getElementById("edit-price").value.trim(),
+      applicantCount: parseInt(document.getElementById("edit-applicants").value) || 1,
+      pricePerPerson: document.getElementById("edit-price").value.trim(),
+      agreedPrice: String((parseInt(document.getElementById("edit-price").value) || 0) * (parseInt(document.getElementById("edit-applicants").value) || 1)),
       autoLogin: document.getElementById("edit-auto-login").checked,
       autoDashboard: document.getElementById("edit-auto-dashboard").checked,
       autoSelect: document.getElementById("edit-auto-select").checked,
@@ -915,7 +1149,7 @@
       captchaMode,
     };
 
-    chrome.storage.local.get(["userProfilesList"], (data) => {
+    chrome.storage.local.get(["userProfilesList"], async (data) => {
       const profiles = data.userProfilesList || [];
       const idx = profiles.findIndex((p) => p.username === originalUsername);
       if (idx >= 0) {
@@ -923,22 +1157,33 @@
       } else {
         profiles.push(updated);
       }
+      // Write to Supabase first (primary), then local cache
+      const saved = idx >= 0 ? profiles[idx] : updated;
+      if (SUPA && SUPA.isReady()) {
+        try { await SUPA.pushProfile(saved); } catch (e) { console.warn("Supabase push failed:", e.message); }
+      }
       chrome.storage.local.set({ userProfilesList: profiles }, () => {
         closeEditModal();
         refresh();
+        scheduleSheetsSync();
       });
     });
   }
 
-  function deleteProfile() {
+  async function deleteProfile() {
     const username = document.getElementById("edit-original-username").value;
     if (!confirm("Delete profile for \"" + deriveProfileName(username) + "\"?")) return;
 
+    // Delete from Supabase first
+    if (SUPA && SUPA.isReady()) {
+      try { await SUPA.deleteProfile(username); } catch (e) { console.warn("Supabase delete failed:", e.message); }
+    }
     chrome.storage.local.get(["userProfilesList"], (data) => {
       const profiles = (data.userProfilesList || []).filter((p) => p.username !== username);
       chrome.storage.local.set({ userProfilesList: profiles }, () => {
         closeEditModal();
         refresh();
+        scheduleSheetsSync();
       });
     });
   }
@@ -1046,7 +1291,8 @@
     const profile = {
       username: "", password: "", securityQuestions: {},
       startDate: "", endDate: "", locations: [],
-      visaType: "", agreedPrice: "",
+      visaType: "", agreedPrice: "", pricePerPerson: "",
+      applicantCount: 1,
       autoLogin: true, autoDashboard: true, autoSelect: true,
       autoSubmit: false, captchaMode: "auto",
     };
@@ -1093,7 +1339,21 @@
       }
       if (/location|city|consulate|place.*prefer|prefer.*place/i.test(keyLower)) { profile.locations = parseLocations(value); continue; }
       if (/visa|typ.*visa|visa.*typ/i.test(keyLower)) { profile.visaType = value.replace(/\s+/g, "").toUpperCase(); continue; }
-      if (/price|cost|amount|fee|\d+\s*k/i.test(key) || (/agreed|confirm|ok|done/i.test(value) && /\d/.test(key))) { profile.agreedPrice = parsePrice(key + " " + value); continue; }
+      if (/number.*applicant|applicant.*count|no.*of.*applicant|applicants|members|family.*member/i.test(keyLower)) {
+        const num = parseInt(value);
+        if (num > 0) profile.applicantCount = num;
+        continue;
+      }
+      if (/price|cost|amount|fee|\d+\s*k/i.test(key) || (/agreed|confirm|ok|done/i.test(value) && /\d/.test(key))) {
+        const priceStr = parsePrice(key + " " + value);
+        profile.pricePerPerson = priceStr;
+        if (/each|per\s*person|per\s*head|per\s*applicant/i.test(key + " " + value)) {
+          profile.agreedPrice = String((parseInt(priceStr) || 0) * profile.applicantCount);
+        } else {
+          profile.agreedPrice = priceStr;
+        }
+        continue;
+      }
 
       const question = matchSecurityQuestion(key);
       if (question) { profile.securityQuestions[question] = value; continue; }
@@ -1123,7 +1383,9 @@
     }
 
     if (profile.visaType) document.getElementById("edit-visa-type").value = profile.visaType;
-    if (profile.agreedPrice) document.getElementById("edit-price").value = profile.agreedPrice;
+    if (profile.applicantCount) document.getElementById("edit-applicants").value = profile.applicantCount;
+    if (profile.pricePerPerson || profile.agreedPrice) document.getElementById("edit-price").value = profile.pricePerPerson || profile.agreedPrice;
+    calcTotalPrice();
   }
 
   document.getElementById("edit-paste-toggle").addEventListener("click", () => {
@@ -1166,7 +1428,9 @@
     document.getElementById("edit-end-date").value = "";
     document.querySelectorAll("#edit-locations input[type=checkbox]").forEach((cb) => { cb.checked = false; });
     document.getElementById("edit-visa-type").value = "";
+    document.getElementById("edit-applicants").value = "1";
     document.getElementById("edit-price").value = "";
+    document.getElementById("edit-total-price").value = "";
     document.getElementById("edit-auto-login").checked = true;
     document.getElementById("edit-auto-dashboard").checked = true;
     document.getElementById("edit-auto-select").checked = true;
@@ -1276,6 +1540,294 @@
       });
     });
   });
+
+  // ─── SUPABASE PROFILE SYNC ─────────────────────────────────────────
+
+  async function pullCloudProfiles() {
+    if (!SUPA || !SUPA.isReady()) return;
+    if (!SUPA.hasEncryption()) {
+      console.warn("[Dashboard] Skipping cloud pull — no encryption key (enter master password)");
+      return;
+    }
+    try {
+      const [profiles, devices] = await Promise.all([
+        SUPA.pullProfiles(),
+        SUPA.getDevices(),
+      ]);
+      cloudProfiles = profiles;
+      cloudDevices = {};
+      devices.forEach(d => { cloudDevices[d.id] = { name: d.device_name, lastSeen: d.last_seen }; });
+
+      // Auto-cleanup stale active users (device heartbeat older than 10 min)
+      const now = Date.now();
+      for (const cp of cloudProfiles) {
+        if (!cp.isActive || !cp.activeDeviceId) continue;
+        const device = cloudDevices[cp.activeDeviceId];
+        if (!device || !device.lastSeen) continue;
+        const lastSeen = new Date(device.lastSeen).getTime();
+        if (now - lastSeen > STALE_DEVICE_THRESHOLD_MS) {
+          console.log(`[Dashboard] Stale cleanup: "${cp.username}" on "${device.name}" (last seen ${Math.round((now - lastSeen) / 60000)}min ago)`);
+          await SUPA.updateProfileStatus(cp.username, "idle", false);
+          cp.isActive = false;
+          cp.status = "idle";
+        }
+      }
+
+      // Merge cloud profiles into local storage (so booking logic can use them)
+      const localData = await new Promise(r => chrome.storage.local.get(["userProfilesList"], r));
+      let localProfiles = localData.userProfilesList || [];
+
+      const canDecrypt = SUPA.hasEncryption();
+
+      for (const cp of cloudProfiles) {
+        const localProfile = {
+          username: cp.username,
+          autoLogin: cp.autoLogin,
+          autoDashboard: cp.autoDashboard,
+          autoSelect: cp.autoSelect,
+          autoSubmit: cp.autoSubmit,
+          captchaMode: cp.captchaMode,
+          startDate: cp.startDate || "",
+          endDate: cp.endDate || "",
+          locations: cp.locations || [],
+          visaType: cp.visaType || "",
+          agreedPrice: cp.agreedPrice ? String(cp.agreedPrice) : "",
+          applicantCount: cp.applicantCount || 1,
+          pricePerPerson: cp.pricePerPerson ? String(cp.pricePerPerson) : "",
+        };
+        // Only merge password and security questions if decryption is available
+        if (canDecrypt) {
+          localProfile.password = cp.password;
+          localProfile.securityQuestions = {};
+          if (cp.securityQuestions) {
+            cp.securityQuestions.forEach(sq => {
+              if (sq.question && sq.answer) localProfile.securityQuestions[sq.question] = sq.answer;
+            });
+          }
+        }
+        const idx = localProfiles.findIndex(p => p.username === cp.username);
+        if (idx >= 0) localProfiles[idx] = { ...localProfiles[idx], ...localProfile };
+        else localProfiles.push(localProfile);
+      }
+
+      await new Promise(r => chrome.storage.local.set({ userProfilesList: localProfiles }, r));
+      console.log("[Dashboard] Cloud sync: pulled", cloudProfiles.length, "profiles,", devices.length, "devices");
+    } catch (e) {
+      console.warn("[Dashboard] Cloud pull failed:", e.message);
+    }
+  }
+
+  // Poll Supabase every 30s for fresh data
+  let cloudPollTimer = null;
+  function startCloudPolling() {
+    if (cloudPollTimer) clearInterval(cloudPollTimer);
+    pullCloudProfiles().then(() => refresh());
+    cloudPollTimer = setInterval(async () => {
+      await pullCloudProfiles();
+      refresh();
+    }, SUPABASE_POLL_INTERVAL);
+  }
+
+  // ─── TOTAL PRICE CALCULATOR ───────────────────────────────────────
+
+  function calcTotalPrice() {
+    const price = parseInt(document.getElementById("edit-price").value) || 0;
+    const count = parseInt(document.getElementById("edit-applicants").value) || 1;
+    const total = price * count;
+    document.getElementById("edit-total-price").value = total > 0 ? total.toLocaleString("en-IN") : "";
+  }
+
+  document.getElementById("edit-price").addEventListener("input", calcTotalPrice);
+  document.getElementById("edit-applicants").addEventListener("input", calcTotalPrice);
+
+  // ─── CLOUD SYNC (SUPABASE) ────────────────────────────────────────
+
+  const SUPA = typeof SupabaseSync !== "undefined" ? SupabaseSync : null;
+
+  async function updateCloudUI() {
+    const statusEl = document.getElementById("cloud-status");
+    const pullBtn = document.getElementById("cloud-pull-btn");
+    const pushBtn = document.getElementById("cloud-push-btn");
+    const deviceIdEl = document.getElementById("cloud-device-id");
+    const deviceNameInput = document.getElementById("cloud-device-name");
+
+    if (SUPA && SUPA.isReady()) {
+      statusEl.textContent = "Connected";
+      statusEl.style.color = "#81c784";
+      pullBtn.style.display = "inline-block";
+      pushBtn.style.display = "inline-block";
+      deviceIdEl.textContent = SUPA.getDeviceId() || "—";
+      const savedName = await SUPA.getDeviceName();
+      if (savedName && deviceNameInput) deviceNameInput.value = savedName;
+      loadCloudDevices();
+    }
+  }
+
+  async function loadCloudDevices() {
+    if (!SUPA || !SUPA.isReady()) return;
+    const listEl = document.getElementById("cloud-devices-list");
+    try {
+      const devices = await SUPA.getDevices();
+      if (devices.length === 0) { listEl.textContent = "No devices"; return; }
+      const myId = SUPA.getDeviceId();
+      listEl.innerHTML = devices.map(d => {
+        const ago = timeSince(d.last_seen);
+        const isMe = d.id === myId ? ' <span style="color:#3ecf8e;">(this device)</span>' : "";
+        return `<div style="margin-bottom:4px;">• <b>${esc(d.device_name || "Unnamed")}</b>${isMe} — last seen ${ago}</div>`;
+      }).join("");
+    } catch (e) {
+      listEl.textContent = "Error loading devices";
+    }
+  }
+
+  function timeSince(isoStr) {
+    if (!isoStr) return "never";
+    const sec = Math.floor((Date.now() - new Date(isoStr).getTime()) / 1000);
+    if (sec < 60) return "just now";
+    if (sec < 3600) return Math.floor(sec / 60) + "m ago";
+    if (sec < 86400) return Math.floor(sec / 3600) + "h ago";
+    return Math.floor(sec / 86400) + "d ago";
+  }
+
+  // Cloud button → open modal
+  document.getElementById("cloud-btn").addEventListener("click", () => {
+    chrome.storage.local.get(["__supabase_operator_key"], (data) => {
+      if (data.__supabase_operator_key) {
+        document.getElementById("cloud-api-key").value = data.__supabase_operator_key;
+      }
+      document.getElementById("cloud-status").textContent = "";
+      document.getElementById("cloud-modal").style.display = "flex";
+      updateCloudUI();
+    });
+  });
+
+  document.getElementById("cloud-close-btn").addEventListener("click", () => {
+    document.getElementById("cloud-modal").style.display = "none";
+  });
+
+  document.getElementById("cloud-modal").addEventListener("click", (e) => {
+    if (e.target.id === "cloud-modal") document.getElementById("cloud-modal").style.display = "none";
+  });
+
+  // Connect
+  document.getElementById("cloud-connect-btn").addEventListener("click", async () => {
+    const apiKey = document.getElementById("cloud-api-key").value.trim();
+    const masterPw = document.getElementById("cloud-master-pw").value;
+    const statusEl = document.getElementById("cloud-status");
+
+    if (!apiKey) { statusEl.textContent = "Enter API key!"; statusEl.style.color = "#ef5350"; return; }
+    if (!masterPw) { statusEl.textContent = "Enter master password!"; statusEl.style.color = "#ef5350"; return; }
+    if (!SUPA) { statusEl.textContent = "SupabaseSync not loaded"; statusEl.style.color = "#ef5350"; return; }
+
+    // Prompt for device name on first connect
+    const existingDevice = await chrome.storage.local.get(["__supabase_device_id"]);
+    let deviceName = null;
+    if (!existingDevice.__supabase_device_id) {
+      deviceName = prompt("Name this Chrome profile (e.g. Arun-Main, Kavita-Laptop):");
+      if (!deviceName || !deviceName.trim()) { statusEl.textContent = "Device name required!"; statusEl.style.color = "#ef5350"; return; }
+      deviceName = deviceName.trim();
+    }
+
+    statusEl.textContent = "Connecting...";
+    statusEl.style.color = "#ffb74d";
+
+    try {
+      await SUPA.init(apiKey, masterPw, deviceName);
+
+      // Push all existing local profiles
+      const profiles = await new Promise(r => chrome.storage.local.get(["userProfilesList"], d => r(d.userProfilesList || [])));
+      for (const p of profiles) { await SUPA.pushProfile(p); }
+
+      statusEl.textContent = `Connected! ${profiles.length} profiles synced.`;
+      statusEl.style.color = "#81c784";
+      updateCloudUI();
+      startCloudPolling();
+    } catch (e) {
+      statusEl.textContent = "Error: " + e.message;
+      statusEl.style.color = "#ef5350";
+    }
+  });
+
+  // Pull profiles from cloud (manual trigger)
+  document.getElementById("cloud-pull-btn").addEventListener("click", async () => {
+    const statusEl = document.getElementById("cloud-status");
+    if (!SUPA || !SUPA.isReady()) { statusEl.textContent = "Not connected"; statusEl.style.color = "#ef5350"; return; }
+
+    statusEl.textContent = "Pulling...";
+    statusEl.style.color = "#ffb74d";
+
+    try {
+      await pullCloudProfiles();
+      statusEl.textContent = `Pulled ${cloudProfiles.length} profiles!`;
+      statusEl.style.color = "#81c784";
+      refresh();
+      scheduleSheetsSync();
+    } catch (e) {
+      statusEl.textContent = "Pull failed: " + e.message;
+      statusEl.style.color = "#ef5350";
+    }
+  });
+
+  // Push all local data to cloud
+  document.getElementById("cloud-push-btn").addEventListener("click", async () => {
+    const statusEl = document.getElementById("cloud-status");
+    if (!SUPA || !SUPA.isReady()) { statusEl.textContent = "Not connected"; statusEl.style.color = "#ef5350"; return; }
+
+    statusEl.textContent = "Pushing...";
+    statusEl.style.color = "#ffb74d";
+
+    try {
+      const data = await new Promise(r => chrome.storage.local.get(["userProfilesList", "slotHistory", "eventLog"], r));
+
+      // Push profiles
+      const profiles = data.userProfilesList || [];
+      for (const p of profiles) { await SUPA.pushProfile(p); }
+
+      // Push slot history
+      const slots = data.slotHistory || [];
+      if (slots.length > 0) {
+        const slotBatch = slots.map(s => ({
+          username: s.username, location: s.location, date: s.date,
+          action: s.action || "detected", inRange: !!s.inRange,
+          detectedAt: s.foundAt,
+        }));
+        await SUPA.pushSlotBatch(slotBatch);
+      }
+
+      // Push events
+      const events = data.eventLog || [];
+      if (events.length > 0) {
+        for (const e of events) {
+          SUPA.bufferEvent({ type: e.type, message: e.message, username: e.username, timestamp: e.timestamp });
+        }
+        await SUPA.flushEvents();
+      }
+
+      statusEl.textContent = `Pushed! ${profiles.length} profiles, ${slots.length} slots, ${events.length} events`;
+      statusEl.style.color = "#81c784";
+    } catch (e) {
+      statusEl.textContent = "Push failed: " + e.message;
+      statusEl.style.color = "#ef5350";
+    }
+  });
+
+  // Rename device
+  document.getElementById("cloud-rename-btn").addEventListener("click", async () => {
+    const name = document.getElementById("cloud-device-name").value.trim();
+    if (!name || !SUPA || !SUPA.isReady()) return;
+    await SUPA.renameDevice(name);
+    loadCloudDevices();
+  });
+
+  // Auto-connect on dashboard load if already configured
+  if (SUPA) {
+    SUPA.initFromStorage().then(connected => {
+      if (connected) {
+        updateCloudUI();
+        startCloudPolling();
+      }
+    }).catch(() => {});
+  }
 
   refresh();
   setInterval(refresh, REFRESH_INTERVAL);

@@ -2,6 +2,7 @@
   "use strict";
 
   const LOG_PREFIX = "[AutoBook]";
+  const SUPABASE_ENABLED = typeof SupabaseSync !== "undefined";
   const CAPTCHA_MAX_RETRIES = 5;
   const DASHBOARD_CLICK_DELAY = 2000;
   const MAX_EVENT_LOG = 500;
@@ -64,6 +65,10 @@
       __eventFlushTimer = null;
     }
     flushEventLog();
+    // Flush Supabase event buffer
+    if (SUPABASE_ENABLED && SupabaseSync.isReady()) {
+      SupabaseSync.flushEvents();
+    }
   });
 
   function trackEvent(type, message, username, extra) {
@@ -81,6 +86,11 @@
       }, 2000);
     }
     log(`[${type}] ${message}`);
+
+    // Push to Supabase
+    if (SUPABASE_ENABLED && SupabaseSync.isReady()) {
+      SupabaseSync.bufferEvent({ type, message, username: username || "", metadata: extra || null, timestamp: event.timestamp });
+    }
 
     // Auto-increment per-user counters based on event type
     if (username) {
@@ -105,6 +115,11 @@
       };
       chrome.storage.local.set({ userStatuses: statuses });
     });
+    // Sync status to Supabase
+    if (SUPABASE_ENABLED && SupabaseSync.isReady()) {
+      const isActive = ["cycling", "slot_found", "logging_in", "security_questions", "on_dashboard"].includes(status);
+      SupabaseSync.updateProfileStatus(username, status, isActive);
+    }
   }
 
   // Atomic counter increment for per-user metrics
@@ -176,6 +191,17 @@
 
       stats[dayKey] = today;
       chrome.storage.local.set({ dailyStats: stats });
+
+      // Push to Supabase
+      if (SUPABASE_ENABLED && SupabaseSync.isReady()) {
+        SupabaseSync.pushDailyStat({
+          username: username || null,
+          date: dayKey,
+          hour: hour != null ? hour : istHour(),
+          location: location || null,
+          [key]: delta,
+        });
+      }
     });
   }
 
@@ -241,6 +267,15 @@
       // Soft cap (quota prune in sw-enhanced enforces hard cap)
       if (history.length > 1500) history.length = 1500;
       chrome.storage.local.set({ slotHistory: history });
+
+      // Push to Supabase
+      if (SUPABASE_ENABLED && SupabaseSync.isReady()) {
+        SupabaseSync.pushSlot({
+          username: entry.username, location: entry.location, date: entry.date,
+          action: entry.action || "detected", inRange: !!entry.inRange,
+          round: entry.round || null, detectedAt: record.foundAt,
+        });
+      }
     });
   }
 
@@ -257,6 +292,9 @@
         history[idx].action = newAction;
         history[idx].actionAt = new Date().toISOString();
         chrome.storage.local.set({ slotHistory: history });
+        if (SUPABASE_ENABLED && SupabaseSync.isReady()) {
+          SupabaseSync.updateSlotAction(username, location, date, newAction);
+        }
       } else {
         // No prior detected entry — create fresh one with new action
         recordSlotHistory({ username, location, date, action: newAction });
@@ -592,7 +630,13 @@
 
   function saveUserProfiles(profiles) {
     return new Promise((resolve) => {
-      chrome.storage.local.set({ userProfilesList: profiles }, resolve);
+      chrome.storage.local.set({ userProfilesList: profiles }, () => {
+        // Push each profile to Supabase
+        if (SUPABASE_ENABLED && SupabaseSync.isReady()) {
+          profiles.forEach((p) => SupabaseSync.pushProfile(p));
+        }
+        resolve();
+      });
     });
   }
 
@@ -1064,6 +1108,22 @@
           <div id="sp-sync-status" style="font-size:11px;color:#888;margin-top:4px;"></div>
         </div>
 
+        <!-- Supabase Cloud Sync -->
+        <div style="margin-bottom:10px;">
+          <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Cloud Sync (Supabase)</div>
+          <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px;">
+            <input type="text" id="sp-supa-key" placeholder="Operator API Key" style="flex:1;padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:11px;">
+          </div>
+          <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px;">
+            <input type="password" id="sp-supa-master" placeholder="Master Password (for encryption)" style="flex:1;padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:11px;">
+          </div>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <button id="sp-supa-connect" style="background:#3ecf8e;color:white;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;">CONNECT</button>
+            <button id="sp-supa-pull" style="background:#6c5ce7;color:white;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;display:none;">PULL ALL</button>
+            <span id="sp-supa-status" style="font-size:11px;color:#888;"></span>
+          </div>
+        </div>
+
         <!-- Paste Client Message -->
         <div style="margin-bottom:10px;">
           <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Quick Add (Paste Client Message)</div>
@@ -1239,6 +1299,126 @@
       } finally {
         syncBtn.disabled = false;
         syncBtn.textContent = "SYNC";
+      }
+    });
+
+    // Supabase Cloud Sync handlers
+    chrome.storage.local.get(["__supabase_operator_key"], (data) => {
+      if (data.__supabase_operator_key) {
+        const keyInput = document.getElementById("sp-supa-key");
+        if (keyInput) keyInput.value = data.__supabase_operator_key;
+        const statusEl = document.getElementById("sp-supa-status");
+        const pullBtn = document.getElementById("sp-supa-pull");
+        if (statusEl) statusEl.textContent = "Connected";
+        if (statusEl) statusEl.style.color = "#27ae60";
+        if (pullBtn) pullBtn.style.display = "inline-block";
+      }
+    });
+
+    document.getElementById("sp-supa-connect").addEventListener("click", async () => {
+      const keyInput = document.getElementById("sp-supa-key");
+      const masterInput = document.getElementById("sp-supa-master");
+      const statusEl = document.getElementById("sp-supa-status");
+      const pullBtn = document.getElementById("sp-supa-pull");
+      const opKey = keyInput.value.trim();
+      const masterPw = masterInput.value;
+
+      if (!opKey) { statusEl.textContent = "Enter API key!"; statusEl.style.color = "#e74c3c"; return; }
+      if (!masterPw) { statusEl.textContent = "Enter master password!"; statusEl.style.color = "#e74c3c"; return; }
+
+      // Prompt for device name on first connect
+      const existingDevice = await new Promise(r => chrome.storage.local.get(["__supabase_device_id"], r));
+      let deviceName = null;
+      if (!existingDevice.__supabase_device_id) {
+        deviceName = prompt("Name this Chrome profile (e.g. Arun-Main, Kavita-Laptop):");
+        if (!deviceName || !deviceName.trim()) { statusEl.textContent = "Device name required!"; statusEl.style.color = "#e74c3c"; return; }
+        deviceName = deviceName.trim();
+      }
+
+      statusEl.textContent = "Connecting...";
+      statusEl.style.color = "#f39c12";
+
+      try {
+        if (SUPABASE_ENABLED) {
+          await SupabaseSync.init(opKey, masterPw, deviceName);
+          statusEl.textContent = "Connected! Device registered.";
+          statusEl.style.color = "#27ae60";
+          pullBtn.style.display = "inline-block";
+
+          // Push all existing local profiles to Supabase
+          const profiles = await loadUserProfiles();
+          for (const p of profiles) { await SupabaseSync.pushProfile(p); }
+          statusEl.textContent = `Connected! ${profiles.length} profiles synced.`;
+        } else {
+          statusEl.textContent = "SupabaseSync not loaded";
+          statusEl.style.color = "#e74c3c";
+        }
+      } catch (e) {
+        statusEl.textContent = "Error: " + e.message;
+        statusEl.style.color = "#e74c3c";
+      }
+    });
+
+    document.getElementById("sp-supa-pull").addEventListener("click", async () => {
+      const statusEl = document.getElementById("sp-supa-status");
+      if (!SUPABASE_ENABLED || !SupabaseSync.isReady()) {
+        statusEl.textContent = "Not connected";
+        statusEl.style.color = "#e74c3c";
+        return;
+      }
+      statusEl.textContent = "Pulling profiles...";
+      statusEl.style.color = "#f39c12";
+
+      try {
+        const cloudProfiles = await SupabaseSync.pullProfiles();
+        if (cloudProfiles.length === 0) {
+          statusEl.textContent = "No profiles in cloud";
+          statusEl.style.color = "#f39c12";
+          return;
+        }
+
+        // Merge with local: cloud wins on conflict (by username)
+        let localProfiles = await loadUserProfiles();
+        for (const cp of cloudProfiles) {
+          const localProfile = {
+            username: cp.username,
+            password: cp.password,
+            securityQuestions: {},
+            autoLogin: cp.autoLogin,
+            autoDashboard: cp.autoDashboard,
+            autoSelect: cp.autoSelect,
+            autoSubmit: cp.autoSubmit,
+            captchaMode: cp.captchaMode,
+            startDate: cp.startDate || "",
+            endDate: cp.endDate || "",
+            locations: cp.locations || [],
+            visaType: cp.visaType || "",
+            agreedPrice: cp.agreedPrice || "",
+          };
+          // Convert security questions array to object
+          if (cp.securityQuestions) {
+            cp.securityQuestions.forEach((sq) => {
+              if (sq.question && sq.answer) localProfile.securityQuestions[sq.question] = sq.answer;
+            });
+          }
+          const idx = localProfiles.findIndex((p) => p.username === cp.username);
+          if (idx >= 0) localProfiles[idx] = { ...localProfiles[idx], ...localProfile };
+          else localProfiles.push(localProfile);
+        }
+
+        await new Promise((r) => chrome.storage.local.set({ userProfilesList: localProfiles }, r));
+        statusEl.textContent = `Pulled ${cloudProfiles.length} profiles!`;
+        statusEl.style.color = "#27ae60";
+
+        // Refresh dropdown if exists
+        const dropdown = document.getElementById("sp-user-select");
+        if (dropdown) {
+          const currentVal = dropdown.value;
+          await refreshUserDropdown(currentVal);
+        }
+      } catch (e) {
+        statusEl.textContent = "Pull failed: " + e.message;
+        statusEl.style.color = "#e74c3c";
       }
     });
 
@@ -2047,6 +2227,92 @@
   let __session401Detected = false;
   let __rateLimited429 = false;
 
+  // ─── CLOUDFLARE CHALLENGE / "UNABLE TO LOAD" DETECTION ─────────────
+  let __cfChallengeActive = false;    // Turnstile widget detected on page
+  let __unableToLoadCount = 0;        // consecutive "unable to load" alerts
+  let __unableToLoadBackoffMs = 0;    // current backoff for "unable to load"
+  const UNABLE_TO_LOAD_INITIAL_MS = 30000;   // 30s first backoff
+  const UNABLE_TO_LOAD_MAX_MS = 180000;      // 3 min max backoff
+  const UNABLE_TO_LOAD_RESET_AFTER = 300000; // reset counter after 5 min of no alerts
+  let __lastUnableToLoadAt = 0;
+
+  // Detect Cloudflare Turnstile widget on current page
+  // Turnstile renders as: <div class="cf-turnstile"> or iframe src containing challenges.cloudflare.com
+  function detectTurnstileChallenge() {
+    // Check for Turnstile container div
+    if (document.querySelector(".cf-turnstile, #cf-turnstile, [data-sitekey]")) return true;
+    // Check for challenge iframe
+    const iframes = document.querySelectorAll("iframe");
+    for (const f of iframes) {
+      const src = (f.src || "").toLowerCase();
+      if (src.includes("challenges.cloudflare.com") || src.includes("turnstile")) return true;
+    }
+    // Check for challenge-running/challenge-form (CF interstitial)
+    if (document.querySelector("#challenge-running, #challenge-form, #challenge-stage")) return true;
+    // Check for "Verify you are human" text in h2/h3/label
+    const labels = document.querySelectorAll("h2, h3, label, span");
+    for (const el of labels) {
+      if ((el.textContent || "").toLowerCase().includes("verify you are human")) return true;
+    }
+    return false;
+  }
+
+  // Wait for Turnstile challenge to be solved (poll every 2s, max 5 min)
+  async function waitForChallengeSolved(maxWaitMs = 300000) {
+    const start = Date.now();
+    const statusEl = document.getElementById("ab-status");
+    log("Waiting for Cloudflare challenge to be solved...");
+    while (Date.now() - start < maxWaitMs) {
+      if (!cycling.active || __abortAll) return false;
+      const remaining = Math.ceil((maxWaitMs - (Date.now() - start)) / 1000);
+      if (statusEl) statusEl.textContent = `🛡️ Cloudflare challenge — solve manually (${remaining}s timeout)`;
+      await sleep(2000);
+      if (!detectTurnstileChallenge()) {
+        log("Cloudflare challenge cleared!");
+        __cfChallengeActive = false;
+        return true;
+      }
+    }
+    log("Cloudflare challenge wait timed out after " + (maxWaitMs / 1000) + "s");
+    return false;
+  }
+
+  // Handle "unable to load" alert — set flag for cycling loop
+  function onUnableToLoadAlert(alertText) {
+    const now = Date.now();
+    // Reset counter if last alert was >5 min ago
+    if (now - __lastUnableToLoadAt > UNABLE_TO_LOAD_RESET_AFTER) {
+      __unableToLoadCount = 0;
+      __unableToLoadBackoffMs = 0;
+    }
+    __lastUnableToLoadAt = now;
+    __unableToLoadCount++;
+
+    // Progressive backoff: 30s → 60s → 120s → 180s (cap)
+    if (__unableToLoadBackoffMs === 0) {
+      __unableToLoadBackoffMs = UNABLE_TO_LOAD_INITIAL_MS;
+    } else {
+      __unableToLoadBackoffMs = Math.min(__unableToLoadBackoffMs * 2, UNABLE_TO_LOAD_MAX_MS);
+    }
+
+    const waitSec = Math.round(__unableToLoadBackoffMs / 1000);
+    log(`"Unable to load" alert #${__unableToLoadCount} — backoff ${waitSec}s`);
+
+    chrome.storage.local.get(["loginDetails"], (d) => {
+      const u = d.loginDetails?.username || "";
+      trackEvent(EVENT_TYPES.ERROR, `Unable to load appointments — backoff ${waitSec}s (hit #${__unableToLoadCount})`, u);
+      if (__unableToLoadCount >= 2) {
+        sendTelegramNotification("rate",
+          `🟡 <b>UNABLE TO LOAD × ${__unableToLoadCount}</b>\n\n` +
+          `👤 <b>User:</b> ${u}\n` +
+          `⏳ Backoff ${waitSec}s\n` +
+          `⚠️ Cloudflare challenge may follow — keep browser visible\n` +
+          `🔁 Round ${cycling.round}`
+        );
+      }
+    });
+  }
+
   function randomDelay(minSec, maxSec) {
     const ms = (minSec + Math.random() * (maxSec - minSec)) * 1000;
     return sleep(ms);
@@ -2854,6 +3120,64 @@
       // Simulate human activity (mouse, scroll, focus) between location checks
       await simulateHumanActivity();
 
+      // ── Layer 2: Cloudflare Turnstile challenge detection ──
+      if (detectTurnstileChallenge()) {
+        __cfChallengeActive = true;
+        setStatus("🛡️ Cloudflare challenge detected — waiting for manual solve...");
+        log("Turnstile challenge detected — pausing cycling");
+        chrome.storage.local.get(["loginDetails"], (d) => {
+          const u = d.loginDetails?.username || "";
+          trackEvent(EVENT_TYPES.ERROR, `Cloudflare Turnstile challenge detected at round ${cycling.round}`, u);
+          sendTelegramNotification("rate",
+            `🛡️ <b>CLOUDFLARE CHALLENGE</b>\n\n` +
+            `👤 <b>User:</b> ${u}\n` +
+            `⚠️ "Verify you are human" detected\n` +
+            `⏸️ Cycling PAUSED — solve manually\n` +
+            `🔁 Round ${cycling.round}`
+          );
+        });
+        const solved = await waitForChallengeSolved();
+        if (!cycling.active) return;
+        if (!solved) {
+          stopCycling("Cloudflare challenge not solved within timeout");
+          return;
+        }
+        // Challenge solved — add cooldown before resuming
+        setStatus("✅ Challenge solved — resuming in 10s...");
+        await sleep(10000);
+        if (!cycling.active) return;
+        // Reset "unable to load" backoff since user just solved challenge
+        __unableToLoadCount = 0;
+        __unableToLoadBackoffMs = 0;
+        chrome.storage.local.get(["loginDetails"], (d) => {
+          const u = d.loginDetails?.username || "";
+          trackEvent(EVENT_TYPES.SESSION, "Cloudflare challenge solved — cycling resumed", u);
+          sendTelegramNotification("rate", `✅ <b>CHALLENGE SOLVED</b>\n\n👤 <b>User:</b> ${u}\n▶️ Cycling resumed\n🔁 Round ${cycling.round}`);
+        });
+      }
+
+      // ── Layer 1: "Unable to load" backoff ──
+      if (__unableToLoadBackoffMs > 0 && __lastUnableToLoadAt > 0) {
+        const sinceLast = Date.now() - __lastUnableToLoadAt;
+        // Only apply backoff if alert was recent (within backoff window)
+        if (sinceLast < __unableToLoadBackoffMs + 5000) {
+          const waitSec = Math.round(__unableToLoadBackoffMs / 1000);
+          setStatus(`⚠️ "Unable to load" — cooling down ${waitSec}s...`);
+          log(`Unable to load backoff: ${waitSec}s (hit #${__unableToLoadCount})`);
+          for (let s = waitSec; s > 0; s--) {
+            if (!cycling.active || __abortAll) return;
+            setStatus(`⚠️ "Unable to load" — cooling down ${s}s...`);
+            await sleep(1000);
+          }
+          // Check for Turnstile after cooldown (challenge often appears during wait)
+          if (detectTurnstileChallenge()) {
+            continue; // loop back — Turnstile check at top of next iteration handles it
+          }
+          // Clear the timestamp so we don't re-trigger same backoff
+          __lastUnableToLoadAt = 0;
+        }
+      }
+
       // Check for 429 rate limit — exponential backoff
       if (__rateLimited429) {
         __rateLimited429 = false;
@@ -2893,6 +3217,11 @@
 
       const data = await dataPromise;
 
+      // Check for Turnstile after data fetch
+      if (detectTurnstileChallenge()) {
+        continue; // loop back — Turnstile handler at top of next iteration
+      }
+
       // Check for 429 after data fetch
       if (__rateLimited429) {
         __rateLimited429 = false;
@@ -2911,6 +3240,12 @@
 
       // Reset backoff on successful request
       cycling.backoffMs = 0;
+      // Reset "unable to load" counter on success
+      if (__unableToLoadCount > 0) {
+        log(`Successful fetch — resetting "unable to load" counter (was ${__unableToLoadCount})`);
+        __unableToLoadCount = 0;
+        __unableToLoadBackoffMs = 0;
+      }
 
       // Check for 401 / session expiry
       if (isSessionExpired()) {
@@ -3019,11 +3354,21 @@
         outOfRangeText += `${month}: ${days.sort((a, b) => a - b).join(", ")}\n`;
       }
 
-      // Send Telegram overview
-      chrome.storage.local.get(["loginDetails"], (d) => {
+      // Send Telegram overview with user context
+      chrome.storage.local.get(["loginDetails", "userProfilesList", "__supabase_device_name"], (d) => {
         const u = d.loginDetails?.username || "";
+        const profile = (d.userProfilesList || []).find(p => p.username === u) || {};
+        const deviceName = d.__supabase_device_name || "Unknown";
+        const applicants = profile.applicantCount || 1;
+        const visaType = profile.visaType || "";
         const msg =
-          `📍 <b>SLOTS OVERVIEW: ${loc.name}</b>\n` +
+          `📍 <b>SLOTS OVERVIEW: ${loc.name}</b>\n\n` +
+          `👤 <b>User:</b> ${u}\n` +
+          `💻 <b>Device:</b> ${deviceName}\n` +
+          `📆 <b>Date Range:</b> ${startDate || "—"} to ${endDate || "—"}\n` +
+          `👥 <b>Applicants:</b> ${applicants}\n` +
+          (visaType ? `🎫 <b>Visa:</b> ${visaType}\n` : "") +
+          `🔄 <b>Round:</b> ${cycling.round} | <b>Cycle:</b> ${i + 1}/${locations.length} locations\n\n` +
           `📅 <b>Available:</b> ${data.ScheduleDays.length} dates\n\n` +
           `✅ <b>IN RANGE (${inRange.length}):</b>\n` +
           (inRangeText || "None\n") +
@@ -3527,6 +3872,11 @@
   // ─── MAIN ROUTER ───────────────────────────────────────────────────
 
   async function init() {
+    // Initialize Supabase sync from stored config
+    if (SUPABASE_ENABLED) {
+      try { await SupabaseSync.initFromStorage(); } catch (e) { console.warn("[AutoBook] Supabase init skipped:", e.message); }
+    }
+
     const settings = await getSettings();
     const path = window.location.pathname.toLowerCase();
     const host = window.location.hostname.toLowerCase();
@@ -3544,8 +3894,17 @@
 
       // Listen for auto-dismissed alerts (from alert-override.js MAIN world script)
       document.addEventListener("__abAlertDismissed", (e) => {
+        const msg = (e.detail || "").toLowerCase();
         log("Alert auto-dismissed: " + e.detail);
         const activeUser = settings.loginDetails?.username || "";
+
+        // Detect "Unable to load appointment available days" → trigger backoff
+        if (msg.includes("unable to load") || msg.includes("could not load") || msg.includes("failed to load")) {
+          onUnableToLoadAlert(e.detail);
+          trackEvent(EVENT_TYPES.ERROR, "Alert (unable to load): " + e.detail, activeUser);
+          return; // skip generic Telegram — onUnableToLoadAlert sends its own after 2nd hit
+        }
+
         trackEvent(EVENT_TYPES.ERROR, "Alert dismissed: " + e.detail, activeUser);
         sendTelegramNotification("error", `⚠️ <b>ALERT DISMISSED</b>\n\n👤 <b>User:</b> ${activeUser}\n📋 ${e.detail}`);
       });
@@ -3564,6 +3923,29 @@
       log("Cloudflare block detected on page load");
       trackEvent(EVENT_TYPES.ERROR, "Cloudflare block detected (Error 1015 / 429) on page load", cfUser);
       sendTelegramNotification("error", `🛡️ <b>CLOUDFLARE BLOCKED</b>\n\n👤 <b>User:</b> ${cfUser}\n⚠️ Rate limited by Cloudflare on page load\n💡 Wait a few minutes before retrying`);
+      return;
+    }
+
+    // Turnstile challenge on page load — wait for manual solve then reload
+    if (host.includes("usvisascheduling.com") && detectTurnstileChallenge()) {
+      const cfUser = settings.loginDetails?.username || activeAutoUser || "";
+      log("Turnstile challenge detected on page load — waiting for solve");
+      __cfChallengeActive = true;
+      trackEvent(EVENT_TYPES.ERROR, "Cloudflare Turnstile challenge on page load", cfUser);
+      sendTelegramNotification("rate",
+        `🛡️ <b>CLOUDFLARE CHALLENGE (page load)</b>\n\n` +
+        `👤 <b>User:</b> ${cfUser}\n` +
+        `⚠️ "Verify you are human" on page load\n` +
+        `⏸️ Waiting for manual solve...`
+      );
+      const solved = await waitForChallengeSolved();
+      if (solved) {
+        log("Challenge solved on page load — reloading");
+        trackEvent(EVENT_TYPES.SESSION, "Turnstile solved on page load — reloading", cfUser);
+        sendTelegramNotification("rate", `✅ <b>CHALLENGE SOLVED</b>\n\n👤 <b>User:</b> ${cfUser}\n🔄 Reloading page...`);
+        await sleep(2000);
+        window.location.reload();
+      }
       return;
     }
 
@@ -3845,6 +4227,9 @@
           history[idx].action = "confirmed";
           history[idx].confirmedAt = new Date().toISOString();
           chrome.storage.local.set({ slotHistory: history });
+          if (SUPABASE_ENABLED && SupabaseSync.isReady()) {
+            SupabaseSync.updateSlotAction(routerUser, history[idx].location, history[idx].date, "confirmed");
+          }
         }
       });
       sendTelegramNotification("confirmed", `✅ <b>BOOKING CONFIRMED</b>\n\n👤 <b>User:</b> ${routerUser}\n🎉 Appointment confirmation page reached!`);
