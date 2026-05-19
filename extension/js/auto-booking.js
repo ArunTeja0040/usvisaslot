@@ -2231,9 +2231,9 @@
   let __cfChallengeActive = false;    // Turnstile widget detected on page
   let __unableToLoadCount = 0;        // consecutive "unable to load" alerts
   let __unableToLoadBackoffMs = 0;    // current backoff for "unable to load"
-  const UNABLE_TO_LOAD_INITIAL_MS = 30000;   // 30s first backoff
-  const UNABLE_TO_LOAD_MAX_MS = 180000;      // 3 min max backoff
-  const UNABLE_TO_LOAD_RESET_AFTER = 300000; // reset counter after 5 min of no alerts
+  const UNABLE_TO_LOAD_INITIAL_MS = 60000;   // 60s first backoff (was 30s)
+  const UNABLE_TO_LOAD_MAX_MS = 300000;      // 5 min max backoff (was 3 min)
+  const UNABLE_TO_LOAD_RESET_AFTER = 600000; // reset counter after 10 min of no alerts (was 5 min)
   let __lastUnableToLoadAt = 0;
 
   // Detect Cloudflare Turnstile widget on current page
@@ -2311,6 +2311,164 @@
         );
       }
     });
+  }
+
+  // ─── REQUEST RATE TRACKER ────────────────────────────────────────────
+  const RATE_CAP_PER_MINUTE = 6;           // max requests per 60s window
+  const RATE_SOFT_THRESHOLD = 4;           // add extra delay above this
+  const RATE_FLUSH_INTERVAL_MS = 60000;    // push stats to Supabase every 60s
+  const ERROR_1015_INITIAL_MS = 300000;    // 5 min first backoff for Error 1015
+  const ERROR_1015_MAX_MS = 900000;        // 15 min max for Error 1015
+
+  const requestTracker = {
+    log: [],                // [{timestamp, location, status, delaySec}] — flushed to Supabase
+    rateWindow: [],         // [{timestamp}] — kept for rate cap calculation (not flushed)
+    flushTimer: null,       // interval ID for periodic Supabase push
+    lastFlushAt: 0,
+    error1015BackoffMs: 0,  // separate backoff for Error 1015 page
+  };
+
+  // Record a request in the tracker
+  function trackApiRequest(location, status, delaySec) {
+    const now = Date.now();
+    requestTracker.log.push({
+      timestamp: now,
+      location: location || "unknown",
+      status: status || "success",
+      delaySec: delaySec || 0,
+    });
+    // Also push to rate window (separate from flush)
+    requestTracker.rateWindow.push(now);
+    // Trim rate window to last 2 minutes
+    const cutoff = now - 120000;
+    requestTracker.rateWindow = requestTracker.rateWindow.filter(t => t > cutoff);
+    log(`[RateTracker] ${status} @ ${location} (${(delaySec || 0).toFixed(1)}s) — ${getRateDisplay()}`);
+  }
+
+  // Count requests in last N seconds (uses rateWindow, not log)
+  function getRequestsInWindow(seconds) {
+    const cutoff = Date.now() - (seconds * 1000);
+    return requestTracker.rateWindow.filter(t => t > cutoff).length;
+  }
+
+  // Rate cap check — returns ms to wait (0 if under cap)
+  function getRateCapWaitMs() {
+    const count = getRequestsInWindow(60);
+    if (count >= RATE_CAP_PER_MINUTE) {
+      const cutoff = Date.now() - 60000;
+      const windowEntries = requestTracker.rateWindow.filter(t => t > cutoff);
+      if (windowEntries.length === 0) return 0;
+      const oldest = Math.min(...windowEntries);
+      return (oldest + 60000) - Date.now() + 1000; // +1s buffer
+    }
+    return 0;
+  }
+
+  // Extra delay when approaching rate cap
+  function getSoftThrottleDelaySec() {
+    const count = getRequestsInWindow(60);
+    if (count >= RATE_SOFT_THRESHOLD && count < RATE_CAP_PER_MINUTE) {
+      return 5 + Math.random() * 5; // 5-10s extra
+    }
+    return 0;
+  }
+
+  // Get current rate string for status display
+  function getRateDisplay() {
+    const count = getRequestsInWindow(60);
+    if (count >= RATE_CAP_PER_MINUTE) return `🔴 Rate: ${count}/${RATE_CAP_PER_MINUTE}/min`;
+    if (count >= RATE_SOFT_THRESHOLD) return `⚠️ Rate: ${count}/${RATE_CAP_PER_MINUTE}/min`;
+    return `Rate: ${count}/${RATE_CAP_PER_MINUTE}/min`;
+  }
+
+  // Flush request stats to Supabase (called every 60s)
+  async function flushRequestStats() {
+    const now = Date.now();
+    const periodStart = requestTracker.lastFlushAt || (now - RATE_FLUSH_INTERVAL_MS);
+    const periodEnd = now;
+
+    // Get ALL entries currently in log (don't filter by time — they may have been trimmed)
+    const entries = requestTracker.log.splice(0); // take all + clear
+    if (entries.length === 0) {
+      requestTracker.lastFlushAt = now;
+      return;
+    }
+
+    const total = entries.length;
+    const successful = entries.filter(e => e.status === "success").length;
+    const blocked = total - successful;
+    const avgDelay = entries.reduce((s, e) => s + (e.delaySec || 0), 0) / total;
+    const locations = [...new Set(entries.map(e => e.location))];
+
+    // Count error types
+    const errorTypes = {};
+    entries.forEach(e => {
+      if (e.status !== "success") {
+        errorTypes[e.status] = (errorTypes[e.status] || 0) + 1;
+      }
+    });
+
+    log(`Request stats (local): ${total} total, ${successful} ok, ${blocked} blocked, locations: ${locations.join(", ")}`);
+
+    try {
+      const stored = await new Promise(r => chrome.storage.local.get(["loginDetails", "__supabase_device_name"], d => r(d)));
+      const deviceName = stored.__supabase_device_name || "Unknown";
+      const username = stored.loginDetails?.username || "";
+
+      const SB_REST = "https://sbuaojiamicreyysvnqj.supabase.co/rest/v1";
+      const SB_KEY = "sb_publishable_OrTLSVqVljSOoIeUZIoIcw_O0udxgyq";
+
+      const resp = await fetch(`${SB_REST}/request_stats`, {
+        method: "POST",
+        headers: {
+          "apikey": SB_KEY,
+          "Authorization": "Bearer " + SB_KEY,
+          "Content-Type": "application/json",
+          "Prefer": "return=minimal",
+        },
+        body: JSON.stringify({
+          device_name: deviceName,
+          username: username,
+          period_start: new Date(periodStart).toISOString(),
+          period_end: new Date(periodEnd).toISOString(),
+          total_requests: total,
+          successful_requests: successful,
+          blocked_requests: blocked,
+          avg_delay_sec: Math.round(avgDelay * 10) / 10,
+          locations_checked: `{${locations.join(",")}}`,
+          error_types: errorTypes,
+        }),
+      });
+      if (resp.ok) {
+        log(`Request stats pushed to Supabase: ${total} total, ${blocked} blocked`);
+      } else {
+        const errText = await resp.text();
+        log(`Request stats flush failed: ${resp.status} — ${errText}`);
+      }
+    } catch (err) {
+      log(`Request stats flush error: ${err.message}`);
+    }
+
+    requestTracker.lastFlushAt = now;
+  }
+
+  // Start periodic stats flush (call when cycling starts)
+  function startRequestStatsFlush() {
+    stopRequestStatsFlush();
+    requestTracker.lastFlushAt = Date.now();
+    requestTracker.log = [];
+    requestTracker.flushTimer = setInterval(flushRequestStats, RATE_FLUSH_INTERVAL_MS);
+    log("Request stats flush timer started (every 60s)");
+  }
+
+  // Stop periodic stats flush (call when cycling stops)
+  function stopRequestStatsFlush() {
+    if (requestTracker.flushTimer) {
+      clearInterval(requestTracker.flushTimer);
+      requestTracker.flushTimer = null;
+    }
+    // Final flush
+    flushRequestStats();
   }
 
   function randomDelay(minSec, maxSec) {
@@ -2598,6 +2756,7 @@
     });
     cycling.active = true;
     cycling.round = 0;
+    startRequestStatsFlush(); // Start rate tracking
     const locs = Array.from(checked).map((cb) => cb.dataset.name || cb.value).join(", ");
     const startDate = document.getElementById("ab-start-date")?.value || "—";
     const endDate = document.getElementById("ab-end-date")?.value || "—";
@@ -2746,6 +2905,7 @@
       fastIntervalMs: GRACE_PERIOD_INTERVAL_MS, missedDate: null,
     };
     stopKeepAlive();
+    stopRequestStatsFlush(); // Flush final stats + stop timer
 
     const startBtn = document.getElementById("ab-start-btn");
     const stopBtn = document.getElementById("ab-stop-btn");
@@ -3157,31 +3317,51 @@
       }
 
       // ── Layer 1: "Unable to load" backoff ──
-      if (__unableToLoadBackoffMs > 0 && __lastUnableToLoadAt > 0) {
-        const sinceLast = Date.now() - __lastUnableToLoadAt;
-        // Only apply backoff if alert was recent (within backoff window)
-        if (sinceLast < __unableToLoadBackoffMs + 5000) {
-          const waitSec = Math.round(__unableToLoadBackoffMs / 1000);
-          setStatus(`⚠️ "Unable to load" — cooling down ${waitSec}s...`);
-          log(`Unable to load backoff: ${waitSec}s (hit #${__unableToLoadCount})`);
-          for (let s = waitSec; s > 0; s--) {
-            if (!cycling.active || __abortAll) return;
-            setStatus(`⚠️ "Unable to load" — cooling down ${s}s...`);
-            await sleep(1000);
-          }
-          // Check for Turnstile after cooldown (challenge often appears during wait)
-          if (detectTurnstileChallenge()) {
-            continue; // loop back — Turnstile check at top of next iteration handles it
-          }
-          // Clear the timestamp so we don't re-trigger same backoff
-          __lastUnableToLoadAt = 0;
+      if (__unableToLoadBackoffMs > 0 && __unableToLoadCount > 0) {
+        const waitSec = Math.round(__unableToLoadBackoffMs / 1000);
+        setStatus(`⚠️ "Unable to load" × ${__unableToLoadCount} — cooling down ${waitSec}s...`);
+        log(`Unable to load backoff: ${waitSec}s (hit #${__unableToLoadCount})`);
+        for (let s = waitSec; s > 0; s--) {
+          if (!cycling.active || __abortAll) return;
+          setStatus(`⚠️ "Unable to load" × ${__unableToLoadCount} — cooling down ${s}s...`);
+          await sleep(1000);
+        }
+        // Backoff served — clear backoffMs but KEEP count (so next alert escalates)
+        __unableToLoadBackoffMs = 0;
+        // Check for Turnstile after cooldown
+        if (detectTurnstileChallenge()) {
+          continue;
+        }
+      }
+
+      // ── Rate cap: wait if we've hit max requests/minute ──
+      const rateWaitMs = getRateCapWaitMs();
+      if (rateWaitMs > 0) {
+        const rateWaitSec = Math.ceil(rateWaitMs / 1000);
+        log(`Rate cap reached (${getRequestsInWindow(60)}/${RATE_CAP_PER_MINUTE}/min) — waiting ${rateWaitSec}s`);
+        for (let s = rateWaitSec; s > 0; s--) {
+          if (!cycling.active || __abortAll) return;
+          setStatus(`🔴 Rate cap reached — cooling ${s}s... | ${getRateDisplay()}`);
+          await sleep(1000);
+        }
+      }
+
+      // ── Soft throttle: add extra delay when approaching cap ──
+      const softDelay = getSoftThrottleDelaySec();
+      if (softDelay > 0) {
+        const sdSec = Math.ceil(softDelay);
+        log(`Soft throttle: adding ${sdSec}s extra delay (${getRequestsInWindow(60)}/${RATE_CAP_PER_MINUTE}/min)`);
+        for (let s = sdSec; s > 0; s--) {
+          if (!cycling.active || __abortAll) return;
+          setStatus(`⚠️ Slowing down ${s}s... | ${getRateDisplay()}`);
+          await sleep(1000);
         }
       }
 
       // Check for 429 rate limit — exponential backoff
       if (__rateLimited429) {
         __rateLimited429 = false;
-        cycling.backoffMs = cycling.backoffMs ? Math.min(cycling.backoffMs * 2, 300000) : 60000;
+        cycling.backoffMs = cycling.backoffMs ? Math.min(cycling.backoffMs * 2, 600000) : 120000;
         const waitSec = Math.round(cycling.backoffMs / 1000);
         setStatus(`Rate limited (429)! Pausing ${waitSec}s...`);
         log(`Backoff: waiting ${waitSec}s before resuming`);
@@ -3197,7 +3377,7 @@
       }
 
       const loc = locations[i];
-      setStatus(`Checking ${loc.name} (${i + 1}/${locations.length})...`);
+      setStatus(`Checking ${loc.name} (${i + 1}/${locations.length})... | ${getRateDisplay()}`);
 
       const select = document.getElementById("post_select");
       if (!select) {
@@ -3215,17 +3395,27 @@
         select.dispatchEvent(new Event("change", { bubbles: true }));
       }
 
+      const fetchStartMs = Date.now();
       const data = await dataPromise;
+      const fetchDelaySec = (Date.now() - fetchStartMs) / 1000;
 
       // Check for Turnstile after data fetch
       if (detectTurnstileChallenge()) {
-        continue; // loop back — Turnstile handler at top of next iteration
+        trackApiRequest(loc.name, "blocked", fetchDelaySec);
+        continue;
+      }
+
+      // Check if "unable to load" alert fired during fetch
+      if (__unableToLoadBackoffMs > 0) {
+        trackApiRequest(loc.name, "unable_to_load", fetchDelaySec);
+        continue; // loop back — backoff check at top of next iteration handles it
       }
 
       // Check for 429 after data fetch
       if (__rateLimited429) {
+        trackApiRequest(loc.name, "429", fetchDelaySec);
         __rateLimited429 = false;
-        cycling.backoffMs = cycling.backoffMs ? Math.min(cycling.backoffMs * 2, 300000) : 60000;
+        cycling.backoffMs = cycling.backoffMs ? Math.min(cycling.backoffMs * 2, 600000) : 120000;
         const waitSec = Math.round(cycling.backoffMs / 1000);
         setStatus(`Rate limited (429)! Pausing ${waitSec}s...`);
         chrome.storage.local.get(["loginDetails"], (d) => {
@@ -3237,6 +3427,9 @@
         if (!cycling.active) return;
         continue; // retry this round
       }
+
+      // Track successful request
+      trackApiRequest(loc.name, "success", fetchDelaySec);
 
       // Reset backoff on successful request
       cycling.backoffMs = 0;
@@ -3917,12 +4110,37 @@
       return;
     }
 
-    // Cloudflare block detection on page load
+    // Cloudflare block detection on page load — wait with backoff then reload
     if (host.includes("usvisascheduling.com") && isCloudflareBlocked()) {
       const cfUser = settings.loginDetails?.username || activeAutoUser || "";
-      log("Cloudflare block detected on page load");
-      trackEvent(EVENT_TYPES.ERROR, "Cloudflare block detected (Error 1015 / 429) on page load", cfUser);
-      sendTelegramNotification("error", `🛡️ <b>CLOUDFLARE BLOCKED</b>\n\n👤 <b>User:</b> ${cfUser}\n⚠️ Rate limited by Cloudflare on page load\n💡 Wait a few minutes before retrying`);
+      log("Cloudflare block (Error 1015) detected on page load");
+
+      // Progressive backoff for Error 1015
+      requestTracker.error1015BackoffMs = requestTracker.error1015BackoffMs
+        ? Math.min(requestTracker.error1015BackoffMs * 2, ERROR_1015_MAX_MS)
+        : ERROR_1015_INITIAL_MS;
+      const waitSec = Math.round(requestTracker.error1015BackoffMs / 1000);
+
+      trackEvent(EVENT_TYPES.ERROR, `Cloudflare Error 1015 — waiting ${waitSec}s before reload`, cfUser);
+      trackApiRequest("page_load", "1015", 0);
+      sendTelegramNotification("error",
+        `🛡️ <b>CLOUDFLARE ERROR 1015</b>\n\n` +
+        `👤 <b>User:</b> ${cfUser}\n` +
+        `⚠️ Rate limited by Cloudflare\n` +
+        `⏳ Waiting ${waitSec}s before retry\n` +
+        `💡 Retrying after ban won't make it worse — we wait it out`
+      );
+
+      // Countdown wait — visible in any injected status element
+      for (let s = waitSec; s > 0; s--) {
+        const m = Math.floor(s / 60);
+        const r = s % 60;
+        const statusEl = document.getElementById("ab-status");
+        if (statusEl) statusEl.textContent = `🛡️ Cloudflare blocked — retrying in ${m}m ${r}s...`;
+        await sleep(1000);
+      }
+      log("Error 1015 wait complete — reloading page");
+      window.location.reload();
       return;
     }
 
