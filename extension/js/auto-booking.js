@@ -1120,6 +1120,7 @@
           <div style="display:flex;gap:6px;align-items:center;">
             <button id="sp-supa-connect" style="background:#3ecf8e;color:white;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;">CONNECT</button>
             <button id="sp-supa-pull" style="background:#6c5ce7;color:white;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;display:none;">PULL ALL</button>
+            <button id="sp-supa-delete" style="background:#e74c3c;color:white;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;display:none;">DELETE DEVICE</button>
             <span id="sp-supa-status" style="font-size:11px;color:#888;"></span>
           </div>
         </div>
@@ -1309,9 +1310,11 @@
         if (keyInput) keyInput.value = data.__supabase_operator_key;
         const statusEl = document.getElementById("sp-supa-status");
         const pullBtn = document.getElementById("sp-supa-pull");
+        const deleteBtn = document.getElementById("sp-supa-delete");
         if (statusEl) statusEl.textContent = "Connected";
         if (statusEl) statusEl.style.color = "#27ae60";
         if (pullBtn) pullBtn.style.display = "inline-block";
+        if (deleteBtn) deleteBtn.style.display = "inline-block";
       }
     });
 
@@ -1344,6 +1347,7 @@
           statusEl.textContent = "Connected! Device registered.";
           statusEl.style.color = "#27ae60";
           pullBtn.style.display = "inline-block";
+          document.getElementById("sp-supa-delete").style.display = "inline-block";
 
           // Push all existing local profiles to Supabase
           const profiles = await loadUserProfiles();
@@ -1418,6 +1422,38 @@
         }
       } catch (e) {
         statusEl.textContent = "Pull failed: " + e.message;
+        statusEl.style.color = "#e74c3c";
+      }
+    });
+
+    document.getElementById("sp-supa-delete").addEventListener("click", async () => {
+      const statusEl = document.getElementById("sp-supa-status");
+      const pullBtn = document.getElementById("sp-supa-pull");
+      const deleteBtn = document.getElementById("sp-supa-delete");
+
+      if (!SUPABASE_ENABLED) {
+        statusEl.textContent = "SupabaseSync not loaded";
+        statusEl.style.color = "#e74c3c";
+        return;
+      }
+
+      const confirmed = confirm("Are you sure? This will remove this device from Supabase cloud and clear all local sync data. You can re-register after.");
+      if (!confirmed) return;
+
+      statusEl.textContent = "Deleting device...";
+      statusEl.style.color = "#f39c12";
+
+      try {
+        await SupabaseSync.deleteDevice();
+        statusEl.textContent = "Device deleted. Click CONNECT to re-register.";
+        statusEl.style.color = "#e74c3c";
+        pullBtn.style.display = "none";
+        deleteBtn.style.display = "none";
+        // Clear key/password inputs
+        document.getElementById("sp-supa-key").value = "";
+        document.getElementById("sp-supa-master").value = "";
+      } catch (e) {
+        statusEl.textContent = "Delete failed: " + e.message;
         statusEl.style.color = "#e74c3c";
       }
     });
@@ -2229,12 +2265,6 @@
 
   // ─── CLOUDFLARE CHALLENGE / "UNABLE TO LOAD" DETECTION ─────────────
   let __cfChallengeActive = false;    // Turnstile widget detected on page
-  let __unableToLoadCount = 0;        // consecutive "unable to load" alerts
-  let __unableToLoadBackoffMs = 0;    // current backoff for "unable to load"
-  const UNABLE_TO_LOAD_INITIAL_MS = 30000;   // 30s first backoff
-  const UNABLE_TO_LOAD_MAX_MS = 180000;      // 3 min max backoff
-  const UNABLE_TO_LOAD_RESET_AFTER = 300000; // reset counter after 5 min of no alerts
-  let __lastUnableToLoadAt = 0;
 
   // Detect Cloudflare Turnstile widget on current page
   // Turnstile renders as: <div class="cf-turnstile"> or iframe src containing challenges.cloudflare.com
@@ -2277,38 +2307,89 @@
     return false;
   }
 
-  // Handle "unable to load" alert — set flag for cycling loop
+  // Handle "unable to load" alert — stop cycling, cooldown, navigate to dashboard
+  let __reentryCount = 0;  // tracks how many dashboard re-entries
+  const REENTRY_COOLDOWN_MS = 60000; // 60s flat cooldown before re-entry
+
   function onUnableToLoadAlert(alertText) {
-    const now = Date.now();
-    // Reset counter if last alert was >5 min ago
-    if (now - __lastUnableToLoadAt > UNABLE_TO_LOAD_RESET_AFTER) {
-      __unableToLoadCount = 0;
-      __unableToLoadBackoffMs = 0;
-    }
-    __lastUnableToLoadAt = now;
-    __unableToLoadCount++;
+    // Prevent multiple triggers from same round (multiple locations fail)
+    if (window.__unableToLoadHandling) return;
+    window.__unableToLoadHandling = true;
 
-    // Progressive backoff: 30s → 60s → 120s → 180s (cap)
-    if (__unableToLoadBackoffMs === 0) {
-      __unableToLoadBackoffMs = UNABLE_TO_LOAD_INITIAL_MS;
-    } else {
-      __unableToLoadBackoffMs = Math.min(__unableToLoadBackoffMs * 2, UNABLE_TO_LOAD_MAX_MS);
-    }
+    __reentryCount++;
+    const roundsCompleted = cycling.round;
+    const cooldownSec = Math.round(REENTRY_COOLDOWN_MS / 1000);
 
-    const waitSec = Math.round(__unableToLoadBackoffMs / 1000);
-    log(`"Unable to load" alert #${__unableToLoadCount} — backoff ${waitSec}s`);
+    log(`"Unable to load" — re-entry #${__reentryCount}, ran ${roundsCompleted} rounds. Cooldown ${cooldownSec}s then navigate to dashboard.`);
+
+    // Stop cycling immediately
+    if (cycling.active) stopCycling("Unable to load — navigating to dashboard");
+
+    chrome.storage.local.get(["loginDetails"], async (d) => {
+      const u = d.loginDetails?.username || "";
+      trackEvent(EVENT_TYPES.ERROR, `Unable to load — re-entry #${__reentryCount}, ${roundsCompleted} rounds, cooldown ${cooldownSec}s`, u);
+      sendTelegramNotification("rate",
+        `⚠️ <b>UNABLE TO LOAD</b>\n\n` +
+        `👤 <b>User:</b> ${u}\n` +
+        `🔁 Ran <b>${roundsCompleted}</b> rounds before error\n` +
+        `🔄 Re-entry attempt: <b>${__reentryCount}</b>\n` +
+        `⏳ Cooling down <b>${cooldownSec}s</b> → navigating to dashboard`
+      );
+
+      // Countdown cooldown
+      for (let s = cooldownSec; s > 0; s--) {
+        if (__abortAll) { window.__unableToLoadHandling = false; return; }
+        setStatus(`⚠️ Unable to load — cooling down ${s}s before dashboard re-entry...`);
+        await sleep(1000);
+      }
+
+      // Save cycling state for auto-resume (fresh round count)
+      const state = {
+        active: true,
+        round: 0,  // fresh start
+        startDate: document.getElementById("ab-start-date")?.value || "",
+        endDate: document.getElementById("ab-end-date")?.value || "",
+        interval: document.getElementById("ab-interval")?.value || "30",
+        locations: Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map(cb => cb.value),
+        timestamp: Date.now(),
+        reentryCount: __reentryCount,
+      };
+      sessionStorage.setItem("ab-cycling-state", JSON.stringify(state));
+
+      // Navigate to dashboard — auto-click Reschedule → Continue → back to OFC/schedule
+      window.__unableToLoadHandling = false;
+      window.location.href = window.location.origin + "/en-US/";
+    });
+  }
+
+  // Handle severe errors (429, Error 1015, Cloudflare blocked) — auto-logout
+  function handleSevereError(reason) {
+    log(`Severe error: ${reason} — auto-logging out`);
+    if (cycling.active) stopCycling(`${reason} — auto-logout`);
 
     chrome.storage.local.get(["loginDetails"], (d) => {
       const u = d.loginDetails?.username || "";
-      trackEvent(EVENT_TYPES.ERROR, `Unable to load appointments — backoff ${waitSec}s (hit #${__unableToLoadCount})`, u);
-      if (__unableToLoadCount >= 2) {
-        sendTelegramNotification("rate",
-          `🟡 <b>UNABLE TO LOAD × ${__unableToLoadCount}</b>\n\n` +
-          `👤 <b>User:</b> ${u}\n` +
-          `⏳ Backoff ${waitSec}s\n` +
-          `⚠️ Cloudflare challenge may follow — keep browser visible\n` +
-          `🔁 Round ${cycling.round}`
-        );
+      trackEvent(EVENT_TYPES.ERROR, `Severe: ${reason} — auto-logout triggered`, u);
+      sendTelegramNotification("error",
+        `🚫 <b>${reason.toUpperCase()}</b>\n\n` +
+        `👤 <b>User:</b> ${u}\n` +
+        `🔁 Ran <b>${cycling.round}</b> rounds\n` +
+        `🔒 <b>AUTO-LOGOUT</b> — session cleared\n` +
+        `✅ Chrome profile free for next user`
+      );
+      updateUserStatus(u, "idle");
+
+      __abortAll = true;
+      window.__autoBookingLoginActive = false;
+      if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
+      sessionStorage.clear();
+      chrome.storage.local.remove(["activeAutomationUser", "loginDetails", "securityQuestions"]);
+
+      const signOutLink = document.querySelector('a[href*="LogOff"], a[href*="sign-out"], a[href*="signout"], a[href*="logout"], a[aria-label="Sign out"]');
+      if (signOutLink) {
+        signOutLink.click();
+      } else {
+        window.location.href = window.location.origin + "/en-US/";
       }
     });
   }
@@ -2548,8 +2629,8 @@
       const raw = sessionStorage.getItem("ab-cycling-state");
       if (!raw) return null;
       const state = JSON.parse(raw);
-      // Only valid if saved within last 5 minutes
-      if (Date.now() - state.timestamp > 5 * 60 * 1000) {
+      // Only valid if saved within last 10 minutes (cooldown can be up to 300s + navigation time)
+      if (Date.now() - state.timestamp > 10 * 60 * 1000) {
         sessionStorage.removeItem("ab-cycling-state");
         return null;
       }
@@ -3146,9 +3227,8 @@
         setStatus("✅ Challenge solved — resuming in 10s...");
         await sleep(10000);
         if (!cycling.active) return;
-        // Reset "unable to load" backoff since user just solved challenge
-        __unableToLoadCount = 0;
-        __unableToLoadBackoffMs = 0;
+        // Reset re-entry count since user just solved challenge
+        __reentryCount = 0;
         chrome.storage.local.get(["loginDetails"], (d) => {
           const u = d.loginDetails?.username || "";
           trackEvent(EVENT_TYPES.SESSION, "Cloudflare challenge solved — cycling resumed", u);
@@ -3156,44 +3236,11 @@
         });
       }
 
-      // ── Layer 1: "Unable to load" backoff ──
-      if (__unableToLoadBackoffMs > 0 && __lastUnableToLoadAt > 0) {
-        const sinceLast = Date.now() - __lastUnableToLoadAt;
-        // Only apply backoff if alert was recent (within backoff window)
-        if (sinceLast < __unableToLoadBackoffMs + 5000) {
-          const waitSec = Math.round(__unableToLoadBackoffMs / 1000);
-          setStatus(`⚠️ "Unable to load" — cooling down ${waitSec}s...`);
-          log(`Unable to load backoff: ${waitSec}s (hit #${__unableToLoadCount})`);
-          for (let s = waitSec; s > 0; s--) {
-            if (!cycling.active || __abortAll) return;
-            setStatus(`⚠️ "Unable to load" — cooling down ${s}s...`);
-            await sleep(1000);
-          }
-          // Check for Turnstile after cooldown (challenge often appears during wait)
-          if (detectTurnstileChallenge()) {
-            continue; // loop back — Turnstile check at top of next iteration handles it
-          }
-          // Clear the timestamp so we don't re-trigger same backoff
-          __lastUnableToLoadAt = 0;
-        }
-      }
-
-      // Check for 429 rate limit — exponential backoff
+      // Check for 429 rate limit — severe error, auto-logout
       if (__rateLimited429) {
         __rateLimited429 = false;
-        cycling.backoffMs = cycling.backoffMs ? Math.min(cycling.backoffMs * 2, 300000) : 60000;
-        const waitSec = Math.round(cycling.backoffMs / 1000);
-        setStatus(`Rate limited (429)! Pausing ${waitSec}s...`);
-        log(`Backoff: waiting ${waitSec}s before resuming`);
-        chrome.storage.local.get(["loginDetails"], (d) => {
-          const u = d.loginDetails?.username || "";
-          trackEvent(EVENT_TYPES.ERROR, `429 rate limited — backoff ${waitSec}s (round ${cycling.round})`, u);
-          sendTelegramNotification("rate", `🟠 <b>429 RATE LIMITED</b>\n\n👤 <b>User:</b> ${u}\n⏳ Backoff ${waitSec}s\n🔁 Round ${cycling.round}`);
-        });
-        await sleep(cycling.backoffMs);
-        if (!cycling.active) return;
-        // After backoff, re-check
-        if (__rateLimited429) { continue; }
+        handleSevereError("429 Rate Limited");
+        return;
       }
 
       const loc = locations[i];
@@ -3240,11 +3287,10 @@
 
       // Reset backoff on successful request
       cycling.backoffMs = 0;
-      // Reset "unable to load" counter on success
-      if (__unableToLoadCount > 0) {
-        log(`Successful fetch — resetting "unable to load" counter (was ${__unableToLoadCount})`);
-        __unableToLoadCount = 0;
-        __unableToLoadBackoffMs = 0;
+      // Reset re-entry count on successful request
+      if (__reentryCount > 0) {
+        log(`Successful fetch — resetting re-entry counter (was ${__reentryCount})`);
+        __reentryCount = 0;
       }
 
       // Check for 401 / session expiry
@@ -3823,11 +3869,18 @@
 
     injectBookingPanel();
 
-    // Restore cycling state after keep-alive refresh
+    // Restore cycling state after keep-alive refresh or dashboard re-entry
     const savedState = getReloginState();
     if (savedState && savedState.active) {
-      log("Restoring cycling after page refresh...");
-      trackEvent(EVENT_TYPES.SESSION, `Restoring cycling after page refresh — resuming from round ${savedState.round}`, activeUser);
+      const activeUser = settings.loginDetails?.username || "";
+      // Restore re-entry count if this is an "unable to load" re-entry
+      if (savedState.reentryCount) {
+        __reentryCount = savedState.reentryCount;
+        log(`Dashboard re-entry #${__reentryCount} — resuming cycling with fresh rounds`);
+      } else {
+        log("Restoring cycling after page refresh...");
+      }
+      trackEvent(EVENT_TYPES.SESSION, `Restoring cycling — re-entry #${savedState.reentryCount || 0}, fresh round`, activeUser);
       clearReloginState();
       await sleep(1000);
 
@@ -3898,11 +3951,18 @@
         log("Alert auto-dismissed: " + e.detail);
         const activeUser = settings.loginDetails?.username || "";
 
-        // Detect "Unable to load appointment available days" → trigger backoff
+        // Detect "Unable to load appointment available days" → trigger dashboard re-entry
         if (msg.includes("unable to load") || msg.includes("could not load") || msg.includes("failed to load")) {
           onUnableToLoadAlert(e.detail);
           trackEvent(EVENT_TYPES.ERROR, "Alert (unable to load): " + e.detail, activeUser);
-          return; // skip generic Telegram — onUnableToLoadAlert sends its own after 2nd hit
+          return;
+        }
+
+        // Detect "An error has occurred!" → same dashboard re-entry logic
+        if (msg.includes("error has occurred") || msg.includes("an error has occurred")) {
+          onUnableToLoadAlert(e.detail);
+          trackEvent(EVENT_TYPES.ERROR, "Alert (error occurred): " + e.detail, activeUser);
+          return;
         }
 
         trackEvent(EVENT_TYPES.ERROR, "Alert dismissed: " + e.detail, activeUser);
@@ -3917,12 +3977,10 @@
       return;
     }
 
-    // Cloudflare block detection on page load
+    // Cloudflare block detection on page load — severe error, auto-logout
     if (host.includes("usvisascheduling.com") && isCloudflareBlocked()) {
-      const cfUser = settings.loginDetails?.username || activeAutoUser || "";
-      log("Cloudflare block detected on page load");
-      trackEvent(EVENT_TYPES.ERROR, "Cloudflare block detected (Error 1015 / 429) on page load", cfUser);
-      sendTelegramNotification("error", `🛡️ <b>CLOUDFLARE BLOCKED</b>\n\n👤 <b>User:</b> ${cfUser}\n⚠️ Rate limited by Cloudflare on page load\n💡 Wait a few minutes before retrying`);
+      log("Cloudflare block detected on page load — triggering auto-logout");
+      handleSevereError("Cloudflare Blocked (Error 1015)");
       return;
     }
 
@@ -4293,25 +4351,29 @@
     }
     if (msg.action === "logout") {
       log("LOGOUT command received — clearing session and redirecting to login...");
+      // Get username BEFORE removing loginDetails
       chrome.storage.local.get(["loginDetails"], (d) => {
         const u = d.loginDetails?.username || "";
         trackEvent(EVENT_TYPES.SESSION, `Logout command received — clearing session for ${u}`, u);
         sendTelegramNotification("logout", `🚪 <b>LOGGED OUT</b>\n\n👤 <b>User:</b> ${u}\n🔒 Session cleared from dashboard\n✅ Ready for next user`);
-      });
-      __abortAll = true;
-      window.__autoBookingLoginActive = false;
-      if (cycling.active) stopCycling("Logged out from dashboard");
-      if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
-      sessionStorage.clear();
-      chrome.storage.local.remove(["activeAutomationUser", "loginDetails", "securityQuestions"]);
-      if (window.location.hostname.includes("usvisascheduling.com")) {
-        const signOutLink = document.querySelector('a[href*="LogOff"], a[href*="sign-out"], a[href*="signout"], a[href*="logout"], a[aria-label="Sign out"]');
-        if (signOutLink) {
-          signOutLink.click();
-        } else {
-          window.location.href = window.location.origin + "/en-US/";
+        // Always update status to idle (even if not cycling)
+        updateUserStatus(u, "idle");
+
+        __abortAll = true;
+        window.__autoBookingLoginActive = false;
+        if (cycling.active) stopCycling("Logged out from dashboard");
+        if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
+        sessionStorage.clear();
+        chrome.storage.local.remove(["activeAutomationUser", "loginDetails", "securityQuestions"]);
+        if (window.location.hostname.includes("usvisascheduling.com")) {
+          const signOutLink = document.querySelector('a[href*="LogOff"], a[href*="sign-out"], a[href*="signout"], a[href*="logout"], a[aria-label="Sign out"]');
+          if (signOutLink) {
+            signOutLink.click();
+          } else {
+            window.location.href = window.location.origin + "/en-US/";
+          }
         }
-      }
+      });
       sendResponse({ ok: true });
     }
     return true;

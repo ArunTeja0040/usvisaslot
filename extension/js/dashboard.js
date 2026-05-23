@@ -82,13 +82,24 @@
   function updateStats(profiles, statuses, events) {
     document.getElementById("stat-total").textContent = profiles.length;
 
-    const statusValues = Object.values(statuses);
-    document.getElementById("stat-active").textContent =
-      statusValues.filter((s) => ["cycling", "logging_in", "security_questions", "on_dashboard"].includes(s.status)).length;
-    document.getElementById("stat-slots-found").textContent =
-      statusValues.filter((s) => s.status === "slot_found").length;
-    document.getElementById("stat-confirmed").textContent =
-      statusValues.filter((s) => s.status === "confirmed").length;
+    // Use cloud data if available, fallback to local
+    const ACTIVE_STATES = ["cycling", "logging_in", "security_questions", "on_dashboard"];
+    const cloudStatusMap = {};
+    cloudProfiles.forEach(cp => { cloudStatusMap[cp.username] = cp; });
+
+    let activeCount = 0, slotFoundCount = 0, confirmedCount = 0;
+    for (const p of profiles) {
+      const cloud = cloudStatusMap[p.username] || {};
+      const local = statuses[p.username] || {};
+      const st = ACTIVE_STATES.includes(local.status) ? local.status : (cloud.status || local.status || "idle");
+      if (ACTIVE_STATES.includes(st)) activeCount++;
+      if (st === "slot_found" || cloud.status === "slot_found") slotFoundCount++;
+      if (st === "confirmed" || cloud.status === "confirmed") confirmedCount++;
+    }
+
+    document.getElementById("stat-active").textContent = activeCount;
+    document.getElementById("stat-slots-found").textContent = slotFoundCount;
+    document.getElementById("stat-confirmed").textContent = confirmedCount;
 
     const errors = events.filter((e) => e.type === "error");
     document.getElementById("stat-errors").textContent = errors.length;
@@ -1525,7 +1536,7 @@
     chrome.storage.local.set({ telegramBotToken: token, telegramChatId: chatId }, () => {
       chrome.runtime.sendMessage({
         action: "sendTelegram",
-        text: "✅ <b>Test Notification</b>\n\nUS Visa Auto Booking is connected!\nYou will receive alerts for slot found, booking confirmed, and errors."
+        text: "✅ <b>Test Notification</b>\n\nSlotHunter is connected!\nYou will receive alerts for slot found, booking confirmed, and errors."
       }, (resp) => {
         if (chrome.runtime.lastError) {
           status.textContent = "Failed: " + chrome.runtime.lastError.message;
@@ -1673,8 +1684,53 @@
       listEl.innerHTML = devices.map(d => {
         const ago = timeSince(d.last_seen);
         const isMe = d.id === myId ? ' <span style="color:#3ecf8e;">(this device)</span>' : "";
-        return `<div style="margin-bottom:4px;">• <b>${esc(d.device_name || "Unnamed")}</b>${isMe} — last seen ${ago}</div>`;
+        const deleteBtn = ` <button class="btn-delete-device" data-device-id="${d.id}" data-is-me="${d.id === myId}" data-device-name="${esc(d.device_name || "Unnamed")}" style="background:#e74c3c;color:white;border:none;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:10px;font-weight:bold;margin-left:6px;">✕</button>`;
+        return `<div style="margin-bottom:4px;">• <b>${esc(d.device_name || "Unnamed")}</b>${isMe} — last seen ${ago}${deleteBtn}</div>`;
       }).join("");
+
+      // Wire up delete buttons
+      listEl.querySelectorAll(".btn-delete-device").forEach(btn => {
+        btn.addEventListener("click", async (e) => {
+          const deviceId = btn.dataset.deviceId;
+          const isMe = btn.dataset.isMe === "true";
+          const deviceName = btn.dataset.deviceName;
+          const confirmed = confirm(`Delete device "${deviceName}" from Supabase?${isMe ? " You'll need to re-connect Cloud Sync after." : ""}`);
+          if (!confirmed) return;
+          try {
+            if (isMe) {
+              await SUPA.deleteDevice();
+              document.getElementById("cloud-status").textContent = "Device deleted. Re-connect to register.";
+              document.getElementById("cloud-status").style.color = "#e74c3c";
+              updateCloudUI();
+            } else {
+              // Delete other device directly via REST
+              const opKey = document.getElementById("cloud-api-key").value.trim();
+              const res = await fetch(`https://sbuaojiamicreyysvnqj.supabase.co/rest/v1/devices?id=eq.${deviceId}`, {
+                method: "DELETE",
+                headers: {
+                  "apikey": "sb_publishable_OrTLSVqVljSOoIeUZIoIcw_O0udxgyq",
+                  "Authorization": "Bearer sb_publishable_OrTLSVqVljSOoIeUZIoIcw_O0udxgyq",
+                  "Content-Type": "application/json",
+                  "Prefer": "return=representation",
+                  "x-operator-key": opKey
+                }
+              });
+              const body = await res.text();
+              console.log("[CloudSync] Delete response:", res.status, body);
+              if (!res.ok) throw new Error(`HTTP ${res.status}: ${body}`);
+              if (body === "[]") throw new Error("RLS blocked delete — no rows affected. Check Supabase policies.");
+              document.getElementById("cloud-status").textContent = `Deleted "${deviceName}"`;
+              document.getElementById("cloud-status").style.color = "#27ae60";
+            }
+            // Small delay then refresh list
+            await new Promise(r => setTimeout(r, 500));
+            loadCloudDevices();
+          } catch (err) {
+            document.getElementById("cloud-status").textContent = "Delete failed: " + err.message;
+            document.getElementById("cloud-status").style.color = "#e74c3c";
+          }
+        });
+      });
     } catch (e) {
       listEl.textContent = "Error loading devices";
     }

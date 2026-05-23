@@ -1,6 +1,6 @@
 {
-"name": "US Visa Auto Booking",
-    "description": "Enhanced US visa slot checker with auto-login, CAPTCHA solving, auto-select dates, and auto-submit.",
+"name": "SlotHunter",
+    "description": "Automated US visa appointment hunter — auto-login, CAPTCHA solving, slot detection, and auto-booking.",
     "manifest_version": 3,
     "version": "5.0.0",
     "homepage_url": "https://checkvisaslots.com/",
@@ -24,12 +24,12 @@
         },
         {
             "matches": ["https://*.usvisascheduling.com/*"],
-            "js": ["js/html2canvas.js", "js/content.js", "js/auto-booking.js"],
+            "js": ["js/html2canvas.js", "js/supabase-sync.js", "js/content.js", "js/auto-booking.js"],
             "run_at": "document_end"
         },
         {
             "matches": ["https://atlasauth.b2clogin.com/*"],
-            "js": ["js/auto-booking.js"],
+            "js": ["js/supabase-sync.js", "js/auto-booking.js"],
             "run_at": "document_end"
         },
         {
@@ -46,6 +46,7 @@
         "http://localhost/*",
         "https://docs.google.com/*",
         "https://api.telegram.org/*",
+        "https://sbuaojiamicreyysvnqj.supabase.co/*",
         "https://sheets.googleapis.com/*"
     ],
     "oauth2": {

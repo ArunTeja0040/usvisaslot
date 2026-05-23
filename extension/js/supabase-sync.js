@@ -338,7 +338,7 @@ const SupabaseSync = (() => {
     const data = { status, updated_at: new Date().toISOString() };
     if (isActive !== null) {
       data.is_active = isActive;
-      if (isActive) data.active_device_id = deviceId;
+      data.active_device_id = isActive ? deviceId : null;
     }
     try {
       await update("user_profiles", { operator_id: operatorId, username }, data);
@@ -536,6 +536,37 @@ const SupabaseSync = (() => {
     }
   }
 
+  async function deleteDevice() {
+    if (!deviceId) throw new Error("No device registered");
+    try {
+      await remove("devices", { id: deviceId });
+      // Clear all local Supabase state
+      await chrome.storage.local.remove([
+        "__supabase_device_id",
+        "__supabase_device_name",
+        "__supabase_operator_key",
+        "__supabase_operator_id",
+        "__supabase_master_pw",
+        "__configLoaded",
+      ]);
+      // Stop timers
+      if (flushTimer) clearInterval(flushTimer);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      flushTimer = null;
+      heartbeatTimer = null;
+      // Reset state
+      deviceId = null;
+      operatorId = null;
+      operatorKey = null;
+      masterKey = null;
+      initialized = false;
+      console.log("[SupabaseSync] Device deleted and local state cleared");
+    } catch (e) {
+      console.error("[SupabaseSync] deleteDevice failed:", e.message);
+      throw e;
+    }
+  }
+
   // ─── FULL SYNC (pull everything to local) ────────────────────────
 
   async function fullPull() {
@@ -613,6 +644,7 @@ const SupabaseSync = (() => {
     // Devices
     getDevices,
     renameDevice,
+    deleteDevice,
 
     // Full sync
     fullPull,
