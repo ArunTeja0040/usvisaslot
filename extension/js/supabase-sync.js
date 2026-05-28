@@ -339,6 +339,12 @@ const SupabaseSync = (() => {
     if (isActive !== null) {
       data.is_active = isActive;
       data.active_device_id = isActive ? deviceId : null;
+      if (isActive) {
+        const stored = await chrome.storage.local.get(["__supabase_device_name"]);
+        data.active_device_name = stored.__supabase_device_name || null;
+      } else {
+        data.active_device_name = null;
+      }
     }
     try {
       await update("user_profiles", { operator_id: operatorId, username }, data);
