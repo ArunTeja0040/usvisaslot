@@ -229,10 +229,19 @@
           <label>Master Password</label>
           <input type="password" id="cloud-master-pw" placeholder="For encrypting credentials">
         </div>
+        <!-- Import section — shown when no config -->
+        <div id="cloud-import-section" style="display:none;margin-top:8px;">
+          <textarea id="cloud-import-input" placeholder="Paste config string from another profile..." style="width:100%;height:50px;padding:5px 8px;background:#0f1923;color:#e0e0e0;border:1px solid #2d3e50;border-radius:4px;font-size:11px;font-family:monospace;resize:vertical;box-sizing:border-box;"></textarea>
+          <div style="display:flex;gap:6px;align-items:center;margin-top:4px;">
+            <button id="cloud-import-btn" class="btn btn-small" style="background:#e67e22;color:#fff;">📥 Import Config</button>
+            <span id="cloud-import-status" style="font-size:11px;color:#78909c;"></span>
+          </div>
+        </div>
         <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
           <button id="cloud-connect-btn" class="btn btn-small btn-green">Connect</button>
           <button id="cloud-pull-btn" class="btn btn-small" style="background:#6c5ce7;color:#fff;display:none;">Pull Profiles</button>
           <button id="cloud-push-btn" class="btn btn-small btn-blue" style="display:none;">Push All</button>
+          <button id="cloud-export-btn" class="btn btn-small" style="background:#16a085;color:#fff;display:none;">📤 Export Config</button>
           <span id="cloud-status" style="font-size:11px;color:#78909c;"></span>
         </div>
         <div class="form-section" style="margin-top:14px;">Device Info</div>

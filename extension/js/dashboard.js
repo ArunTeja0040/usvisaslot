@@ -1659,6 +1659,8 @@
     const statusEl = document.getElementById("cloud-status");
     const pullBtn = document.getElementById("cloud-pull-btn");
     const pushBtn = document.getElementById("cloud-push-btn");
+    const exportBtn = document.getElementById("cloud-export-btn");
+    const importSection = document.getElementById("cloud-import-section");
     const deviceIdEl = document.getElementById("cloud-device-id");
     const deviceNameInput = document.getElementById("cloud-device-name");
 
@@ -1667,10 +1669,15 @@
       statusEl.style.color = "#81c784";
       pullBtn.style.display = "inline-block";
       pushBtn.style.display = "inline-block";
+      if (exportBtn) exportBtn.style.display = "inline-block";
+      if (importSection) importSection.style.display = "none";
       deviceIdEl.textContent = SUPA.getDeviceId() || "—";
       const savedName = await SUPA.getDeviceName();
       if (savedName && deviceNameInput) deviceNameInput.value = savedName;
       loadCloudDevices();
+    } else {
+      // Not connected — show import option
+      if (importSection) importSection.style.display = "block";
     }
   }
 
@@ -1873,6 +1880,116 @@
     if (!name || !SUPA || !SUPA.isReady()) return;
     await SUPA.renameDevice(name);
     loadCloudDevices();
+  });
+
+  // Export config — copies base64 config string to clipboard
+  document.getElementById("cloud-export-btn").addEventListener("click", async () => {
+    const statusEl = document.getElementById("cloud-status");
+    try {
+      const data = await new Promise(r => chrome.storage.local.get(
+        ["telegramBotToken", "telegramChatId", "__supabase_operator_key", "__supabase_master_pw"], r
+      ));
+      const config = {
+        telegramBotToken: data.telegramBotToken || "",
+        telegramChatId: data.telegramChatId || "",
+        supabaseOperatorKey: data.__supabase_operator_key || "",
+        supabaseMasterPassword: data.__supabase_master_pw || "",
+      };
+      if (!config.supabaseOperatorKey || !config.supabaseMasterPassword) {
+        statusEl.textContent = "Missing Supabase config!";
+        statusEl.style.color = "#ef5350";
+        return;
+      }
+      const encoded = btoa(JSON.stringify(config));
+      await navigator.clipboard.writeText(encoded);
+      statusEl.textContent = "📋 Config copied to clipboard!";
+      statusEl.style.color = "#16a085";
+      setTimeout(() => { statusEl.textContent = "Connected"; statusEl.style.color = "#81c784"; }, 3000);
+    } catch (e) {
+      statusEl.textContent = "Export failed: " + e.message;
+      statusEl.style.color = "#ef5350";
+    }
+  });
+
+  // Import config — decode base64, save, connect, pull profiles
+  document.getElementById("cloud-import-btn").addEventListener("click", async () => {
+    const input = document.getElementById("cloud-import-input");
+    const statusEl = document.getElementById("cloud-import-status");
+    const raw = (input.value || "").trim();
+    if (!raw) { statusEl.textContent = "Paste config string first!"; statusEl.style.color = "#ef5350"; return; }
+
+    let config;
+    try {
+      config = JSON.parse(atob(raw));
+    } catch {
+      statusEl.textContent = "Invalid config string!";
+      statusEl.style.color = "#ef5350";
+      return;
+    }
+
+    if (!config.supabaseOperatorKey || !config.supabaseMasterPassword) {
+      statusEl.textContent = "Config missing Supabase keys!";
+      statusEl.style.color = "#ef5350";
+      return;
+    }
+
+    const deviceName = prompt("Name this Chrome profile (e.g. Ravi-Laptop, Arun-Main):");
+    if (!deviceName || !deviceName.trim()) {
+      statusEl.textContent = "Device name required!";
+      statusEl.style.color = "#ef5350";
+      return;
+    }
+
+    statusEl.textContent = "Importing...";
+    statusEl.style.color = "#f39c12";
+
+    try {
+      await new Promise(r => chrome.storage.local.set({
+        telegramBotToken: config.telegramBotToken || "",
+        telegramChatId: config.telegramChatId || "",
+        telegramNotify: true,
+        __supabase_operator_key: config.supabaseOperatorKey,
+        __supabase_master_pw: config.supabaseMasterPassword,
+      }, r));
+
+      if (SUPA) {
+        await SUPA.init(config.supabaseOperatorKey, config.supabaseMasterPassword, deviceName.trim());
+        const cloudProfiles = await SUPA.pullProfiles();
+        let localProfiles = [];
+        for (const cp of cloudProfiles) {
+          const profile = {
+            username: cp.username, password: cp.password,
+            securityQuestions: {},
+            autoLogin: cp.autoLogin, autoDashboard: cp.autoDashboard,
+            autoSelect: cp.autoSelect, autoSubmit: cp.autoSubmit,
+            captchaMode: cp.captchaMode,
+            startDate: cp.startDate || "", endDate: cp.endDate || "",
+            locations: cp.locations || [], visaType: cp.visaType || "",
+            agreedPrice: cp.agreedPrice || "",
+          };
+          if (cp.securityQuestions) {
+            cp.securityQuestions.forEach((sq) => {
+              if (sq.question && sq.answer) profile.securityQuestions[sq.question] = sq.answer;
+            });
+          }
+          localProfiles.push(profile);
+        }
+        await new Promise(r => chrome.storage.local.set({ userProfilesList: localProfiles }, r));
+        statusEl.textContent = `✅ Connected! ${cloudProfiles.length} profiles loaded.`;
+        statusEl.style.color = "#81c784";
+
+        // Update UI
+        updateCloudUI();
+        startCloudPolling();
+        refresh();
+      } else {
+        statusEl.textContent = "SupabaseSync not loaded!";
+        statusEl.style.color = "#ef5350";
+      }
+    } catch (e) {
+      statusEl.textContent = "Import failed: " + e.message;
+      statusEl.style.color = "#ef5350";
+    }
   });
 
   // Auto-connect on dashboard load if already configured

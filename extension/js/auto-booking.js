@@ -1111,15 +1111,27 @@
         <!-- Supabase Cloud Sync -->
         <div style="margin-bottom:10px;">
           <div style="font-weight:bold;margin-bottom:6px;color:#1a5276;border-bottom:1px solid #eee;padding-bottom:4px;">Cloud Sync (Supabase)</div>
-          <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px;">
-            <input type="text" id="sp-supa-key" placeholder="Operator API Key" style="flex:1;padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:11px;">
+          <!-- Import section — shown when no config exists -->
+          <div id="sp-import-section" style="display:none;margin-bottom:6px;">
+            <textarea id="sp-import-input" placeholder="Paste config string from another profile..." style="width:100%;height:50px;padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:11px;font-family:monospace;resize:vertical;box-sizing:border-box;"></textarea>
+            <div style="display:flex;gap:6px;align-items:center;margin-top:4px;">
+              <button id="sp-import-btn" style="background:#e67e22;color:white;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;">📥 IMPORT CONFIG</button>
+              <span id="sp-import-status" style="font-size:11px;color:#888;"></span>
+            </div>
           </div>
-          <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px;">
-            <input type="password" id="sp-supa-master" placeholder="Master Password (for encryption)" style="flex:1;padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:11px;">
+          <!-- Manual config — shown when no config exists -->
+          <div id="sp-manual-config">
+            <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px;">
+              <input type="text" id="sp-supa-key" placeholder="Operator API Key" style="flex:1;padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:11px;">
+            </div>
+            <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px;">
+              <input type="password" id="sp-supa-master" placeholder="Master Password (for encryption)" style="flex:1;padding:5px 8px;border:1px solid #ccc;border-radius:4px;font-size:11px;">
+            </div>
           </div>
-          <div style="display:flex;gap:6px;align-items:center;">
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
             <button id="sp-supa-connect" style="background:#3ecf8e;color:white;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;">CONNECT</button>
             <button id="sp-supa-pull" style="background:#6c5ce7;color:white;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;display:none;">PULL ALL</button>
+            <button id="sp-supa-export" style="background:#16a085;color:white;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;display:none;">📤 EXPORT CONFIG</button>
             <button id="sp-supa-delete" style="background:#e74c3c;color:white;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;display:none;">DELETE DEVICE</button>
             <span id="sp-supa-status" style="font-size:11px;color:#888;"></span>
           </div>
@@ -1304,7 +1316,10 @@
     });
 
     // Supabase Cloud Sync handlers
-    chrome.storage.local.get(["__supabase_operator_key"], (data) => {
+    chrome.storage.local.get(["__supabase_operator_key", "__supabase_master_pw"], (data) => {
+      const importSection = document.getElementById("sp-import-section");
+      const manualConfig = document.getElementById("sp-manual-config");
+      const exportBtn = document.getElementById("sp-supa-export");
       if (data.__supabase_operator_key) {
         const keyInput = document.getElementById("sp-supa-key");
         if (keyInput) keyInput.value = data.__supabase_operator_key;
@@ -1315,6 +1330,11 @@
         if (statusEl) statusEl.style.color = "#27ae60";
         if (pullBtn) pullBtn.style.display = "inline-block";
         if (deleteBtn) deleteBtn.style.display = "inline-block";
+        if (exportBtn) exportBtn.style.display = "inline-block";
+        if (importSection) importSection.style.display = "none";
+      } else {
+        // No config — show import option
+        if (importSection) importSection.style.display = "block";
       }
     });
 
@@ -1455,6 +1475,137 @@
       } catch (e) {
         statusEl.textContent = "Delete failed: " + e.message;
         statusEl.style.color = "#e74c3c";
+      }
+    });
+
+    // Export config — copies base64 config string to clipboard
+    document.getElementById("sp-supa-export").addEventListener("click", async () => {
+      const statusEl = document.getElementById("sp-supa-status");
+      try {
+        const data = await new Promise(r => chrome.storage.local.get(
+          ["telegramBotToken", "telegramChatId", "__supabase_operator_key", "__supabase_master_pw"], r
+        ));
+        const config = {
+          telegramBotToken: data.telegramBotToken || "",
+          telegramChatId: data.telegramChatId || "",
+          supabaseOperatorKey: data.__supabase_operator_key || "",
+          supabaseMasterPassword: data.__supabase_master_pw || "",
+        };
+        if (!config.supabaseOperatorKey || !config.supabaseMasterPassword) {
+          statusEl.textContent = "Missing Supabase config!";
+          statusEl.style.color = "#e74c3c";
+          return;
+        }
+        const encoded = btoa(JSON.stringify(config));
+        await navigator.clipboard.writeText(encoded);
+        statusEl.textContent = "📋 Config copied to clipboard!";
+        statusEl.style.color = "#16a085";
+        setTimeout(() => { statusEl.textContent = "Connected"; statusEl.style.color = "#27ae60"; }, 3000);
+      } catch (e) {
+        statusEl.textContent = "Export failed: " + e.message;
+        statusEl.style.color = "#e74c3c";
+      }
+    });
+
+    // Import config — decode base64, save, connect, pull profiles
+    document.getElementById("sp-import-btn").addEventListener("click", async () => {
+      const input = document.getElementById("sp-import-input");
+      const statusEl = document.getElementById("sp-import-status");
+      const raw = (input.value || "").trim();
+      if (!raw) { statusEl.textContent = "Paste config string first!"; statusEl.style.color = "#e74c3c"; return; }
+
+      let config;
+      try {
+        config = JSON.parse(atob(raw));
+      } catch {
+        statusEl.textContent = "Invalid config string!";
+        statusEl.style.color = "#e74c3c";
+        return;
+      }
+
+      if (!config.supabaseOperatorKey || !config.supabaseMasterPassword) {
+        statusEl.textContent = "Config missing Supabase keys!";
+        statusEl.style.color = "#e74c3c";
+        return;
+      }
+
+      // Prompt for device name
+      const deviceName = prompt("Name this Chrome profile (e.g. Ravi-Laptop, Arun-Main):");
+      if (!deviceName || !deviceName.trim()) {
+        statusEl.textContent = "Device name required!";
+        statusEl.style.color = "#e74c3c";
+        return;
+      }
+
+      statusEl.textContent = "Importing...";
+      statusEl.style.color = "#f39c12";
+
+      try {
+        // Save Telegram config
+        await new Promise(r => chrome.storage.local.set({
+          telegramBotToken: config.telegramBotToken || "",
+          telegramChatId: config.telegramChatId || "",
+          telegramNotify: true,
+          __supabase_operator_key: config.supabaseOperatorKey,
+          __supabase_master_pw: config.supabaseMasterPassword,
+        }, r));
+
+        // Connect to Supabase + register device
+        if (SUPABASE_ENABLED) {
+          await SupabaseSync.init(config.supabaseOperatorKey, config.supabaseMasterPassword, deviceName.trim());
+
+          // Pull all user profiles
+          const cloudProfiles = await SupabaseSync.pullProfiles();
+          let localProfiles = [];
+          for (const cp of cloudProfiles) {
+            const profile = {
+              username: cp.username,
+              password: cp.password,
+              securityQuestions: {},
+              autoLogin: cp.autoLogin,
+              autoDashboard: cp.autoDashboard,
+              autoSelect: cp.autoSelect,
+              autoSubmit: cp.autoSubmit,
+              captchaMode: cp.captchaMode,
+              startDate: cp.startDate || "",
+              endDate: cp.endDate || "",
+              locations: cp.locations || [],
+              visaType: cp.visaType || "",
+              agreedPrice: cp.agreedPrice || "",
+            };
+            if (cp.securityQuestions) {
+              cp.securityQuestions.forEach((sq) => {
+                if (sq.question && sq.answer) profile.securityQuestions[sq.question] = sq.answer;
+              });
+            }
+            localProfiles.push(profile);
+          }
+          await new Promise(r => chrome.storage.local.set({ userProfilesList: localProfiles }, r));
+
+          statusEl.textContent = `✅ Connected! ${cloudProfiles.length} profiles loaded.`;
+          statusEl.style.color = "#27ae60";
+
+          // Update UI — hide import, show connected state
+          document.getElementById("sp-import-section").style.display = "none";
+          document.getElementById("sp-supa-key").value = config.supabaseOperatorKey;
+          document.getElementById("sp-supa-status").textContent = "Connected";
+          document.getElementById("sp-supa-status").style.color = "#27ae60";
+          document.getElementById("sp-supa-pull").style.display = "inline-block";
+          document.getElementById("sp-supa-export").style.display = "inline-block";
+          document.getElementById("sp-supa-delete").style.display = "inline-block";
+
+          // Refresh user dropdown
+          const profiles = await loadUserProfiles();
+          await refreshUserDropdown(profiles.length > 0 ? profiles[0].username : "__new__");
+          if (profiles.length > 0) populateForm(profiles[0]);
+        } else {
+          statusEl.textContent = "SupabaseSync not loaded!";
+          statusEl.style.color = "#e74c3c";
+        }
+      } catch (e) {
+        statusEl.textContent = "Import failed: " + e.message;
+        statusEl.style.color = "#e74c3c";
+        log("Config import error: " + e.message);
       }
     });
 
