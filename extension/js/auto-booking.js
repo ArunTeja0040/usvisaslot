@@ -2308,7 +2308,17 @@
 
   // Detect Cloudflare Turnstile widget on current page
   // Turnstile renders as: <div class="cf-turnstile"> or iframe src containing challenges.cloudflare.com
+  function isWaitingRoom() {
+    const bodyText = (document.body?.textContent || "").toLowerCase();
+    return bodyText.includes("you are now in line") ||
+           bodyText.includes("estimated wait time") ||
+           bodyText.includes("thank you for your patience") ||
+           bodyText.includes("waiting room powered by cloudflare");
+  }
+
   function detectTurnstileChallenge() {
+    // Waiting room pages have CF elements but are NOT challenges — exclude them
+    if (isWaitingRoom()) return false;
     // Check for Turnstile container div
     if (document.querySelector(".cf-turnstile, #cf-turnstile, [data-sitekey]")) return true;
     // Check for challenge iframe
@@ -2537,6 +2547,18 @@
         log("Cloudflare block detected via heading: " + heading.textContent);
         return true;
       }
+    }
+    // Detect raw JSON error response from Cloudflare (no HTML, just JSON text on page)
+    // e.g. {"error_code":1015,"error_name":"rate_limited","cloudflare_error":true,...}
+    const bodyText = (document.body?.textContent || "").trim();
+    if (bodyText.startsWith("{") && bodyText.length < 2000) {
+      try {
+        const json = JSON.parse(bodyText);
+        if (json.cloudflare_error || json.error_code === 1015 || json.error_name === "rate_limited") {
+          log("Cloudflare block detected via JSON response: error_code=" + json.error_code);
+          return true;
+        }
+      } catch {}
     }
     return false;
   }
@@ -4011,29 +4033,50 @@
       });
     }
 
-    if (host.includes("b2clogin.com")) {
-      sessionStorage.removeItem("__ab401RetryCount");
-      log("On b2clogin.com — detecting page type...");
-      await handleLoginPage();
+    // Cloudflare Waiting Room detection — any domain (b2clogin, usvisascheduling)
+    // Must run BEFORE Turnstile check — waiting room has CF elements that trigger false positive
+    if (isWaitingRoom()) {
+      const wrUser = settings.loginDetails?.username || activeAutoUser || "";
+      if (!automationActive) {
+        log("Waiting room detected but automation stopped — not refreshing");
+        return;
+      }
+      const attempt = parseInt(sessionStorage.getItem("__abWaitingRoomCount") || "0") + 1;
+      sessionStorage.setItem("__abWaitingRoomCount", String(attempt));
+      if (attempt > 30) {
+        log("Waiting room — max retries (30) reached, stopping");
+        trackEvent(EVENT_TYPES.ERROR, "Waiting room max retries reached", wrUser);
+        sessionStorage.removeItem("__abWaitingRoomCount");
+        sendTelegramNotification("error", `🔴 <b>WAITING ROOM TIMEOUT</b>\n\n👤 <b>User:</b> ${wrUser}\n⚠️ 30 retries exhausted — needs manual check`);
+        return;
+      }
+      log(`Waiting room detected (attempt ${attempt}) on ${host} — auto-refreshing in 30s`);
+      trackEvent(EVENT_TYPES.SESSION, `Waiting room detected (attempt ${attempt}) on ${host}`, wrUser);
+      if (attempt === 1) {
+        sendTelegramNotification("rate",
+          `⏳ <b>WAITING ROOM</b>\n\n` +
+          `👤 <b>User:</b> ${wrUser}\n` +
+          `🌐 <b>Domain:</b> ${host}\n` +
+          `⏸️ In queue — page will auto-refresh\n` +
+          `🔄 Attempt ${attempt}/30`
+        );
+      }
+      await sleep(30000);
+      window.location.reload();
       return;
     }
 
-    // Cloudflare block detection on page load — severe error, auto-logout
-    if (host.includes("usvisascheduling.com") && isCloudflareBlocked()) {
-      log("Cloudflare block detected on page load — triggering auto-logout");
-      handleSevereError("Cloudflare Blocked (Error 1015)");
-      return;
-    }
-
-    // Turnstile challenge on page load — wait for manual solve then reload
-    if (host.includes("usvisascheduling.com") && detectTurnstileChallenge()) {
+    // Cloudflare Turnstile challenge — any domain
+    // Runs AFTER waiting room check so no false positives
+    if (detectTurnstileChallenge()) {
       const cfUser = settings.loginDetails?.username || activeAutoUser || "";
       log("Turnstile challenge detected on page load — waiting for solve");
       __cfChallengeActive = true;
-      trackEvent(EVENT_TYPES.ERROR, "Cloudflare Turnstile challenge on page load", cfUser);
+      trackEvent(EVENT_TYPES.ERROR, `Cloudflare Turnstile challenge on ${host}`, cfUser);
       sendTelegramNotification("rate",
-        `🛡️ <b>CLOUDFLARE CHALLENGE (page load)</b>\n\n` +
+        `🛡️ <b>CLOUDFLARE CHALLENGE</b>\n\n` +
         `👤 <b>User:</b> ${cfUser}\n` +
+        `🌐 <b>Domain:</b> ${host}\n` +
         `⚠️ "Verify you are human" on page load\n` +
         `⏸️ Waiting for manual solve...`
       );
@@ -4045,6 +4088,20 @@
         await sleep(2000);
         window.location.reload();
       }
+      return;
+    }
+
+    if (host.includes("b2clogin.com")) {
+      sessionStorage.removeItem("__ab401RetryCount");
+      log("On b2clogin.com — detecting page type...");
+      await handleLoginPage();
+      return;
+    }
+
+    // Cloudflare block detection on page load — severe error, auto-logout
+    if (host.includes("usvisascheduling.com") && isCloudflareBlocked()) {
+      log("Cloudflare block detected on page load — triggering auto-logout");
+      handleSevereError("Cloudflare Blocked (Error 1015)");
       return;
     }
 
@@ -4245,38 +4302,6 @@
       }
       // Clear counter on successful (non-401) page load
       sessionStorage.removeItem("__abBare401Count");
-    }
-
-    // Waiting room detection — only auto-refresh if automation is active
-    if (host.includes("usvisascheduling.com")) {
-      for (let wc = 0; wc < 6; wc++) {
-        const bodyText = (document.body?.textContent || "").toLowerCase();
-        const hasWaitingRoomClass = !!document.querySelector('[class*="waitingroom"], [class*="waiting-room"], [id*="waitingroom"], [id*="waiting-room"]');
-        if (bodyText.includes("waiting room") || bodyText.includes("will be redirected") ||
-            bodyText.includes("website maintenance") || hasWaitingRoomClass) {
-          if (!automationActive) {
-            log("Waiting room detected but automation is stopped — not refreshing");
-            return;
-          }
-          const attempt = parseInt(sessionStorage.getItem("__abWaitingRoomCount") || "0") + 1;
-          sessionStorage.setItem("__abWaitingRoomCount", String(attempt));
-          const activeUser = settings.loginDetails?.username || "";
-          if (attempt > 30) {
-            log("Waiting room — max retries (30) reached, stopping");
-            trackEvent(EVENT_TYPES.ERROR, "Waiting room max retries reached", activeUser);
-            sessionStorage.removeItem("__abWaitingRoomCount");
-            sendTelegramNotification("error", `🔴 <b>WAITING ROOM TIMEOUT</b>\n\n👤 <b>User:</b> ${activeUser}\n⚠️ Site maintenance detected — 30 retries exhausted`);
-            return;
-          }
-          trackEvent(EVENT_TYPES.SESSION, `Waiting room detected (attempt ${attempt})`, activeUser);
-          log(`Waiting room detected (attempt ${attempt}) — refreshing in 10s...`);
-          await sleep(10000);
-          window.location.reload();
-          return;
-        }
-        await sleep(500);
-      }
-      sessionStorage.removeItem("__abWaitingRoomCount");
     }
 
     const routerUser = settings.loginDetails?.username || activeAutoUser || "";
