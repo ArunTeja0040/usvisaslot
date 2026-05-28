@@ -1862,6 +1862,46 @@
   async function handleDashboard(settings) {
     const activeUser = settings.loginDetails?.username || "";
     trackEvent(EVENT_TYPES.DASHBOARD, "Reached dashboard", activeUser);
+
+    // Check if we came here to logout after severe error (1015/429/CF blocked)
+    const severeLogoutReason = sessionStorage.getItem("__abSevereLogout");
+    if (severeLogoutReason) {
+      sessionStorage.removeItem("__abSevereLogout");
+      log(`Severe logout: ${severeLogoutReason} — finding sign-out link on dashboard`);
+      trackEvent(EVENT_TYPES.SESSION, `Dashboard logout for: ${severeLogoutReason}`, activeUser);
+
+      // Wait for page to fully load
+      await sleep(2000);
+
+      const signOutLink = document.querySelector('a[href*="LogOff"], a[href*="sign-out"], a[href*="signout"], a[href*="logout"], a[aria-label="Sign out"]');
+      if (signOutLink) {
+        log("Sign-out link found — clicking to logout");
+        trackEvent(EVENT_TYPES.SESSION, "Sign-out link clicked — logging out", activeUser);
+        sendTelegramNotification("error",
+          `✅ <b>LOGGED OUT SUCCESSFULLY</b>\n\n` +
+          `👤 <b>User:</b> ${activeUser}\n` +
+          `📋 <b>Reason:</b> ${severeLogoutReason}\n` +
+          `✅ Chrome profile free for next user`
+        );
+        // Clear credentials AFTER we have the username for Telegram, then click logout
+        chrome.storage.local.remove(["loginDetails", "securityQuestions"]);
+        signOutLink.click();
+      } else {
+        log("Sign-out link NOT found on dashboard — clearing all state as fallback");
+        trackEvent(EVENT_TYPES.ERROR, "Sign-out link not found on dashboard — manual logout needed", activeUser);
+        sendTelegramNotification("error",
+          `⚠️ <b>LOGOUT FAILED</b>\n\n` +
+          `👤 <b>User:</b> ${activeUser}\n` +
+          `📋 <b>Reason:</b> ${severeLogoutReason}\n` +
+          `❌ Sign-out link not found on dashboard\n` +
+          `🔧 Manual logout required`
+        );
+        // Clear everything to prevent auto-click loop
+        chrome.storage.local.remove(["loginDetails", "securityQuestions", "is_auto-dashboard"]);
+      }
+      return; // Stop — don't auto-click Continue/Reschedule
+    }
+
     updateUserStatus(activeUser, "on_dashboard");
 
     // Check if automation is still active (persistent flag survives page reloads)
@@ -2364,7 +2404,7 @@
 
   // Handle severe errors (429, Error 1015, Cloudflare blocked) — auto-logout
   function handleSevereError(reason) {
-    log(`Severe error: ${reason} — auto-logging out`);
+    log(`Severe error: ${reason} — navigating to dashboard for logout`);
     if (cycling.active) stopCycling(`${reason} — auto-logout`);
 
     chrome.storage.local.get(["loginDetails"], (d) => {
@@ -2374,23 +2414,24 @@
         `🚫 <b>${reason.toUpperCase()}</b>\n\n` +
         `👤 <b>User:</b> ${u}\n` +
         `🔁 Ran <b>${cycling.round}</b> rounds\n` +
-        `🔒 <b>AUTO-LOGOUT</b> — session cleared\n` +
-        `✅ Chrome profile free for next user`
+        `🔒 <b>AUTO-LOGOUT</b> — navigating to dashboard to sign out`
       );
       updateUserStatus(u, "idle");
 
       __abortAll = true;
       window.__autoBookingLoginActive = false;
       if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
-      sessionStorage.clear();
-      chrome.storage.local.remove(["activeAutomationUser", "loginDetails", "securityQuestions"]);
 
-      const signOutLink = document.querySelector('a[href*="LogOff"], a[href*="sign-out"], a[href*="signout"], a[href*="logout"], a[aria-label="Sign out"]');
-      if (signOutLink) {
-        signOutLink.click();
-      } else {
-        window.location.href = window.location.origin + "/en-US/";
-      }
+      // Don't clear loginDetails yet — dashboard needs username for logout Telegram
+      // Only clear after actual sign-out click in handleDashboard()
+      chrome.storage.local.remove(["activeAutomationUser"]);
+
+      // Set flag so dashboard knows to logout instead of auto-clicking Continue
+      sessionStorage.clear();
+      sessionStorage.setItem("__abSevereLogout", reason);
+
+      // Navigate to dashboard where sign-out link always exists
+      window.location.href = window.location.origin + "/en-US/";
     });
   }
 
