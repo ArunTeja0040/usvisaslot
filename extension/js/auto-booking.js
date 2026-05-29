@@ -1862,7 +1862,7 @@
       const passField = document.getElementById("password");
       const captchaImg = document.getElementById("captchaImage");
 
-      if (userField && passField && captchaImg) {
+      if (userField && passField) {
         clearInterval(waitForForm);
 
         await sleep(600);
@@ -1880,7 +1880,19 @@
         passField.dispatchEvent(new Event("change", { bubbles: true }));
         await sleep(300);
 
-        await handleCaptcha(settings);
+        // CAPTCHA is optional — site may have removed it
+        if (captchaImg) {
+          await handleCaptcha(settings);
+        } else {
+          log("No CAPTCHA detected — clicking Sign In directly");
+          const signInBtn = document.getElementById("next") || document.querySelector('button[type="submit"], #continue');
+          if (signInBtn) {
+            clickSafe(signInBtn);
+            trackEvent(EVENT_TYPES.LOGIN, "Clicked Sign In (no CAPTCHA)", loginDetails.username);
+          } else {
+            log("Sign In button not found");
+          }
+        }
       }
 
       const responseFields = document.querySelectorAll('[id$="_response"]');
@@ -2150,6 +2162,93 @@
       missedDate: null,
     },
   };
+
+  // ─── RATE TRACKER ───────────────────────────────────────────────
+  const RATE_SOFT_LIMIT = 4;   // req/min → add extra delay
+  const RATE_HARD_LIMIT = 6;   // req/min → pause 60s
+  const RATE_WINDOW_MS = 60000; // 60 second sliding window
+  const RATE_FLUSH_INTERVAL_MS = 60000; // flush stats every 60s
+
+  let rateTracker = {
+    window: [],              // timestamps of each request
+    totalRequests: 0,
+    successfulRequests: 0,
+    blockedRequests: 0,
+    delays: [],              // delay values for avg calculation
+    locationsChecked: new Set(),
+    errorTypes: {},
+    periodStart: null,
+    flushTimer: null,
+  };
+
+  function rateTrackerReset() {
+    rateTracker.window = [];
+    rateTracker.totalRequests = 0;
+    rateTracker.successfulRequests = 0;
+    rateTracker.blockedRequests = 0;
+    rateTracker.delays = [];
+    rateTracker.locationsChecked = new Set();
+    rateTracker.errorTypes = {};
+    rateTracker.periodStart = new Date().toISOString();
+    if (rateTracker.flushTimer) clearInterval(rateTracker.flushTimer);
+    rateTracker.flushTimer = null;
+  }
+
+  function rateTrackerRecord(locName, success, delaySec) {
+    const now = Date.now();
+    rateTracker.window.push(now);
+    rateTracker.totalRequests++;
+    if (success) rateTracker.successfulRequests++;
+    else rateTracker.blockedRequests++;
+    if (delaySec != null) rateTracker.delays.push(delaySec);
+    if (locName) rateTracker.locationsChecked.add(locName);
+    // Trim window to last 60s
+    rateTracker.window = rateTracker.window.filter(t => now - t < RATE_WINDOW_MS);
+  }
+
+  function rateTrackerRecordError(errorType) {
+    rateTracker.errorTypes[errorType] = (rateTracker.errorTypes[errorType] || 0) + 1;
+  }
+
+  function rateTrackerGetRate() {
+    const now = Date.now();
+    rateTracker.window = rateTracker.window.filter(t => now - t < RATE_WINDOW_MS);
+    return rateTracker.window.length;
+  }
+
+  async function rateTrackerFlush() {
+    if (rateTracker.totalRequests === 0) return;
+    const avgDelay = rateTracker.delays.length > 0
+      ? Math.round((rateTracker.delays.reduce((a, b) => a + b, 0) / rateTracker.delays.length) * 10) / 10
+      : 0;
+    const stats = {
+      username: "",
+      periodStart: rateTracker.periodStart,
+      periodEnd: new Date().toISOString(),
+      totalRequests: rateTracker.totalRequests,
+      successfulRequests: rateTracker.successfulRequests,
+      blockedRequests: rateTracker.blockedRequests,
+      avgDelaySec: avgDelay,
+      locationsChecked: Array.from(rateTracker.locationsChecked),
+      errorTypes: rateTracker.errorTypes,
+    };
+    // Get username
+    const d = await new Promise(r => chrome.storage.local.get(["loginDetails"], r));
+    stats.username = d.loginDetails?.username || "";
+    // Push to Supabase
+    if (SUPABASE_ENABLED && SupabaseSync.isReady()) {
+      await SupabaseSync.pushRequestStats(stats);
+      log(`Rate stats flushed: ${stats.totalRequests} req, ${stats.successfulRequests} ok, ${stats.blockedRequests} blocked, avg ${avgDelay}s`);
+    }
+    // Reset counters for next period (keep window for rate calc)
+    rateTracker.totalRequests = 0;
+    rateTracker.successfulRequests = 0;
+    rateTracker.blockedRequests = 0;
+    rateTracker.delays = [];
+    rateTracker.locationsChecked = new Set();
+    rateTracker.errorTypes = {};
+    rateTracker.periodStart = new Date().toISOString();
+  }
   const GRACE_PERIOD_ROUNDS = 5;
   const GRACE_PERIOD_INTERVAL_MS = 10000;
 
@@ -2524,6 +2623,7 @@
     log(`"Unable to load" — re-entry #${__reentryCount}, ran ${roundsCompleted} rounds. Cooldown ${cooldownSec}s then navigate to dashboard.`);
 
     // Stop cycling immediately
+    rateTrackerRecordError("unable_to_load");
     if (cycling.active) stopCycling("Unable to load — navigating to dashboard");
 
     chrome.storage.local.get(["loginDetails"], async (d) => {
@@ -2893,6 +2993,11 @@
     });
     cycling.active = true;
     cycling.round = 0;
+    // Reset rate tracker and start periodic flush
+    rateTrackerReset();
+    rateTracker.flushTimer = setInterval(() => {
+      if (cycling.active) rateTrackerFlush();
+    }, RATE_FLUSH_INTERVAL_MS);
     const locs = Array.from(checked).map((cb) => cb.dataset.name || cb.value).join(", ");
     const startDate = document.getElementById("ab-start-date")?.value || "—";
     const endDate = document.getElementById("ab-end-date")?.value || "—";
@@ -3035,6 +3140,9 @@
       clearTimeout(cycling.timer);
       cycling.timer = null;
     }
+    // Flush final rate stats and stop timer
+    if (rateTracker.flushTimer) { clearInterval(rateTracker.flushTimer); rateTracker.flushTimer = null; }
+    rateTrackerFlush();
     // Reset grace period state
     cycling.gracePeriod = {
       active: false, location: null, roundsRemaining: 0,
@@ -3404,10 +3512,11 @@
       if (i > 0) {
         const delaySec = humanDelay();
         const totalSec = Math.ceil(delaySec);
+        const rateInfo = rateTrackerGetRate();
         for (let s = totalSec; s > 0; s--) {
           if (!cycling.active || __abortAll) return;
           if (await checkStopSignal()) return;
-          setStatus(`Waiting ${s}s before next location...`);
+          setStatus(`Waiting ${s}s before next location — ${rateInfo} req/min`);
           await sleep(1000);
         }
       }
@@ -3457,8 +3566,33 @@
         return;
       }
 
+      // ── Rate throttle check before request ──
+      const currentRate = rateTrackerGetRate();
+      if (currentRate >= RATE_HARD_LIMIT) {
+        log(`Rate hard cap hit: ${currentRate} req/min — pausing 60s`);
+        rateTrackerRecordError("hard_cap");
+        chrome.storage.local.get(["loginDetails"], (d) => {
+          const u = d.loginDetails?.username || "";
+          trackEvent(EVENT_TYPES.CYCLING, `Rate hard cap (${currentRate}/min) — pausing 60s`, u);
+        });
+        for (let s = 60; s > 0; s--) {
+          if (!cycling.active || __abortAll) return;
+          setStatus(`⚠️ Rate cap (${currentRate}/min) — cooling ${s}s...`);
+          await sleep(1000);
+        }
+      } else if (currentRate >= RATE_SOFT_LIMIT) {
+        const extraWait = 15;
+        log(`Rate soft throttle: ${currentRate} req/min — adding ${extraWait}s delay`);
+        for (let s = extraWait; s > 0; s--) {
+          if (!cycling.active || __abortAll) return;
+          setStatus(`🐢 Soft throttle (${currentRate}/min) — extra ${s}s...`);
+          await sleep(1000);
+        }
+      }
+
       const loc = locations[i];
-      setStatus(`Checking ${loc.name} (${i + 1}/${locations.length})...`);
+      const rateDisplay = rateTrackerGetRate();
+      setStatus(`Checking ${loc.name} (${i + 1}/${locations.length}) — ${rateDisplay} req/min`);
 
       const select = document.getElementById("post_select");
       if (!select) {
@@ -3476,16 +3610,22 @@
         select.dispatchEvent(new Event("change", { bubbles: true }));
       }
 
+      const requestStartTime = Date.now();
       const data = await dataPromise;
+      const requestDelaySec = (Date.now() - requestStartTime) / 1000;
 
       // Check for Turnstile after data fetch
       if (detectTurnstileChallenge()) {
+        rateTrackerRecord(loc.name, false, requestDelaySec);
+        rateTrackerRecordError("turnstile");
         continue; // loop back — Turnstile handler at top of next iteration
       }
 
       // Check for 429 after data fetch
       if (__rateLimited429) {
         __rateLimited429 = false;
+        rateTrackerRecord(loc.name, false, requestDelaySec);
+        rateTrackerRecordError("429");
         cycling.backoffMs = cycling.backoffMs ? Math.min(cycling.backoffMs * 2, 300000) : 60000;
         const waitSec = Math.round(cycling.backoffMs / 1000);
         setStatus(`Rate limited (429)! Pausing ${waitSec}s...`);
@@ -3498,6 +3638,9 @@
         if (!cycling.active) return;
         continue; // retry this round
       }
+
+      // Record successful request
+      rateTrackerRecord(loc.name, true, requestDelaySec);
 
       // Reset backoff on successful request
       cycling.backoffMs = 0;

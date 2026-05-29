@@ -503,6 +503,27 @@ const SupabaseSync = (() => {
     }
   }
 
+  async function pushRequestStats(stats) {
+    if (!isReady()) return;
+    try {
+      const stored = await chrome.storage.local.get(["__supabase_device_name"]);
+      await insert("request_stats", {
+        device_name: stored.__supabase_device_name || null,
+        username: stats.username || "",
+        period_start: stats.periodStart,
+        period_end: stats.periodEnd,
+        total_requests: stats.totalRequests || 0,
+        successful_requests: stats.successfulRequests || 0,
+        blocked_requests: stats.blockedRequests || 0,
+        avg_delay_sec: stats.avgDelaySec || 0,
+        locations_checked: stats.locationsChecked || [],
+        error_types: stats.errorTypes || {},
+      });
+    } catch (e) {
+      console.error("[SupabaseSync] pushRequestStats failed:", e.message);
+    }
+  }
+
   async function pullDailyStats(filters = {}) {
     if (!isReady()) return [];
     let params = "select=*&order=stat_date.desc,stat_hour.asc&limit=500";
@@ -646,6 +667,7 @@ const SupabaseSync = (() => {
     // Stats
     pushDailyStat,
     pullDailyStats,
+    pushRequestStats,
 
     // Devices
     getDevices,
