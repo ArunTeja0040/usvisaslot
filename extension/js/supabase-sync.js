@@ -312,6 +312,7 @@ const SupabaseSync = (() => {
             { question: p.security_q3, answer: await decrypt(p.security_a3_enc) },
           ].filter(q => q.question),
           updatedAt: p.updated_at,
+          rateLimitedAt: p.rate_limited_at,
         });
       }
 
@@ -503,6 +504,35 @@ const SupabaseSync = (() => {
     }
   }
 
+  async function setRateLimitedAt(username, timestamp) {
+    if (!isReady()) return;
+    try {
+      await update("user_profiles", { operator_id: operatorId, username }, {
+        rate_limited_at: timestamp,
+        status: "rate_limited",
+        is_active: false,
+        active_device_id: null,
+        active_device_name: null,
+        updated_at: new Date().toISOString(),
+      });
+    } catch (e) {
+      console.error("[SupabaseSync] setRateLimitedAt failed:", e.message);
+    }
+  }
+
+  async function clearRateLimitedAt(username) {
+    if (!isReady()) return;
+    try {
+      await update("user_profiles", { operator_id: operatorId, username }, {
+        rate_limited_at: null,
+        status: "idle",
+        updated_at: new Date().toISOString(),
+      });
+    } catch (e) {
+      console.error("[SupabaseSync] clearRateLimitedAt failed:", e.message);
+    }
+  }
+
   async function pushRequestStats(stats) {
     if (!isReady()) return;
     try {
@@ -668,6 +698,10 @@ const SupabaseSync = (() => {
     pushDailyStat,
     pullDailyStats,
     pushRequestStats,
+
+    // Rate limit
+    setRateLimitedAt,
+    clearRateLimitedAt,
 
     // Devices
     getDevices,

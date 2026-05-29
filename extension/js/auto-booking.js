@@ -1972,6 +1972,7 @@
       chrome.storage.local.get(["activeAutomationUser"], (d) => resolve(d.activeAutomationUser || null));
     });
     const isRelogin = sessionStorage.getItem(RELOGIN_FLAG) === "true";
+    log(`[DEBUG] Login page check — activeAutoUser: ${activeAutoUser || "null"}, isRelogin: ${isRelogin}, abortAll: ${__abortAll}`);
 
     if (activeAutoUser || isRelogin) {
       sessionStorage.removeItem(RELOGIN_FLAG);
@@ -4120,6 +4121,44 @@
           `🔄 Redirecting to OFC schedule page`
         );
         window.location.href = window.location.origin + "/en-US/ofc-schedule/";
+        return;
+      }
+    }
+
+    // Check for "exceeded the limit" rate limit warning on OFC/booking page
+    // Wait a moment for page to render the warning
+    await sleep(2000);
+    const rateLimitWarning = document.querySelector("#error_row .alert-warning, .alert-warning.warning");
+    if (rateLimitWarning) {
+      const warnText = (rateLimitWarning.textContent || "").toLowerCase();
+      if (warnText.includes("exceeded") || warnText.includes("limit for viewing")) {
+        const activeUser = settings.loginDetails?.username || "";
+        log(`Rate limit exceeded on booking page: "${rateLimitWarning.textContent.trim()}"`);
+        trackEvent(EVENT_TYPES.ERROR, "Rate limit exceeded on booking page — auto-logout", activeUser);
+        sendTelegramNotification("error",
+          `🔴 <b>RATE LIMIT EXCEEDED</b>\n\n` +
+          `👤 <b>User:</b> ${activeUser}\n` +
+          `⚠️ "${rateLimitWarning.textContent.trim()}"\n` +
+          `🔒 <b>Blocked for ~24 hours</b>\n` +
+          `🚪 Auto-logout in progress...`
+        );
+        updateUserStatus(activeUser, "rate_limited");
+        // Save rate_limited_at timestamp to Supabase
+        if (SUPABASE_ENABLED && SupabaseSync.isReady()) {
+          try {
+            await SupabaseSync.setRateLimitedAt(activeUser, new Date().toISOString());
+          } catch (e) { log("Failed to save rate_limited_at: " + e.message); }
+        }
+        // Use same severe logout flow as #21
+        if (cycling.active) stopCycling("Rate limit exceeded — auto-logout");
+        __abortAll = true;
+        window.__autoBookingLoginActive = false;
+        if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
+        // Clear credentials so bot doesn't auto-login after sign-out
+        chrome.storage.local.remove(["activeAutomationUser"]);
+        sessionStorage.clear();
+        sessionStorage.setItem("__abSevereLogout", "Rate Limit Exceeded (24h block)");
+        window.location.href = window.location.origin + "/en-US/";
         return;
       }
     }

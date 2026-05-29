@@ -187,7 +187,7 @@
     // Build cloud status map: username → { status, activeDeviceId, isActive }
     const cloudStatusMap = {};
     cloudProfiles.forEach(cp => {
-      cloudStatusMap[cp.username] = { status: cp.status, activeDeviceId: cp.activeDeviceId, isActive: cp.isActive };
+      cloudStatusMap[cp.username] = { status: cp.status, activeDeviceId: cp.activeDeviceId, isActive: cp.isActive, rateLimitedAt: cp.rateLimitedAt };
     });
 
     const myDeviceId = SUPA ? SUPA.getDeviceId() : null;
@@ -209,11 +209,21 @@
       const deviceLastSeen = activeDevice && activeDevice.lastSeen ? timeAgo(activeDevice.lastSeen) : null;
       const isStaleDevice = activeDevice && activeDevice.lastSeen && (Date.now() - new Date(activeDevice.lastSeen).getTime() > STALE_DEVICE_THRESHOLD_MS);
 
+      // Check rate limit — auto-clear if > 24h
+      const rateLimitedAt = cloud.rateLimitedAt;
+      const isRateLimited = userStatus === "rate_limited" || (rateLimitedAt && (Date.now() - new Date(rateLimitedAt).getTime() < 24 * 60 * 60 * 1000));
+      const rateLimitHoursLeft = rateLimitedAt ? Math.max(0, Math.ceil((24 * 60 * 60 * 1000 - (Date.now() - new Date(rateLimitedAt).getTime())) / 3600000)) : 0;
+
+      // Auto-clear expired rate limits
+      if (rateLimitedAt && !isRateLimited && SUPA && SUPA.isReady()) {
+        SUPA.clearRateLimitedAt(profile.username);
+      }
+
       let cardClass = "user-card";
       if (isActive) cardClass += " active";
       else if (userStatus === "confirmed") cardClass += " confirmed";
       else if (userStatus === "slot_found") cardClass += " slot-found";
-      else if (["rate_limited", "session_expired", "error"].includes(userStatus)) cardClass += " error";
+      else if (isRateLimited || ["session_expired", "error"].includes(userStatus)) cardClass += " error";
 
       const locs = (profile.locations || []).map((l) => `<span class="loc-tag">${esc(l)}</span>`).join("");
       const safeUser = esc(profile.username);
@@ -229,6 +239,7 @@
           </div>
           ${activeOnOtherDevice ? `<div style="background:#e74c3c22;border:1px solid #e74c3c55;border-radius:4px;padding:4px 8px;margin:4px 0;font-size:11px;color:#ef5350;">⚠️ Active on <b>${esc(activeDeviceName || "another device")}</b> ${deviceLastSeen ? `(${deviceLastSeen})` : ""} ${isStaleDevice ? '<span style="color:#f39c12;"> — stale</span>' : ""}</div>` : ""}
           ${isActive && activeDeviceName && !activeOnOtherDevice ? `<div style="font-size:11px;color:#3ecf8e;margin:2px 0;">📍 Running on <b>${esc(activeDeviceName)}</b> ${deviceLastSeen ? `(${deviceLastSeen})` : ""}</div>` : ""}
+          ${isRateLimited ? `<div style="background:#e74c3c33;border:1px solid #e74c3c88;border-radius:4px;padding:6px 8px;margin:4px 0;font-size:11px;color:#ef5350;font-weight:bold;">🔴 RATE LIMITED — blocked for ~${rateLimitHoursLeft}h. Do NOT login this user from any profile.</div>` : ""}
           <div class="card-details">
             <div class="card-detail">
               <span class="detail-label">Dates:</span>
@@ -277,7 +288,9 @@
               : isActive
                 ? `<button class="btn btn-small btn-red btn-stop" data-user="${safeUser}">Stop</button>
                    <button class="btn btn-small btn-orange btn-logout" data-user="${safeUser}">Logout</button>`
-                : `<button class="btn btn-small btn-green btn-start" data-user="${safeUser}">Start Now</button>`}
+                : isRateLimited
+                  ? `<button class="btn btn-small btn-force-rate-limit" data-user="${safeUser}" style="background:#7f8c8d;color:white;" title="Shift+Click to force login despite rate limit">🔴 Blocked (~${rateLimitHoursLeft}h)</button>`
+                  : `<button class="btn btn-small btn-green btn-start" data-user="${safeUser}">Start Now</button>`}
             <button class="btn btn-small btn-gray btn-edit" data-user="${safeUser}">Edit</button>
             <button class="btn btn-small btn-blue btn-history" data-user="${safeUser}" style="background:#3498db;color:white;">📜 History</button>
           </div>
@@ -909,6 +922,17 @@
       }
       if (!confirm(`Force start "${username}"?\n\nThis will mark it as stopped on "${deviceName}" and start it here.`)) return;
       forceStartUser(username);
+    } else if (btn.classList.contains("btn-force-rate-limit")) {
+      if (!e.shiftKey) {
+        alert(`"${username}" is rate-limited (~24h block).\n\nHold Shift + Click to force login anyway.`);
+        return;
+      }
+      if (!confirm(`Force login "${username}" despite rate limit?\n\nThis user may still be blocked by the site.`)) return;
+      // Clear rate limit in Supabase
+      if (SUPA && SUPA.isReady()) {
+        SUPA.clearRateLimitedAt(username);
+      }
+      startUser(username);
     } else if (btn.classList.contains("btn-stop")) {
       stopUser(username);
     } else if (btn.classList.contains("btn-logout")) {
