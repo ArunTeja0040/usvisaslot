@@ -2037,6 +2037,9 @@
       // Wait for page to fully load
       await sleep(2000);
 
+      // Dashboard reachable → reset severe attempt counter (logout will succeed)
+      sessionStorage.removeItem("__abSevereCount");
+
       const signOutLink = document.querySelector('a[href*="LogOff"], a[href*="sign-out"], a[href*="signout"], a[href*="logout"], a[aria-label="Sign out"]');
       if (signOutLink) {
         log("Sign-out link found — clicking to logout");
@@ -2665,18 +2668,49 @@
   }
 
   // Handle severe errors (429, Error 1015, Cloudflare blocked) — auto-logout
+  const SEVERE_MAX_ATTEMPTS = 2;  // try dashboard logout this many times, then give up
   function handleSevereError(reason) {
-    log(`Severe error: ${reason} — navigating to dashboard for logout`);
+    // Re-entry guard — prevent flood within the same page (1015 detected repeatedly)
+    if (window.__severeErrorHandling) return;
+    window.__severeErrorHandling = true;
+
+    // Attempt counter survives navigation (same-origin sessionStorage)
+    const attempts = parseInt(sessionStorage.getItem("__abSevereCount") || "0") + 1;
+
     if (cycling.active) stopCycling(`${reason} — auto-logout`);
 
     chrome.storage.local.get(["loginDetails"], (d) => {
       const u = d.loginDetails?.username || "";
-      trackEvent(EVENT_TYPES.ERROR, `Severe: ${reason} — auto-logout triggered`, u);
+
+      // If we've already tried navigating to dashboard MAX times and still blocked,
+      // the whole site is rate-limited — stop looping. Log once and wait (stable behavior).
+      if (attempts > SEVERE_MAX_ATTEMPTS) {
+        log(`Severe error: ${reason} — site still blocked after ${SEVERE_MAX_ATTEMPTS} attempts. Stopping, will wait.`);
+        trackEvent(EVENT_TYPES.ERROR, `Severe: ${reason} — site fully blocked, waiting (no more retries)`, u);
+        sendTelegramNotification("error",
+          `🚫 <b>${reason.toUpperCase()}</b>\n\n` +
+          `👤 <b>User:</b> ${u}\n` +
+          `⚠️ Whole site blocked — logout not possible\n` +
+          `⏸️ Stopped. Wait a few minutes before retrying.`
+        );
+        updateUserStatus(u, "rate_limited");
+        __abortAll = true;
+        window.__autoBookingLoginActive = false;
+        if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
+        chrome.storage.local.remove(["activeAutomationUser"]);
+        sessionStorage.removeItem("__abSevereCount");
+        return; // stay on page, do nothing further
+      }
+
+      // Otherwise: try dashboard logout
+      sessionStorage.setItem("__abSevereCount", String(attempts));
+      log(`Severe error: ${reason} — navigating to dashboard for logout (attempt ${attempts}/${SEVERE_MAX_ATTEMPTS})`);
+      trackEvent(EVENT_TYPES.ERROR, `Severe: ${reason} — auto-logout triggered (attempt ${attempts}/${SEVERE_MAX_ATTEMPTS})`, u);
       sendTelegramNotification("error",
         `🚫 <b>${reason.toUpperCase()}</b>\n\n` +
         `👤 <b>User:</b> ${u}\n` +
         `🔁 Ran <b>${cycling.round}</b> rounds\n` +
-        `🔒 <b>AUTO-LOGOUT</b> — navigating to dashboard to sign out`
+        `🔒 <b>AUTO-LOGOUT</b> — navigating to dashboard to sign out (attempt ${attempts}/${SEVERE_MAX_ATTEMPTS})`
       );
       updateUserStatus(u, "idle");
 
@@ -2689,7 +2723,6 @@
       chrome.storage.local.remove(["activeAutomationUser"]);
 
       // Set flag so dashboard knows to logout instead of auto-clicking Continue
-      sessionStorage.clear();
       sessionStorage.setItem("__abSevereLogout", reason);
 
       // Navigate to dashboard where sign-out link always exists
