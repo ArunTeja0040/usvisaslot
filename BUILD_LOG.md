@@ -12,6 +12,11 @@ Format:
 
 ---
 
+## 2026-05-31 — "Ask all cities at once" function + test button (Issue #30, Activity 2 of 4)
+**What it does:** Built the function that sends a request to ALL cities at the same time (instead of one-by-one) and reads back each city's available dates. Added a purple "⚡ TEST PARALLEL SCAN" button on the booking panel so you can try it with one click.
+**Why:** This is the core of the speed boost — checking 5 cities together takes ~3-5 seconds instead of ~50. The button lets us prove it works and is accurate before wiring it into the real cycling.
+**What changed for you:** A new purple button on the OFC booking panel (test build only). Clicking it scans all cities instantly and shows each city's dates + how fast it was. It does NOT book anything and does NOT change the normal cycling yet.
+
 ## 2026-05-31 — Remember the real slot request (Issue #29, Activity 1 of 4)
 **What it does:** When you change the city dropdown, the test extension now quietly remembers the exact request the website made (the web address + your per-session IDs).
 **Why:** So later we can copy that exact request to ask all 5 cities at once — using the real thing, never a guess.

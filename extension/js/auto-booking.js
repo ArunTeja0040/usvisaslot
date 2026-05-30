@@ -2347,8 +2347,13 @@
                   style="background:#e65100;color:white;border:none;padding:8px 28px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:14px;">
             LOGOUT
           </button>
+          <button id="ab-parallel-test-btn"
+                  style="background:#6c5ce7;color:white;border:none;padding:8px 20px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:13px;">
+            ⚡ TEST PARALLEL SCAN
+          </button>
           <span id="ab-cycle-info" style="font-size:12px;color:#888;margin-left:10px;"></span>
         </div>
+        <div id="ab-parallel-result" style="font-size:12px;color:#6c5ce7;margin-top:8px;white-space:pre-wrap;"></div>
       </div>`;
 
     mainContainer.parentNode.insertBefore(panel, mainContainer);
@@ -2388,6 +2393,25 @@
         log("START button clicked");
         startCycling();
       });
+
+    // TEST PARALLEL SCAN button (A2) — run all-cities-at-once fetch, show results
+    const parTestBtn = document.getElementById("ab-parallel-test-btn");
+    if (parTestBtn) parTestBtn.addEventListener("click", async () => {
+      const out = document.getElementById("ab-parallel-result");
+      if (!scheduleTemplate) {
+        out.textContent = "⚠️ No template yet — change the city dropdown once first, then click again.";
+        return;
+      }
+      out.textContent = "⚡ Scanning all cities in parallel...";
+      const t0 = Date.now();
+      const res = await parallelScan();
+      if (!res) { out.textContent = "⚠️ Scan failed — no template."; return; }
+      const lines = Object.values(res).map((r) =>
+        r.ok ? `✅ ${r.name}: ${r.dates.length} date(s)${r.dates.length ? " → " + r.dates.slice(0, 5).join(", ") : ""} (${r.ms}ms)`
+             : `❌ ${r.name}: ${r.error || ("HTTP " + r.status)}`
+      );
+      out.textContent = `Done in ${Date.now() - t0}ms (all cities together):\n` + lines.join("\n");
+    });
     document
       .getElementById("ab-stop-btn")
       .addEventListener("click", () => {
@@ -3019,6 +3043,71 @@
     sessionStorage.setItem(RELOGIN_FLAG, "true");
     window.location.href = window.location.origin;
   }
+
+  // ─── PARALLEL SCAN (A2) — fetch all cities at once via captured template ──
+
+  // Extract the JSON object from a response that may have leading whitespace/markup.
+  function extractScheduleJson(text) {
+    if (!text) return null;
+    let i = text.indexOf('{"ScheduleDays');
+    if (i < 0) i = text.indexOf("{");
+    if (i < 0) return null;
+    try { return JSON.parse(text.slice(i)); } catch (e) { return null; }
+  }
+
+  // Fire all cities in parallel using the captured template. Detection only.
+  // Returns { postId: { ok, name, dates:[], status, ms, hasError, error } } or null if no template.
+  async function parallelScan(postIds) {
+    if (!scheduleTemplate || !scheduleTemplate.url || !scheduleTemplate.body) {
+      log("[parallel] no template captured yet — cannot scan");
+      return null;
+    }
+    const sel = document.getElementById("post_select");
+    const nameMap = {};
+    if (sel) Array.from(sel.options).forEach((o) => { if (o.value) nameMap[o.value] = (o.text || "").trim(); });
+    if (!postIds || !postIds.length) postIds = Object.keys(nameMap);
+
+    const headers = {
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      "Accept": "application/json, text/javascript, */*; q=0.01",
+      "X-Requested-With": "XMLHttpRequest",
+    };
+
+    const eq = scheduleTemplate.body.indexOf("=");
+    const baseJsonStr = scheduleTemplate.body.slice(eq + 1);
+
+    const results = {};
+    const scanStart = Date.now();
+    const tasks = postIds.map((pid, idx) => (async () => {
+      await sleep(idx * 250); // stagger to avoid burst-block
+      const name = nameMap[pid] || pid;
+      let body;
+      try {
+        const obj = JSON.parse(baseJsonStr);
+        obj.postId = pid;
+        obj.scheduleDayId = "";
+        obj.scheduleEntryId = "";
+        body = "parameters=" + JSON.stringify(obj);
+      } catch (e) { results[pid] = { ok: false, name, error: "body build: " + e.message }; return; }
+      const url = scheduleTemplate.url.replace(/cacheString=\d+/, "cacheString=" + Date.now());
+      const t0 = Date.now();
+      try {
+        const resp = await fetch(url, { method: "POST", headers, body, credentials: "include" });
+        const text = await resp.text();
+        const json = extractScheduleJson(text);
+        const dates = (json && Array.isArray(json.ScheduleDays)) ? json.ScheduleDays.map((d) => d.Date) : [];
+        results[pid] = { ok: resp.status === 200 && !!json, name, status: resp.status, dates, ms: Date.now() - t0, hasError: json ? json.HasError : null };
+      } catch (e) {
+        results[pid] = { ok: false, name, error: e.message, ms: Date.now() - t0 };
+      }
+    })());
+    await Promise.all(tasks);
+    const summary = Object.values(results).map((r) => `${r.name}:${r.ok ? (r.dates.length + "d") : ("ERR " + (r.error || r.status))}`);
+    log(`[parallel] scan done in ${Date.now() - scanStart}ms → ${summary.join(", ")}`);
+    return results;
+  }
+  // Expose for manual testing in the TEST build (call from booking panel button).
+  if (TEST_MODE) window.__parallelScan = parallelScan;
 
   // ─── CYCLING LOGIC ─────────────────────────────────────────────────
 
