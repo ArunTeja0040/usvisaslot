@@ -1,7 +1,14 @@
 (function () {
   "use strict";
 
-  const LOG_PREFIX = "[AutoBook]";
+  const LOG_PREFIX = "[AutoBook-TEST]";
+  // ─── TEST MODE ──────────────────────────────────────────────────
+  // This is the TEST build (feature/parallel-booking worktree).
+  // - Telegram messages prefixed [TEST]
+  // - Auto-submit FORCED OFF during detection-stage testing (protect real client)
+  // - Device name auto-prefixed TEST- so dashboard can filter test noise
+  const TEST_MODE = true;
+  const TEST_FORCE_NO_SUBMIT = true;  // flip to false only when booking stage approved
   const SUPABASE_ENABLED = typeof SupabaseSync !== "undefined";
   const CAPTCHA_MAX_RETRIES = 5;
   const DASHBOARD_CLICK_DELAY = 2000;
@@ -361,7 +368,8 @@
       if (notify[type] === false) return;
 
       const ts = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true, hour: "2-digit", minute: "2-digit", second: "2-digit", day: "2-digit", month: "short" });
-      const fullMessage = message + `\n\n🕐 <i>${ts} IST</i>`;
+      const prefix = TEST_MODE ? "🧪 <b>[TEST]</b>\n" : "";
+      const fullMessage = prefix + message + `\n\n🕐 <i>${ts} IST</i>`;
 
       const payload = { action: "sendTelegram", text: fullMessage };
       if (replyMarkup) payload.replyMarkup = replyMarkup;
@@ -1356,6 +1364,7 @@
         deviceName = prompt("Name this Chrome profile (e.g. Arun-Main, Kavita-Laptop):");
         if (!deviceName || !deviceName.trim()) { statusEl.textContent = "Device name required!"; statusEl.style.color = "#e74c3c"; return; }
         deviceName = deviceName.trim();
+        if (TEST_MODE && !/^TEST-/i.test(deviceName)) deviceName = "TEST-" + deviceName;
       }
 
       statusEl.textContent = "Connecting...";
@@ -1552,7 +1561,9 @@
 
         // Connect to Supabase + register device
         if (SUPABASE_ENABLED) {
-          await SupabaseSync.init(config.supabaseOperatorKey, config.supabaseMasterPassword, deviceName.trim());
+          let regName = deviceName.trim();
+          if (TEST_MODE && !/^TEST-/i.test(regName)) regName = "TEST-" + regName;
+          await SupabaseSync.init(config.supabaseOperatorKey, config.supabaseMasterPassword, regName);
 
           // Pull all user profiles
           const cloudProfiles = await SupabaseSync.pullProfiles();
@@ -3897,7 +3908,7 @@
           `👤 ${u} · 🕐 ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true, hour: "2-digit", minute: "2-digit", day: "2-digit", month: "short" })} IST`
         );
 
-        if (settings["is_auto-submit"]) {
+        if (settings["is_auto-submit"] && !(TEST_MODE && TEST_FORCE_NO_SUBMIT)) {
           setStatus(`${loc.name}: Slot found on ${tryDate.Date} — auto-submitting!`);
           await sleep(1000);
           const submitBtn = document.getElementById("submitbtn");
@@ -4088,6 +4099,11 @@
   // ─── AUTO-SUBMIT OBSERVER (standalone, without cycling) ────────────
 
   function setupAutoSubmit() {
+    if (TEST_MODE && TEST_FORCE_NO_SUBMIT) {
+      log("TEST_MODE: auto-submit DISABLED — detection-only stage, will not book");
+      sendTelegramNotification("cycling", `🧪 Auto-submit blocked (TEST detection stage) — no real booking`);
+      return;
+    }
     log("Auto-submit observer active");
 
     // Narrow observation to #time_select or #page_form instead of entire body

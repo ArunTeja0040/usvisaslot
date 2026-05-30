@@ -1813,6 +1813,7 @@
       deviceName = prompt("Name this Chrome profile (e.g. Arun-Main, Kavita-Laptop):");
       if (!deviceName || !deviceName.trim()) { statusEl.textContent = "Device name required!"; statusEl.style.color = "#ef5350"; return; }
       deviceName = deviceName.trim();
+      if (!/^TEST-/i.test(deviceName)) deviceName = "TEST-" + deviceName;  // TEST build tag
     }
 
     statusEl.textContent = "Connecting...";
@@ -1957,12 +1958,14 @@
       return;
     }
 
-    const deviceName = prompt("Name this Chrome profile (e.g. Ravi-Laptop, Arun-Main):");
+    let deviceName = prompt("Name this Chrome profile (e.g. Ravi-Laptop, Arun-Main):");
     if (!deviceName || !deviceName.trim()) {
       statusEl.textContent = "Device name required!";
       statusEl.style.color = "#ef5350";
       return;
     }
+    deviceName = deviceName.trim();
+    if (!/^TEST-/i.test(deviceName)) deviceName = "TEST-" + deviceName;  // TEST build tag
 
     statusEl.textContent = "Importing...";
     statusEl.style.color = "#f39c12";
