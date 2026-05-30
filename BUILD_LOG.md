@@ -12,6 +12,11 @@ Format:
 
 ---
 
+## 2026-05-31 — Remember the real slot request (Issue #29, Activity 1 of 4)
+**What it does:** When you change the city dropdown, the test extension now quietly remembers the exact request the website made (the web address + your per-session IDs).
+**Why:** So later we can copy that exact request to ask all 5 cities at once — using the real thing, never a guess.
+**What changed for you:** Nothing visible. Behind the scenes, after you change the city once, the console shows "template captured". No effect on booking or cycling. Just the foundation for the fast all-at-once scan coming next.
+
 ## 2026-05-31 — Investigated how the site fetches slots (Issue #28)
 **What it does:** We watched the real request the website makes when you change the city dropdown, and wrote down exactly how it works.
 **Why:** So when we build the "check all cities at once" feature, we copy the real request instead of guessing — no risk of getting blocked for sending a wrong request.

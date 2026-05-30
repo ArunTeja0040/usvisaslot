@@ -10,6 +10,8 @@
   const TEST_MODE = true;
   const TEST_FORCE_NO_SUBMIT = true;  // flip to false only when booking stage approved
   const SUPABASE_ENABLED = typeof SupabaseSync !== "undefined";
+  // Parallel-scan: captured real schedule-days request template (A1)
+  let scheduleTemplate = null;
   const CAPTCHA_MAX_RETRIES = 5;
   const DASHBOARD_CLICK_DELAY = 2000;
   const MAX_EVENT_LOG = 500;
@@ -4389,6 +4391,16 @@
     // Inject 401 detector on scheduling pages (MAIN world XHR intercept)
     if (host.includes("usvisascheduling.com")) {
       inject401Detector();
+
+      // Parallel-scan A1: capture the real schedule-days request template from page.js (MAIN world)
+      window.addEventListener("vSCPTemplate", (e) => {
+        const t = e.detail || {};
+        if (!t.url || !t.body) return;
+        scheduleTemplate = t;
+        const hasAppd = /appd=/.test(t.url);
+        const hasPrimary = /primaryId/.test(t.body);
+        log(`[parallel] template captured — appd:${hasAppd} primaryId:${hasPrimary} url:${t.url.slice(0, 80)}`);
+      });
 
       // Listen for auto-dismissed alerts (from alert-override.js MAIN world script)
       document.addEventListener("__abAlertDismissed", (e) => {
