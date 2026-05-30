@@ -12,6 +12,11 @@ Format:
 
 ---
 
+## 2026-05-31 — Investigated how the site fetches slots (Issue #28)
+**What it does:** We watched the real request the website makes when you change the city dropdown, and wrote down exactly how it works.
+**Why:** So when we build the "check all cities at once" feature, we copy the real request instead of guessing — no risk of getting blocked for sending a wrong request.
+**What changed for you:** Nothing visible yet — this was research. Good news: the website's slot request needs no special security token, just your normal login. That means checking all 5 cities at the same time is safe and simple to build next. Findings saved in the project notes.
+
 ## 2026-05-31 — Test workspace set up (no issue)
 **What it does:** Created a separate, safe copy of the extension for testing new ideas, plus a set of guide documents so the assistant always knows the rules, the code, and the workflow without being reminded.
 **Why:** So new booking improvements can be built and tried in ONE test Chrome profile without ever touching the live extension that runs all your real clients.

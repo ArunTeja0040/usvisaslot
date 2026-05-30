@@ -22,7 +22,17 @@ Running memory across sessions. Newest on top.
 
 - **anuk0505 cross-device status:** showed cycling locally on one device but idle on others. Root: the cycling device wasn't writing status to Supabase (`isReady()` false / not connected on that profile), so cloud stayed stale (`on_dashboard`, device "Testing"). Stale device heartbeat (>10 min) → dashboard auto-cleanup marked it idle elsewhere. FIX PATH: ensure every device running users is Supabase-connected. (Unconfirmed whether the running profile was connected.)
 - **Date range empty after stop/start on OFC panel (closed #25):** dates set on OFC panel weren't persisted back to profile; closed without code fix — revisit if it recurs.
-- **Parallel detection (next enhancement):** plan = capture one real schedule request via page.js (URL+headers+token+body), replay per postId in parallel with stagger. Detection only, booking flow unchanged. Investigate page.js template-capture first.
+- **Parallel detection (next enhancement):** plan = capture one real schedule request via page.js, replay per postId in parallel with stagger. Detection only, booking flow unchanged.
+
+### Step 0 findings — schedule API (Issue #28, CONFIRMED via live capture)
+- Endpoint: `POST /en-US/custom-actions/?route=/api/v1/schedule-group/get-family-ofc-schedule-days&appd=<APPT_ID>&cacheString=<ms>`.
+- **No anti-forgery token in request** — auth is login COOKIE only (auto on same-origin fetch). Parallel replay is easy + low-risk on auth.
+- Body: `parameters={...,"primaryId":"<USER_ID>","applications":["<USER_ID>"],"postId":"<CITY>","isReschedule":"false"}` — only `postId` changes per city.
+- `appd` (URL) + `primaryId` (body) are per-session → capture live, reuse. `cacheString` = fresh `Date.now()`.
+- Response `{"ScheduleDays":[{Date}],...}`. Response `Token` only for downstream booking, not for days fetch.
+- City→postId map recorded in ARCHITECTURE.md.
+- Conclusion: parallel fetch is the clean approach — fire all 5 cities at once (staggered), cookies auto-attach, parse `ScheduleDays`. Booking flow untouched. Token reuse not even needed for detection.
+- Not yet tested: how many simultaneous fetches before Cloudflare pushback (will stagger + start conservative).
 
 ---
 

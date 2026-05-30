@@ -33,17 +33,39 @@ extension/
 
 ---
 
-## The Schedule API (for parallel detection)
+## The Schedule API (CONFIRMED via Issue #28 capture, 2026-05)
 
-When the location dropdown (`#post_select`) changes, the site POSTs to get schedule days. `page.js` intercepts it.
+When the location dropdown (`#post_select`) changes, the site POSTs to get schedule days. Confirmed from real captured requests:
 
-- **Endpoint pattern:** `.../schedule-group/get-family-(emergency-)?(ofc|consular)-schedule`
-- **Also:** `query-family-members`, `schedule-days` (vSD), `schedule-entries` (vST)
-- **Method:** POST, form-encoded body. Body has a `parameters` field = JSON string containing `postId` (the location id).
-- **Query params on URL:** `route`, `cacheString`.
-- **Response (schedule days):** `{ ScheduleDays: [{ Date: "YYYY-MM-DD" }, ...], postId: "..." }`
-- **Location map:** `#post_select` options → `value` = postId, `text` = location name (e.g. "MUMBAI VAC").
-- **Auth:** Power Apps portal. Requires `__RequestVerificationToken` + cookies (same-origin auto). **DO NOT hardcode/guess the token or body. CAPTURE a real request (page.js already has `_url`, `_requestHeaders`, `_postData`) and REPLAY it with a swapped postId.** See `extension-dev` skill.
+- **Endpoint (one URL for all cities):**
+  ```
+  POST /en-US/custom-actions/?route=/api/v1/schedule-group/get-family-ofc-schedule-days&appd=<APPT_ID>&cacheString=<ms-timestamp>
+  ```
+  - `appd` = appointment/application id — per user/session, SAME across all cities in a session.
+  - `cacheString` = millisecond timestamp, cache-buster, regenerate per call (`Date.now()`).
+- **Method:** POST, `Content-Type: application/x-www-form-urlencoded; charset=UTF-8`.
+- **Headers:** `Accept: application/json...`, `X-Requested-With: XMLHttpRequest`. `Request-Id`/`traceparent` are tracing, optional. **NO `__RequestVerificationToken`.**
+- **AUTH = LOGIN COOKIE ONLY.** Same-origin fetch auto-sends it. No anti-forgery token in the request → parallel replay is straightforward.
+- **Body (only `postId` changes per city):**
+  ```
+  parameters={"primaryId":"<USER_ID>","applications":["<USER_ID>"],"scheduleDayId":"","scheduleEntryId":"","postId":"<CITY_ID>","isReschedule":"false"}
+  ```
+  - `primaryId` + `applications[0]` = applicant id, per user/session, same across cities.
+  - `postId` = the city — the ONLY value to swap for parallel scan.
+  - `scheduleDayId`/`scheduleEntryId` empty for the days fetch (used in later booking steps).
+- **Response:** `{"ScheduleDays":[{Date:"YYYY-MM-DD"},...] , "ScheduleEntries":null, "CategoryID":"...", "Token":"...", "HasError":false, "Errors":{...}}`
+  - `ScheduleDays` = available dates (empty `[]` = no slots).
+  - `Token` (response) only needed for the downstream day/entry selection + booking, NOT for fetching days.
+- **City → postId map** (this session — re-read live, ids are stable per environment):
+  - CHENNAI VAC `3f6bf614-b0db-ec11-a7b4-001dd80234f6`
+  - HYDERABAD VAC `436bf614-b0db-ec11-a7b4-001dd80234f6`
+  - KOLKATA VAC `466bf614-b0db-ec11-a7b4-001dd80234f6`
+  - MUMBAI VAC `486bf614-b0db-ec11-a7b4-001dd80234f6`
+  - NEW DELHI VAC `4a6bf614-b0db-ec11-a7b4-001dd80234f6`
+- **page.js events:** schedule-days response → `vSCP` resource `vSD`; entries → `vST`; members → `vD`.
+
+### Parallel-fetch rule (capture-replay, still applies)
+`appd` + `primaryId` are per-user/session. CAPTURE them from the first real dropdown-change request (page.js sees `_url` + `_postData`), build a template, then `fetch()` all cities in parallel with swapped `postId` + fresh `cacheString`. Stagger 200-300ms to avoid burst-block. Booking flow stays on the existing dropdown path.
 
 ---
 
