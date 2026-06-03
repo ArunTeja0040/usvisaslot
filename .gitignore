@@ -13,3 +13,4 @@ test_report.html
 .chrome_profile/
 .bot_chrome_profile/
 .bot_chrome_data/
+.DS_Store
