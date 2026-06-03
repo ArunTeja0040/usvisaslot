@@ -9,6 +9,13 @@
   // - Device name auto-prefixed TEST- so dashboard can filter test noise
   const TEST_MODE = true;
   const TEST_FORCE_NO_SUBMIT = true;  // flip to false only when booking stage approved
+  // ─── PARALLEL SCAN config (A3) ──
+  const USE_PARALLEL_SCAN = true;     // after template captured, replace sequential per-city loop
+  const PARALLEL_STAGGER_MS = 300;    // ms between launching each city's request (gentle burst)
+  const PARALLEL_ROUND_MS = 20000;    // wait between parallel rounds (tunable in A4)
+  const PARALLEL_BATCH_SIZE = 2;      // cities scanned per round (rotating) — keeps 2 concurrent max (fast, no tarpit/429)
+  let __scanCursor = 0;               // rolling pointer into selected locations
+  const DISABLE_HUMAN_PAUSES = true;  // remove idle-gap + long-break (caused cold-session 403); keep steady round wait
   const SUPABASE_ENABLED = typeof SupabaseSync !== "undefined";
   // Parallel-scan: captured real schedule-days request template (A1)
   let scheduleTemplate = null;
@@ -2612,19 +2619,21 @@
     if (isWaitingRoom()) return false;
     // Check for Turnstile container div
     if (document.querySelector(".cf-turnstile, #cf-turnstile, [data-sitekey]")) return true;
+    // Cloudflare interstitial widget (often inside closed shadow-root, but these markers live on the OUTER page)
+    if (document.querySelector('input[name="cf-turnstile-response"], input#cf-chl-widget-response, #challenge-running, #challenge-form, #challenge-stage, .main-wrapper .ch-title')) return true;
     // Check for challenge iframe
     const iframes = document.querySelectorAll("iframe");
     for (const f of iframes) {
       const src = (f.src || "").toLowerCase();
       if (src.includes("challenges.cloudflare.com") || src.includes("turnstile")) return true;
     }
-    // Check for challenge-running/challenge-form (CF interstitial)
-    if (document.querySelector("#challenge-running, #challenge-form, #challenge-stage")) return true;
-    // Check for "Verify you are human" text in h2/h3/label
-    const labels = document.querySelectorAll("h2, h3, label, span");
-    for (const el of labels) {
-      if ((el.textContent || "").toLowerCase().includes("verify you are human")) return true;
-    }
+    // Title / body text signals of the full-page CF interstitial (outer page — reachable)
+    const title = (document.title || "").toLowerCase();
+    if (title.includes("just a moment")) return true;
+    const bodyTxt = (document.body?.textContent || "").toLowerCase();
+    if (bodyTxt.includes("performing security verification") ||
+        bodyTxt.includes("verify you are human") ||
+        bodyTxt.includes("security service to protect")) return true;
     return false;
   }
 
@@ -3055,6 +3064,55 @@
     try { return JSON.parse(text.slice(i)); } catch (e) { return null; }
   }
 
+  // Detect Cloudflare challenge page ("Just a moment" / Turnstile) in a response body.
+  function isCfChallengeBody(text) {
+    if (!text) return false;
+    const t = text.slice(0, 1500).toLowerCase();
+    return t.includes("just a moment") ||
+           t.includes("challenges.cloudflare.com") ||
+           t.includes("cf-challenge") ||
+           t.includes("/cdn-cgi/challenge-platform") ||
+           (t.includes("<!doctype html") && t.includes("turnstile"));
+  }
+
+  // Cloudflare visible challenge hit during cycling → alert operator (remote-desktop solve), reload OFC to show checkbox, auto-resume after solve.
+  async function handleCloudflareChallenge(activeUser) {
+    if (window.__cfChallengeHandling) return;
+    window.__cfChallengeHandling = true;
+    log("Cloudflare challenge detected during scan — alerting operator for remote solve");
+    if (cycling.active) stopCycling("Cloudflare challenge — awaiting manual solve");
+
+    const stored = await new Promise((r) => chrome.storage.local.get(["__supabase_device_name", "loginDetails"], r));
+    const device = stored.__supabase_device_name || "this device";
+    const u = activeUser || stored.loginDetails?.username || "";
+    trackEvent(EVENT_TYPES.ERROR, "Cloudflare challenge — remote solve needed", u);
+    sendTelegramNotification("rate",
+      `🛡️ <b>CLOUDFLARE CHALLENGE</b>\n\n` +
+      `👤 <b>User:</b> ${u}\n` +
+      `🖥️ <b>Device:</b> ${device}\n` +
+      `⚠️ "Verify you are human" checkbox blocking the bot.\n` +
+      `🔧 <b>Remote into ${device}</b> (Chrome Remote Desktop) and click the checkbox.\n` +
+      `▶️ Bot auto-resumes once solved.`
+    );
+
+    // Save cycling state so it auto-resumes after the page passes the challenge
+    const state = {
+      active: true, round: 0,
+      startDate: document.getElementById("ab-start-date")?.value || "",
+      endDate: document.getElementById("ab-end-date")?.value || "",
+      interval: document.getElementById("ab-interval")?.value || "30",
+      locations: Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map((cb) => cb.value),
+      timestamp: Date.now(),
+    };
+    sessionStorage.setItem("ab-cycling-state", JSON.stringify(state));
+
+    setStatus("🛡️ Cloudflare challenge — solve the checkbox (remote). Reloading to show it...");
+    await sleep(1500);
+    // Reload the OFC page so the visible Turnstile checkbox renders for the operator to click.
+    window.__cfChallengeHandling = false;
+    window.location.reload();
+  }
+
   // Fire all cities in parallel using the captured template. Detection only.
   // Returns { postId: { ok, name, dates:[], status, ms, hasError, error } } or null if no template.
   async function parallelScan(postIds) {
@@ -3067,11 +3125,17 @@
     if (sel) Array.from(sel.options).forEach((o) => { if (o.value) nameMap[o.value] = (o.text || "").trim(); });
     if (!postIds || !postIds.length) postIds = Object.keys(nameMap);
 
-    const headers = {
+    const baseHeaders = {
       "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
       "Accept": "application/json, text/javascript, */*; q=0.01",
       "X-Requested-With": "XMLHttpRequest",
     };
+    // Reuse the session's trace-id (Application Insights) from the captured request so
+    // our requests look like the site's own; fresh span id per request.
+    const randHex = (n) => { let s = ""; for (let i = 0; i < n; i++) s += "0123456789abcdef"[Math.floor(Math.random() * 16)]; return s; };
+    let traceId = randHex(32);
+    const tp = scheduleTemplate.headers && (scheduleTemplate.headers.traceparent || scheduleTemplate.headers.Traceparent);
+    if (tp) { const m = String(tp).match(/^00-([0-9a-f]{32})-/i); if (m) traceId = m[1].toLowerCase(); }
 
     const eq = scheduleTemplate.body.indexOf("=");
     const baseJsonStr = scheduleTemplate.body.slice(eq + 1);
@@ -3079,7 +3143,7 @@
     const results = {};
     const scanStart = Date.now();
     const tasks = postIds.map((pid, idx) => (async () => {
-      await sleep(idx * 250); // stagger to avoid burst-block
+      await sleep(idx * PARALLEL_STAGGER_MS); // stagger to avoid burst-block
       const name = nameMap[pid] || pid;
       let body;
       try {
@@ -3090,13 +3154,17 @@
         body = "parameters=" + JSON.stringify(obj);
       } catch (e) { results[pid] = { ok: false, name, error: "body build: " + e.message }; return; }
       const url = scheduleTemplate.url.replace(/cacheString=\d+/, "cacheString=" + Date.now());
+      // Fresh span id per request — mimic the site's tracing headers
+      const span = randHex(16);
+      const headers = { ...baseHeaders, "Request-Id": `|${traceId}.${span}`, "traceparent": `00-${traceId}-${span}-01` };
       const t0 = Date.now();
       try {
         const resp = await fetch(url, { method: "POST", headers, body, credentials: "include" });
         const text = await resp.text();
+        const challenge = isCfChallengeBody(text);
         const json = extractScheduleJson(text);
         const dates = (json && Array.isArray(json.ScheduleDays)) ? json.ScheduleDays.map((d) => d.Date) : [];
-        results[pid] = { ok: resp.status === 200 && !!json, name, status: resp.status, dates, ms: Date.now() - t0, hasError: json ? json.HasError : null };
+        results[pid] = { ok: resp.status === 200 && !!json, name, status: resp.status, dates, ms: Date.now() - t0, hasError: json ? json.HasError : null, challenge };
       } catch (e) {
         results[pid] = { ok: false, name, error: e.message, ms: Date.now() - t0 };
       }
@@ -3559,7 +3627,9 @@
     if (cycling.nextBreakAt === 0) cycling.nextBreakAt = cycling.round + 15 + Math.floor(Math.random() * 11); // 15-25 rounds
 
     // Skip idle gap + long break during grace period (don't waste recovery window)
-    if (!cycling.gracePeriod.active) {
+    // DISABLE_HUMAN_PAUSES: idle/break caused cold-session 403 after pauses; removed in parallel build.
+    // Steady ~45s round wait keeps rate low without going cold.
+    if (!cycling.gracePeriod.active && !DISABLE_HUMAN_PAUSES) {
     // Layer 2: Idle gap (30-90s every 4-8 rounds)
     if (cycling.round >= cycling.nextIdleAt) {
       const idleSec = 30 + Math.floor(Math.random() * 61);
@@ -3639,7 +3709,54 @@
       setCycleInfo(`Round ${cycling.round}`);
     }
 
-    for (let i = 0; i < locations.length; i++) {
+    // ── PARALLEL ROUND (A3) — replaces sequential per-city loop once template captured ──
+    // Detection only. No booking (A4 adds in-range match + alerts). Falls back to sequential on failure.
+    let didParallel = false;
+    if (USE_PARALLEL_SCAN && scheduleTemplate && !cycling.gracePeriod.active) {
+      // Rotating batch: scan only the next PARALLEL_BATCH_SIZE cities from the STABLE selected list.
+      // Keeps max 2 concurrent (fast, no tarpit, low rate); covers all selected over successive rounds.
+      const stable = Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map((cb) => ({ value: cb.value, name: cb.dataset.name }));
+      const batch = [];
+      const n = Math.min(PARALLEL_BATCH_SIZE, stable.length);
+      for (let k = 0; k < n; k++) batch.push(stable[(__scanCursor + k) % stable.length]);
+      __scanCursor = stable.length ? (__scanCursor + n) % stable.length : 0;
+      setStatus(`⚡ Parallel scanning ${batch.map((b) => b.name).join(", ")}...`);
+      const res = await parallelScan(batch.map((l) => l.value));
+      if (!cycling.active || __abortAll) return;
+      if (!res) {
+        log("[parallel] no result — falling back to sequential this round");
+      } else {
+        let anyErr = false, any429 = false, anyChallenge = false;
+        const found = [];
+        for (const pid of Object.keys(res)) {
+          const r = res[pid];
+          rateTrackerRecord(r.name, r.ok, (r.ms || 0) / 1000);
+          if (r.challenge) anyChallenge = true;
+          if (!r.ok) {
+            anyErr = true;
+            if (r.status === 429) any429 = true;
+            rateTrackerRecordError(r.challenge ? "cf_challenge" : (r.status === 429 ? "429" : "parallel_err"));
+            log(`[parallel] ${r.name}: ERROR ${r.challenge ? "CF-CHALLENGE" : (r.error || r.status)}`);
+          } else if (r.dates.length) {
+            found.push(`${r.name}(${r.dates.length})`);
+            log(`[parallel] ${r.name}: ${r.dates.length} date(s) → ${r.dates.slice(0, 5).join(", ")}`);
+          } else {
+            log(`[parallel] No slots at ${r.name}`);
+          }
+        }
+        // Cloudflare visible challenge → alert operator for remote-desktop solve, then auto-resume
+        if (anyChallenge) { await handleCloudflareChallenge(); return; }
+        if (any429) { handleSevereError("429 Rate Limited (parallel)"); return; }
+        if (anyErr) {
+          log("[parallel] some requests failed — falling back to sequential this round");
+        } else {
+          didParallel = true;
+          setStatus(`⚡ Parallel done — ${found.length ? "SLOTS: " + found.join(", ") : "no slots"} — ${rateTrackerGetRate()} req/min`);
+        }
+      }
+    }
+
+    for (let i = 0; !didParallel && i < locations.length; i++) {
       if (!cycling.active) return;
 
       if (await checkStopSignal()) return;
@@ -3732,7 +3849,9 @@
 
       const select = document.getElementById("post_select");
       if (!select) {
-        stopCycling("Location dropdown not found");
+        // Page degraded (often after 429/challenge) — recover via dashboard re-entry instead of hard-stopping
+        log("Location dropdown not found — page degraded, re-entering via dashboard");
+        onUnableToLoadAlert("Location dropdown missing — page degraded");
         return;
       }
 
@@ -4169,10 +4288,12 @@
     // All locations checked — wait and repeat
     if (!cycling.active) return;
 
-    // Use fast interval during grace period, normal jitter otherwise
+    // Use fast interval during grace period, parallel interval after a parallel round, else normal jitter
     let waitMs;
     if (cycling.gracePeriod.active) {
       waitMs = cycling.gracePeriod.fastIntervalMs;
+    } else if (didParallel) {
+      waitMs = PARALLEL_ROUND_MS * (0.85 + Math.random() * 0.3); // ~38-52s jitter
     } else {
       waitMs = interval * (0.8 + Math.random() * 0.4);
     }
@@ -4553,15 +4674,18 @@
     // Runs AFTER waiting room check so no false positives
     if (detectTurnstileChallenge()) {
       const cfUser = settings.loginDetails?.username || activeAutoUser || "";
-      log("Turnstile challenge detected on page load — waiting for solve");
+      const cfStored = await new Promise((r) => chrome.storage.local.get(["__supabase_device_name"], r));
+      const cfDevice = cfStored.__supabase_device_name || "this device";
+      log("Cloudflare challenge detected on page load — alerting operator for remote solve");
       __cfChallengeActive = true;
-      trackEvent(EVENT_TYPES.ERROR, `Cloudflare Turnstile challenge on ${host}`, cfUser);
+      trackEvent(EVENT_TYPES.ERROR, `Cloudflare challenge on ${host} — remote solve needed`, cfUser);
       sendTelegramNotification("rate",
         `🛡️ <b>CLOUDFLARE CHALLENGE</b>\n\n` +
         `👤 <b>User:</b> ${cfUser}\n` +
-        `🌐 <b>Domain:</b> ${host}\n` +
-        `⚠️ "Verify you are human" on page load\n` +
-        `⏸️ Waiting for manual solve...`
+        `🖥️ <b>Device:</b> ${cfDevice}\n` +
+        `⚠️ "Verify you are human" checkbox blocking the bot.\n` +
+        `🔧 <b>Remote into ${cfDevice}</b> (Chrome Remote Desktop) and click the checkbox.\n` +
+        `▶️ Bot auto-resumes once solved.`
       );
       const solved = await waitForChallengeSolved();
       if (solved) {
