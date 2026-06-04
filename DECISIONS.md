@@ -52,6 +52,31 @@ Running memory across sessions. Newest on top.
   3. Winning pattern likely: ONE controlled parallel burst per round, then a healthy wait. Never parallel + sequential together.
 - A2 parallel fetch itself works (valid data, 3.7s for 5). The risk is frequency/burst, not correctness.
 
+### Booking chain captured (Issue #36, 2026-06-04) — full 3-step flow + CRITICAL token finding
+Captured a real VAC booking end-to-end (live slot). All 3 steps:
+
+1. **DAYS** — `POST /en-US/custom-actions/?route=/api/v1/schedule-group/get-family-ofc-schedule-days&appd=<APPT>&cacheString=<ms>`
+   - body: `parameters={"primaryId","applications":[..],"scheduleDayId":"","scheduleEntryId":"","postId":"<city>","isReschedule":"false"}`
+   - resp: `{"ScheduleDays":[{"ID":null,"Date":"2027-01-20"},...],"Token":"<TOKEN_A>"}` (each day: ID null + Date string)
+
+2. **TIMES** — `POST .../route=/api/v1/schedule-group/get-family-ofc-schedule-entries&appd=<APPT>&cacheString=<ms>`
+   - body: `parameters={"primaryId":null,"applications":null,"scheduleDayId":null,"scheduleEntryId":"","postId":null,"Token":"<TOKEN_A + appended date-blob>"}`
+   - resp: `{"ScheduleEntries":[{"ID":null,"EntriesAvailable":5,"Time":"09:00","Num":1},...],"Token":"<TOKEN_B>"}`
+
+3. **SUBMIT** — `POST .../route=/api/v1/schedule-group/schedule-ofc-appointments-for-family&appd=<APPT>&cacheString=<ms>`
+   - body: `parameters={...nulls...,"Token":"<TOKEN_B + appended time-blob>"}`
+   - resp: `{"AllScheduled":true,"RedirectStub":"schedule/",...}` → BOOKED, redirects to consular scheduling.
+
+**CRITICAL FINDING — pure-API booking for a CHOSEN date is NOT feasible:**
+- The chosen date/time are NOT sent as plain fields (all null in body). They are **baked into the Token**: each step's input token = previous response token + an **opaque encrypted blob** appended by the site's calendar JS when the user clicks a date/time.
+- Confirmed: TIMES-input token === DAYS-response token + extra ~96-char blob. We cannot forge that blob (site-side crypto).
+- Token rotates each step: days→TOKEN_A, entries(TOKEN_A+dateblob)→TOKEN_B, submit(TOKEN_B+timeblob)→done.
+- Day objects + entry objects have `ID:null` — no usable per-date/per-time id to send; the token is the only carrier.
+
+**Implication:** Can't book a specific date via raw fetch (can't build the date-blob). Fast path must: detect via API (all cities, instant) → switch dropdown to the ONE winning city → trigger the site's own datepicker select (it builds the correct token) → pick time → submit (reuse existing booking code). Only one city-switch round-trip (~1-2s), unavoidable because the date is encrypted into the site-built token.
+- Submit endpoint name: `schedule-ofc-appointments-for-family`. Success flag: `AllScheduled:true`. Consular = same flow on `schedule/`.
+- NOTE: appd + primaryId are per-user/session (3 different accounts seen across captures).
+
 ### Step 0 findings — schedule API (Issue #28, CONFIRMED via live capture)
 - Endpoint: `POST /en-US/custom-actions/?route=/api/v1/schedule-group/get-family-ofc-schedule-days&appd=<APPT_ID>&cacheString=<ms>`.
 - **No anti-forgery token in request** — auth is login COOKIE only (auto on same-origin fetch). Parallel replay is easy + low-risk on auth.
