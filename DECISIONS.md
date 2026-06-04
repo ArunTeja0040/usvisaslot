@@ -52,6 +52,32 @@ Running memory across sessions. Newest on top.
   3. Winning pattern likely: ONE controlled parallel burst per round, then a healthy wait. Never parallel + sequential together.
 - A2 parallel fetch itself works (valid data, 3.7s for 5). The risk is frequency/burst, not correctness.
 
+### Fast-booking research + chosen approach (Issue #36, 2026-06-04)
+**User decisions:** grab FIRST in-range slot detected; FASTEST method (accept fragility); VAC only for now (consular later, same flow).
+
+**Research findings (web):**
+- All public US-visa bots only DETECT + alert; booking is done MANUALLY. None replay the booking API — because of the opaque token (which we already captured) + Cloudflare. We are ahead.
+- Site = Microsoft Power Apps portal; calendar = jQuery UI Datepicker; booking only works by dispatching the events the site's own JS listens to (or calling its functions). Pure-API replay of a chosen date = not feasible (token encrypts date/time, built by site JS).
+
+**Hard floor:** booking = 3 sequential server calls (days → times → submit), each ~0.3-1s → absolute min ~2-3s. Cannot remove the 3 round-trips (each token feeds the next).
+
+**Where the slowness really is:** NOT the 3 calls — it's the waiting/polling for the calendar + times to visually render (~5-15s dead time). That's what we kill.
+
+**CHOSEN APPROACH — event-driven, drive the site's own JS (fastest, fragile-accepted):**
+1. Parallel scan finds in-range date at city X (instant).
+2. Fire city X into #post_select (site starts fetching days).
+3. On days-arrival event (page.js vSCP vSD) → instantly fire datepicker select for our date (no wait/poll).
+4. On times-arrival event (vSCP vST) → instantly select first time slot + fire submit.
+5. Reply AllScheduled:true / redirect schedule/ → BOOKED → Telegram.
+- Chain on the site's REAL events (page.js already emits vSD/vST), not fixed sleeps → zero dead time → ~2-3s total.
+- Reuses existing booking code (content.js selectSlotDate + auto-submit) but event-driven + instant + triggered by the fast scan.
+
+**Plan (when approved — NOT built yet):**
+1. Build event-driven fast-grab: first in-range hit → fire city → on vSD fire date → on vST fire time+submit → confirm + Telegram.
+2. Dry-run first (stop before final submit, log "WOULD BOOK city/date/time").
+3. Live test on a real VAC slot. VAC only.
+4. Document fragile bits (site fn/event names, #post_select, datepicker, submit btn) for quick re-capture if site updates.
+
 ### Booking chain captured (Issue #36, 2026-06-04) — full 3-step flow + CRITICAL token finding
 Captured a real VAC booking end-to-end (live slot). All 3 steps:
 
