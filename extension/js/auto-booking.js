@@ -393,6 +393,47 @@
     });
   }
 
+  // Build + send the per-city in-range / out-of-range availability overview
+  // (same format the sequential path uses). dates = array of "YYYY-MM-DD" strings.
+  function sendSlotsOverview(cityName, dates, startDate, endDate) {
+    if (!dates || !dates.length) return;
+    const inRange = dates.filter((d) => isDateInRange(d, startDate, endDate)).sort();
+    const outOfRange = dates.filter((d) => !isDateInRange(d, startDate, endDate)).sort();
+    const byMonth = (arr) => {
+      const m = {};
+      arr.forEach((ds) => {
+        const date = new Date(ds + "T00:00:00");
+        const key = date.toLocaleString("en-US", { month: "long", year: "numeric" });
+        (m[key] = m[key] || []).push(date.getDate());
+      });
+      return Object.entries(m)
+        .map(([mo, days]) => `${mo}: ${days.sort((a, b) => a - b).join(", ")}`)
+        .join("\n");
+    };
+    const inText = byMonth(inRange);
+    const outText = byMonth(outOfRange);
+    chrome.storage.local.get(["loginDetails", "userProfilesList", "__supabase_device_name"], (d) => {
+      const u = d.loginDetails?.username || "";
+      const profile = (d.userProfilesList || []).find((p) => p.username === u) || {};
+      const deviceName = d.__supabase_device_name || "Unknown";
+      const applicants = profile.applicantCount || 1;
+      const visaType = profile.visaType || "";
+      const msg =
+        `📍 <b>SLOTS OVERVIEW: ${cityName}</b>\n\n` +
+        `👤 <b>User:</b> ${u}\n` +
+        `💻 <b>Device:</b> ${deviceName}\n` +
+        `📆 <b>Date Range:</b> ${startDate || "—"} to ${endDate || "—"}\n` +
+        `👥 <b>Applicants:</b> ${applicants}\n` +
+        (visaType ? `🎫 <b>Visa:</b> ${visaType}\n` : "") +
+        `🔄 <b>Round:</b> ${cycling.round} (parallel)\n\n` +
+        `📅 <b>Available:</b> ${dates.length} dates\n\n` +
+        `✅ <b>IN RANGE (${inRange.length}):</b>\n` + (inText || "None") + `\n` +
+        `\n❌ <b>OUT OF RANGE (${outOfRange.length}):</b>\n` + (outText || "None") + `\n`;
+      trackEvent(EVENT_TYPES.CYCLING, `Slots overview (parallel) for ${cityName}: ${inRange.length} in range, ${outOfRange.length} out of range`, u);
+      sendTelegramNotification("availability", msg);
+    });
+  }
+
   function getSettings() {
     return new Promise((resolve) => {
       chrome.storage.local.get(
@@ -3177,6 +3218,85 @@
   // Expose for manual testing in the TEST build (call from booking panel button).
   if (TEST_MODE) window.__parallelScan = parallelScan;
 
+  // ─── FAST-GRAB BOOKING (#36) — event-driven, drive site JS, ~2-3s ──
+  // On first in-range slot from the parallel scan: switch to that city, then react on the
+  // site's own data-arrival events (no waits/polls): days → pick date → times → pick time → submit.
+  // Dry-run when TEST_FORCE_NO_SUBMIT (stops before final submit, logs WOULD BOOK).
+  let __fastGrabbing = false;
+  async function fastGrabBooking(cityValue, cityName, dateStr, alreadyOnCity = false) {
+    if (__fastGrabbing) return;
+    __fastGrabbing = true;
+    const u = await new Promise((r) => chrome.storage.local.get(["loginDetails"], (d) => r(d.loginDetails?.username || "")));
+    const t0 = Date.now();
+    log(`[fastgrab] SLOT in range → ${cityName} ${dateStr} — grabbing`);
+    if (cycling.active) stopCycling("Slot found — grabbing");
+    trackEvent(EVENT_TYPES.SLOT_FOUND, `Slot in range: ${cityName} ${dateStr} — fast-grab started`, u);
+    sendTelegramNotification("slot",
+      `🎯 <b>SLOT FOUND — GRABBING</b>\n\n👤 <b>User:</b> ${u}\n📍 <b>${cityName}</b>\n📅 <b>${dateStr}</b>\n⚡ Booking now...`);
+
+    try {
+      // 1) Switch dropdown to the winning city → site fetches days.
+      //    Sequential path is already on this city with days loaded → skip the switch.
+      if (!alreadyOnCity) {
+        const select = document.getElementById("post_select");
+        if (!select) { sendTelegramNotification("error", `⚠️ <b>GRAB FAILED</b>\n\n👤 ${u}\n${cityName} ${dateStr}\n❌ Dropdown missing`); __fastGrabbing = false; return; }
+        select.value = cityValue;
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+
+        // 2) React on days-arrival event (instant), then select our date
+        const daysData = await waitForScheduleData(15000);
+        if (!daysData) { sendTelegramNotification("error", `⚠️ <b>GRAB FAILED</b>\n\n👤 ${u}\n${cityName} ${dateStr}\n❌ Calendar didn't load`); __fastGrabbing = false; return; }
+      } else {
+        await sleep(800); // calendar already rendered by content.js — small settle before select
+      }
+      const picked = await selectDateInCalendar(new Date(dateStr + "T00:00:00"));
+      if (!picked) {
+        sendTelegramNotification("error", `⚠️ <b>SLOT GONE</b>\n\n👤 ${u}\n${cityName} ${dateStr}\n❌ Date no longer selectable`);
+        trackEvent(EVENT_TYPES.ERROR, `Fast-grab: date not selectable ${cityName} ${dateStr}`, u);
+        __fastGrabbing = false; return;
+      }
+
+      // 3) React on times-arrival → select first time + ready submit
+      const timeReady = await waitForTimeSlotAndSelect(12000);
+      if (!timeReady) {
+        sendTelegramNotification("error", `⚠️ <b>NO TIME SLOTS</b>\n\n👤 ${u}\n${cityName} ${dateStr}\n❌ Times gone (taken)`);
+        trackEvent(EVENT_TYPES.ERROR, `Fast-grab: no time slots ${cityName} ${dateStr}`, u);
+        __fastGrabbing = false; return;
+      }
+      const pickedTime = getSelectedTimeText();
+
+      // 4) Submit (or dry-run stop)
+      if (TEST_MODE && TEST_FORCE_NO_SUBMIT) {
+        const ms = Date.now() - t0;
+        log(`[fastgrab] DRY-RUN — would book ${cityName} ${dateStr} ${pickedTime} (reached submit in ${ms}ms)`);
+        trackEvent(EVENT_TYPES.BOOKING, `DRY-RUN would book ${cityName} ${dateStr} ${pickedTime} (${ms}ms)`, u);
+        sendTelegramNotification("slot",
+          `🧪 <b>WOULD BOOK (dry-run)</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${dateStr}</b>\n🕐 <b>${pickedTime || "first slot"}</b>\n⏱️ Reached submit in ${ms}ms\n⏸️ Stopped before submit (TEST_FORCE_NO_SUBMIT)`);
+        __fastGrabbing = false; return;
+      }
+
+      const submitBtn = document.getElementById("submitbtn");
+      submitBtn.click();
+      const ms = Date.now() - t0;
+      trackEvent(EVENT_TYPES.BOOKING, `Submitted ${cityName} ${dateStr} ${pickedTime} (${ms}ms)`, u);
+      const outcome = await waitForBookingOutcome(15000);
+      if (outcome === "confirmed" || outcome === "ofc_submitted") {
+        updateUserStatus(u, "confirmed", { confirmedAt: new Date().toISOString() });
+        updateSlotHistoryAction(u, cityName, dateStr, outcome === "confirmed" ? "confirmed" : "submitted");
+        sendTelegramNotification("confirmed",
+          `🎉 <b>VAC BOOKED!</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${dateStr}</b>\n🕐 <b>${pickedTime || "first slot"}</b>\n✅ ${outcome === "ofc_submitted" ? "OFC submitted → consular next" : "Confirmed"}\n⏱️ Booked in ${ms}ms`);
+      } else {
+        sendTelegramNotification("error",
+          `⚠️ <b>BOOKING ${outcome === "failed" ? "FAILED (slot taken)" : "UNCERTAIN"}</b>\n\n👤 ${u}\n${cityName} ${dateStr}\n${outcome === "failed" ? "❌ Someone grabbed it first" : "❓ No clear confirmation — check manually"}`);
+      }
+    } catch (e) {
+      log("[fastgrab] error: " + e.message);
+      sendTelegramNotification("error", `⚠️ <b>GRAB ERROR</b>\n\n👤 ${u}\n${cityName} ${dateStr}\n❌ ${e.message}`);
+    } finally {
+      __fastGrabbing = false;
+    }
+  }
+
   // ─── CYCLING LOGIC ─────────────────────────────────────────────────
 
   function startCycling() {
@@ -3385,6 +3505,15 @@
     });
   }
 
+  // Cache the latest time-slot entries feed (vST) so we can report the real
+  // booked time (ScheduleEntries[].Time = "09:00") instead of the radio's value/index.
+  let __lastScheduleEntries = null;
+  addEventListener("vSCP", (e) => {
+    if (e.detail && e.detail.resource === "vST" && e.detail.data && Array.isArray(e.detail.data.ScheduleEntries)) {
+      __lastScheduleEntries = e.detail.data.ScheduleEntries;
+    }
+  });
+
   function waitForScheduleData(timeout = 15000) {
     return new Promise((resolve) => {
       let done = false;
@@ -3524,6 +3653,33 @@
       await sleep(500);
     }
     return false;
+  }
+
+  // Real time-of-day of the selected slot (e.g. "09:00").
+  // Prefer the site's own time-slot feed (ScheduleEntries[].Time), mapping the
+  // selected radio's value (= entry Num) to its Time. Falls back to scanning the
+  // row text for an HH:MM pattern. (Radio value alone is just the slot number.)
+  function getSelectedTimeText() {
+    const radio = document.querySelector('#time_select input[type="radio"]:checked')
+      || document.querySelector('#time_select input[type="radio"]');
+    if (__lastScheduleEntries && __lastScheduleEntries.length) {
+      if (radio && radio.value) {
+        const hit = __lastScheduleEntries.find((en) => String(en.Num) === String(radio.value));
+        if (hit && hit.Time) return String(hit.Time);
+      }
+      if (__lastScheduleEntries[0] && __lastScheduleEntries[0].Time) return String(__lastScheduleEntries[0].Time);
+    }
+    if (!radio) return "";
+    const cands = [
+      radio.getAttribute("aria-label"),
+      radio.id ? document.querySelector(`#time_select label[for="${radio.id}"]`)?.textContent : "",
+      radio.closest("tr,label,td,div")?.textContent,
+    ].filter(Boolean);
+    for (const c of cands) {
+      const m = String(c).match(/\b([01]?\d|2[0-3]):[0-5]\d\s*(?:[AaPp]\.?[Mm]\.?)?/);
+      if (m) return m[0].replace(/\s+/g, " ").trim();
+    }
+    return (cands[0] || "").trim().slice(0, 20);
   }
 
   async function checkStopSignal() {
@@ -3711,6 +3867,10 @@
 
     // ── PARALLEL ROUND (A3) — replaces sequential per-city loop once template captured ──
     // Detection only. No booking (A4 adds in-range match + alerts). Falls back to sequential on failure.
+    // Bootstrap fast-start (#38): remember if a template already existed this round.
+    // If not (very first round), the sequential sweep below stops after the FIRST city
+    // captures the template, so we jump to parallel next round instead of checking all.
+    const hadTemplateAtStart = !!scheduleTemplate;
     let didParallel = false;
     if (USE_PARALLEL_SCAN && scheduleTemplate && !cycling.gracePeriod.active) {
       // Rotating batch: scan only the next PARALLEL_BATCH_SIZE cities from the STABLE selected list.
@@ -3727,6 +3887,7 @@
         log("[parallel] no result — falling back to sequential this round");
       } else {
         let anyErr = false, any429 = false, anyChallenge = false;
+        let grabCity = null, grabDate = null; // first in-range hit
         const found = [];
         for (const pid of Object.keys(res)) {
           const r = res[pid];
@@ -3740,10 +3901,18 @@
           } else if (r.dates.length) {
             found.push(`${r.name}(${r.dates.length})`);
             log(`[parallel] ${r.name}: ${r.dates.length} date(s) → ${r.dates.slice(0, 5).join(", ")}`);
+            sendSlotsOverview(r.name, r.dates, startDate, endDate); // availability ping — every parallel round
+            // First in-range date wins (user choice: grab first detected)
+            if (!grabCity) {
+              const inRange = r.dates.filter((d) => isDateInRange(d, startDate, endDate)).sort();
+              if (inRange.length) { grabCity = { value: pid, name: r.name }; grabDate = inRange[0]; }
+            }
           } else {
             log(`[parallel] No slots at ${r.name}`);
           }
         }
+        // SLOT IN RANGE → fast-grab booking (event-driven). Overrides everything else.
+        if (grabCity) { await fastGrabBooking(grabCity.value, grabCity.name, grabDate); return; }
         // Cloudflare visible challenge → alert operator for remote-desktop solve, then auto-resume
         if (anyChallenge) { await handleCloudflareChallenge(); return; }
         if (any429) { handleSevereError("429 Rate Limited (parallel)"); return; }
@@ -3760,6 +3929,14 @@
       if (!cycling.active) return;
 
       if (await checkStopSignal()) return;
+
+      // Bootstrap fast-start (#38): once the first city has captured the template,
+      // stop the slow sequential sweep — next round runs parallel. (Fallback rounds,
+      // where a template already existed, still check every city.)
+      if (i > 0 && !hadTemplateAtStart && scheduleTemplate) {
+        log("[bootstrap] template captured on first city — switching to parallel next round");
+        break;
+      }
 
       // Layer 1: Human-like weighted random delay between locations
       if (i > 0) {
@@ -4045,218 +4222,17 @@
         continue;
       }
 
-      // Dates in range found! Try each date in order until one yields time slots.
-      let MAX_DATE_TRIES = Math.min(inRange.length, 5);
-      setStatus(
-        `${loc.name}: ${inRange.length} dates in range! Will try up to ${MAX_DATE_TRIES} dates...`
-      );
-
-      // Let content.js finish processing (it auto-selects first date)
-      await sleep(2000);
-
-      let bookedSuccessfully = false;
-      let datesAttempted = [];
-
-      for (let dateIdx = 0; dateIdx < MAX_DATE_TRIES; dateIdx++) {
-        if (!cycling.active || __abortAll) return;
-        if (await checkStopSignal()) return;
-
-        const tryDate = inRange[dateIdx];
-        datesAttempted.push(tryDate.Date);
-        setStatus(`${loc.name}: Trying date ${dateIdx + 1}/${MAX_DATE_TRIES}: ${tryDate.Date}...`);
-        log(`Trying date ${dateIdx + 1}/${MAX_DATE_TRIES} at ${loc.name}: ${tryDate.Date}`);
-
-        const targetDate = new Date(tryDate.Date + "T00:00:00");
-        const selected = await selectDateInCalendar(targetDate);
-
-        if (!selected) {
-          log(`Could not click ${tryDate.Date} at ${loc.name} — trying next date`);
-          await sleep(1000);
-          continue; // try next date in same location
-        }
-
-        // Update slot history: this specific date was selected
-        {
-          const histUser = (await getSettings()).loginDetails?.username || "";
-          if (histUser) updateSlotHistoryAction(histUser, loc.name, tryDate.Date, "selected");
-        }
-
-        // Wait for time slots to load for this date
-        await sleep(1500);
-        const slotReady = await waitForTimeSlotAndSelect(12000);
-
-        if (!slotReady) {
-          // Diagnostic: check what's actually on page
-          const timeSelectEl = document.getElementById("time_select");
-          const radioCount = document.querySelectorAll('#time_select input[type="radio"]').length;
-          const submitBtn = document.getElementById("submitbtn");
-          const submitDisabled = submitBtn ? submitBtn.disabled : "no_submit_btn";
-          const visibleText = (timeSelectEl?.textContent || "").trim().substring(0, 100);
-          log(`No time slots for ${tryDate.Date} at ${loc.name} — radios:${radioCount}, submit disabled:${submitDisabled}, time_select text:"${visibleText}"`);
-          trackEvent(EVENT_TYPES.BOOKING, `No time slots for ${tryDate.Date} (radios=${radioCount}, submit=${submitDisabled})`, (await getSettings()).loginDetails?.username || "");
-          setStatus(`${loc.name}: ${tryDate.Date} no time slots — trying next...`);
-          await sleep(1500);
-          continue; // try next date
-        }
-
-        // SLOT IS READY — submit
-        const settings = await getSettings();
-        const u = settings.loginDetails?.username || "";
-        trackEvent(EVENT_TYPES.SLOT_FOUND, `Slot found at ${loc.name} — date: ${tryDate.Date} (attempt ${dateIdx + 1}/${MAX_DATE_TRIES})`, u, { location: loc.name, date: tryDate.Date });
-        sendTelegramNotification("slot",
-          `🟢 <b>SLOT FOUND!</b>\n\n` +
-          `👤 <b>User:</b> ${u}\n` +
-          `📍 <b>Location:</b> ${loc.name}\n` +
-          `📅 <b>Date:</b> ${tryDate.Date}\n` +
-          (datesAttempted.length > 1 ? `🔁 Tried ${datesAttempted.length - 1} earlier date(s) first\n` : "") +
-          `\n${settings["is_auto-submit"] ? "⏳ Auto-submitting..." : "⚠️ Manual submit needed — go to the tab NOW!"}`
-        );
-
-        // Screenshot
-        sendSlotScreenshot(
-          `🟢 <b>Slot found at ${loc.name}</b> — ${tryDate.Date}\n` +
-          `👤 ${u} · 🕐 ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true, hour: "2-digit", minute: "2-digit", day: "2-digit", month: "short" })} IST`
-        );
-
-        if (settings["is_auto-submit"] && !(TEST_MODE && TEST_FORCE_NO_SUBMIT)) {
-          setStatus(`${loc.name}: Slot found on ${tryDate.Date} — auto-submitting!`);
-          await sleep(1000);
-          const submitBtn = document.getElementById("submitbtn");
-          if (submitBtn && !submitBtn.disabled) submitBtn.click();
-          trackEvent(EVENT_TYPES.BOOKING, `Auto-submitted ${loc.name} ${tryDate.Date}`, u);
-          updateSlotHistoryAction(u, loc.name, tryDate.Date, "submitted");
-
-          // Wait for outcome
-          setStatus(`${loc.name}: Submitted ${tryDate.Date} — waiting for confirmation...`);
-          const outcome = await waitForBookingOutcome(15000);
-
-          if (outcome === "confirmed") {
-            bumpDailyStat({ key: "booked", delta: 1 });
-            sendTelegramNotification("confirmed",
-              `✅ <b>BOOKING SUBMITTED!</b>\n\n` +
-              `👤 <b>User:</b> ${u}\n` +
-              `📍 <b>Location:</b> ${loc.name}\n` +
-              `📅 <b>Date:</b> ${tryDate.Date}\n\n🎉 Confirmed!`
-            );
-            stopCycling("Booking submitted!");
-            return;
-          }
-
-          if (outcome === "ofc_submitted") {
-            // OFC submitted successfully — page navigating to interview booking
-            bumpDailyStat({ key: "booked", delta: 1 });  // count OFC as a booking step
-            updateSlotHistoryAction(u, loc.name, tryDate.Date, "submitted");
-            log(`OFC submitted at ${loc.name} ${tryDate.Date} — page navigating to interview`);
-            trackEvent(EVENT_TYPES.BOOKING, `OFC submitted ${loc.name} ${tryDate.Date} — navigating to interview`, u);
-            sendTelegramNotification("confirmed",
-              `✅ <b>OFC SUBMITTED!</b>\n\n` +
-              `👤 <b>User:</b> ${u}\n` +
-              `📍 <b>Location:</b> ${loc.name}\n` +
-              `📅 <b>OFC Date:</b> ${tryDate.Date}\n\n` +
-              `🔄 Page navigating to interview booking...\n` +
-              `Cycling will auto-resume on interview page.`
-            );
-            // Page is navigating to /schedule/ (interview). Don't stop cycling —
-            // new page will run init() → handleBookingPage → auto-start cycling
-            // for interview if activeAutomationUser is still set.
-            // Just exit gracefully; navigation kills this script anyway.
-            return;
-          }
-
-          if (outcome === "failed" || outcome === "timeout") {
-            const reason = outcome === "failed" ? "slot taken / error" : "no confirmation page after 15s";
-            log(`Submit outcome: ${outcome} (${reason}) for ${tryDate.Date}`);
-            trackEvent(EVENT_TYPES.BOOKING, `Submit ${outcome} for ${tryDate.Date} (${reason})`, u);
-            updateSlotHistoryAction(u, loc.name, tryDate.Date, "missed");
-            bumpDailyStat({ key: "missed", delta: 1 });
-
-            // Re-fetch fresh dates for same location before trying next date
-            log(`Refreshing available dates at ${loc.name} after failed submit...`);
-            setStatus(`${loc.name}: Refreshing dates after failed submit...`);
-            const refreshSelect = document.getElementById("post_select");
-            if (refreshSelect) {
-              const refreshPromise = waitForScheduleData(15000);
-              refreshSelect.dispatchEvent(new Event("change", { bubbles: true }));
-              const freshData = await refreshPromise;
-
-              if (freshData && freshData.ScheduleDays && freshData.ScheduleDays.length > 0) {
-                const startDate = document.getElementById("fromDate")?.value || "";
-                const endDate = document.getElementById("toDate")?.value || "";
-                const freshInRange = freshData.ScheduleDays.filter((d) =>
-                  isDateInRange(d.Date, startDate, endDate)
-                );
-                const freshUntried = freshInRange.filter(
-                  (d) => !datesAttempted.includes(d.Date)
-                );
-
-                if (freshUntried.length > 0) {
-                  const freshMax = Math.min(freshUntried.length, 5);
-                  log(`Fresh data: ${freshInRange.length} in range, ${freshUntried.length} untried — trying up to ${freshMax}`);
-                  sendTelegramNotification("error",
-                    `⚠️ <b>SUBMIT FAILED — REFRESHED DATES</b>\n\n` +
-                    `👤 <b>User:</b> ${u}\n` +
-                    `📍 <b>Location:</b> ${loc.name}\n` +
-                    `❌ ${tryDate.Date} — ${reason}\n` +
-                    `🔄 Refreshed: ${freshUntried.length} new dates to try`
-                  );
-
-                  // Replace remaining iterations with fresh untried dates
-                  inRange.length = 0;
-                  for (let fi = 0; fi < freshMax; fi++) inRange.push(freshUntried[fi]);
-                  dateIdx = -1; // reset so next iteration starts at 0
-                  MAX_DATE_TRIES = freshMax;
-                  await sleep(1500);
-                  continue;
-                }
-
-                log(`No untried in-range dates after refresh at ${loc.name} (tried: ${datesAttempted.join(", ")})`);
-              } else {
-                log(`No dates available after refresh at ${loc.name}`);
-              }
-            }
-
-            // No fresh dates available — enter grace period
-            cycling.gracePeriod = {
-              active: true,
-              location: loc.name,
-              roundsRemaining: GRACE_PERIOD_ROUNDS,
-              fastIntervalMs: GRACE_PERIOD_INTERVAL_MS,
-              missedDate: tryDate.Date,
-            };
-
-            sendTelegramNotification("error",
-              `⚠️ <b>SUBMIT FAILED — GRACE PERIOD</b>\n\n` +
-              `👤 <b>User:</b> ${u}\n` +
-              `📍 <b>Location:</b> ${loc.name}\n` +
-              `📅 <b>Last attempt:</b> ${tryDate.Date}\n` +
-              `🔁 Tried ${datesAttempted.length} dates: ${datesAttempted.join(", ")}\n` +
-              `❌ All failed — entering grace period (${GRACE_PERIOD_ROUNDS} rounds @ ${GRACE_PERIOD_INTERVAL_MS / 1000}s)`
-            );
-            bookedSuccessfully = true; // exit outer date loop, fall to next location iteration via continue
-            break;
-          }
-        } else {
-          // Manual submit mode — slot ready, stop cycling for user to submit
-          stopCycling(`${loc.name}: Slot found on ${tryDate.Date}! Review and click Submit.`);
-          return;
-        }
-      } // end for date loop
-
-      if (bookedSuccessfully) {
-        // Grace period set, continue to next location iteration
-        continue;
-      }
-
-      // All in-range dates tried, none yielded time slots
-      setStatus(`${loc.name}: Tried ${datesAttempted.length} dates, none had time slots — next location`);
-      log(`${loc.name}: Exhausted ${datesAttempted.length} in-range dates without time slots: ${datesAttempted.join(", ")}`);
-      sendTelegramNotification("error",
-        `ℹ️ <b>NO TIME SLOTS — ${loc.name}</b>\n\n` +
-        `Tried ${datesAttempted.length} in-range dates:\n` +
-        datesAttempted.map(d => `• ${d}`).join("\n") +
-        `\n\nNone had available time slots. Moving to next location.`
-      );
-      await sleep(2000);
+      // ── UNIFIED BOOKING PATH (Issue #36) ──
+      // Sequential round-1 + fallback rounds route their in-range catch through the
+      // SAME fast-grab used by the parallel scan: one booking path, one message set
+      // (🎯 / 🧪 / 🎉), one dry-run guard. Already on this city with days loaded, so
+      // pass alreadyOnCity=true to skip the redundant dropdown re-switch.
+      // (Replaces the old multi-date retry + grace-period submit block — chosen design
+      //  is "grab FIRST in-range, fastest".)
+      const grabDate = inRange[0].Date; // first in-range, already sorted ascending
+      log(`[unified] sequential in-range at ${loc.name} → fast-grab ${grabDate}`);
+      await fastGrabBooking(loc.value, loc.name, grabDate, true);
+      return;
     }
 
     // Smart range expansion offer — check at end of round
