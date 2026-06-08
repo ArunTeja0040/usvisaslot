@@ -118,6 +118,7 @@
     const filterStatus = document.getElementById("filter-status").value;
     const filterVisa = document.getElementById("filter-visa")?.value || "all";
     const filterMonth = document.getElementById("filter-month")?.value || "all";
+    const searchTerm = (document.getElementById("profile-search")?.value || "").trim().toLowerCase();
 
     // Build slot stats per user
     const slotStats = {};
@@ -142,6 +143,11 @@
     });
 
     const filtered = profiles.filter((p) => {
+      // Search by name / username
+      if (searchTerm) {
+        const hay = (deriveProfileName(p.username) + " " + p.username).toLowerCase();
+        if (!hay.includes(searchTerm)) return false;
+      }
       // Status filter
       if (filterStatus !== "all") {
         const userStatus = statuses[p.username]?.status || "idle";
@@ -209,13 +215,15 @@
       const deviceLastSeen = activeDevice && activeDevice.lastSeen ? timeAgo(activeDevice.lastSeen) : null;
       const isStaleDevice = activeDevice && activeDevice.lastSeen && (Date.now() - new Date(activeDevice.lastSeen).getTime() > STALE_DEVICE_THRESHOLD_MS);
 
-      // Check rate limit — auto-clear if > 24h
+      // Check rate limit — purely time-based (24h from the timestamp). A stale
+      // "rate_limited" status without a fresh timestamp must NOT block forever.
       const rateLimitedAt = cloud.rateLimitedAt;
-      const isRateLimited = userStatus === "rate_limited" || (rateLimitedAt && (Date.now() - new Date(rateLimitedAt).getTime() < 24 * 60 * 60 * 1000));
-      const rateLimitHoursLeft = rateLimitedAt ? Math.max(0, Math.ceil((24 * 60 * 60 * 1000 - (Date.now() - new Date(rateLimitedAt).getTime())) / 3600000)) : 0;
+      const rlMs = rateLimitedAt ? new Date(rateLimitedAt).getTime() : 0;
+      const isRateLimited = rlMs > 0 && (Date.now() - rlMs < 24 * 60 * 60 * 1000);
+      const rateLimitHoursLeft = isRateLimited ? Math.max(0, Math.ceil((24 * 60 * 60 * 1000 - (Date.now() - rlMs)) / 3600000)) : 0;
 
-      // Auto-clear expired rate limits
-      if (rateLimitedAt && !isRateLimited && SUPA && SUPA.isReady()) {
+      // Auto-clear once expired, or a stuck rate_limited status with no fresh timestamp
+      if ((userStatus === "rate_limited" || rateLimitedAt) && !isRateLimited && SUPA && SUPA.isReady()) {
         SUPA.clearRateLimitedAt(profile.username);
       }
 
@@ -1013,6 +1021,7 @@
   document.getElementById("filter-status").addEventListener("change", refresh);
   document.getElementById("filter-visa")?.addEventListener("change", refresh);
   document.getElementById("filter-month")?.addEventListener("change", refresh);
+  document.getElementById("profile-search")?.addEventListener("input", refresh);
   document.getElementById("log-filter-user").addEventListener("change", refresh);
   document.getElementById("log-filter-type").addEventListener("change", refresh);
 
@@ -1644,6 +1653,11 @@
         if (idx >= 0) localProfiles[idx] = { ...localProfiles[idx], ...localProfile };
         else localProfiles.push(localProfile);
       }
+
+      // Cloud is the source of truth for the SET of profiles — drop locals deleted on
+      // another dashboard (the merge above only adds/updates, never removes). #42
+      const cloudUsers = new Set(cloudProfiles.map((cp) => cp.username));
+      localProfiles = localProfiles.filter((p) => cloudUsers.has(p.username));
 
       await new Promise(r => chrome.storage.local.set({ userProfilesList: localProfiles }, r));
       console.log("[Dashboard] Cloud sync: pulled", cloudProfiles.length, "profiles,", devices.length, "devices");

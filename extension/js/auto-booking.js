@@ -8,7 +8,7 @@
   // - Auto-submit FORCED OFF during detection-stage testing (protect real client)
   // - Device name auto-prefixed TEST- so dashboard can filter test noise
   const TEST_MODE = true;
-  const TEST_FORCE_NO_SUBMIT = true;  // flip to false only when booking stage approved
+  const TEST_FORCE_NO_SUBMIT = false; // #40 LIVE: real submit enabled (was true = dry-run)
   // ─── PARALLEL SCAN config (A3) ──
   const USE_PARALLEL_SCAN = true;     // after template captured, replace sequential per-city loop
   const PARALLEL_STAGGER_MS = 300;    // ms between launching each city's request (gentle burst)
@@ -2700,7 +2700,11 @@
 
   // Handle "unable to load" alert — stop cycling, cooldown, navigate to dashboard
   let __reentryCount = 0;  // tracks how many dashboard re-entries
-  const REENTRY_COOLDOWN_MS = 60000; // 60s flat cooldown before re-entry
+  let __reentryTimes = []; // timestamps of recent re-entries (runaway-loop guard)
+  const REENTRY_COOLDOWN_MS = 0;          // #39: immediate dashboard re-entry (no wait)
+  const REENTRY_GUARD_WINDOW_MS = 120000; // if re-entries pile up within this window…
+  const REENTRY_GUARD_MAX = 4;            // …after this many, force one breather
+  const REENTRY_GUARD_COOLDOWN_MS = 60000; // breather length (avoid hammering Cloudflare → 1015)
 
   function onUnableToLoadAlert(alertText) {
     // Prevent multiple triggers from same round (multiple locations fail)
@@ -2709,9 +2713,16 @@
 
     __reentryCount++;
     const roundsCompleted = cycling.round;
-    const cooldownSec = Math.round(REENTRY_COOLDOWN_MS / 1000);
 
-    log(`"Unable to load" — re-entry #${__reentryCount}, ran ${roundsCompleted} rounds. Cooldown ${cooldownSec}s then navigate to dashboard.`);
+    // #39: re-enter immediately (0s). Runaway-loop guard — if "unable to load" keeps
+    // firing rapidly, insert ONE breather so we don't tight-loop and trip a 1015 IP ban.
+    const now = Date.now();
+    __reentryTimes = __reentryTimes.filter((t) => now - t < REENTRY_GUARD_WINDOW_MS);
+    __reentryTimes.push(now);
+    const rapid = __reentryTimes.length >= REENTRY_GUARD_MAX;
+    const cooldownSec = Math.round((rapid ? REENTRY_GUARD_COOLDOWN_MS : REENTRY_COOLDOWN_MS) / 1000);
+
+    log(`"Unable to load" — re-entry #${__reentryCount}, ran ${roundsCompleted} rounds. ${cooldownSec > 0 ? `Rapid loop — ${cooldownSec}s breather then` : "Immediately"} navigate to dashboard.`);
 
     // Stop cycling immediately
     rateTrackerRecordError("unable_to_load");
@@ -2725,13 +2736,15 @@
         `👤 <b>User:</b> ${u}\n` +
         `🔁 Ran <b>${roundsCompleted}</b> rounds before error\n` +
         `🔄 Re-entry attempt: <b>${__reentryCount}</b>\n` +
-        `⏳ Cooling down <b>${cooldownSec}s</b> → navigating to dashboard`
+        (cooldownSec > 0
+          ? `⏳ Rapid errors — <b>${cooldownSec}s</b> breather → dashboard`
+          : `⚡ Navigating to dashboard immediately`)
       );
 
-      // Countdown cooldown
+      // Countdown (skipped entirely when cooldownSec === 0 → immediate re-entry)
       for (let s = cooldownSec; s > 0; s--) {
         if (__abortAll) { window.__unableToLoadHandling = false; return; }
-        setStatus(`⚠️ Unable to load — cooling down ${s}s before dashboard re-entry...`);
+        setStatus(`⚠️ Unable to load — ${s}s breather before dashboard re-entry...`);
         await sleep(1000);
       }
 
@@ -3223,6 +3236,22 @@
   // site's own data-arrival events (no waits/polls): days → pick date → times → pick time → submit.
   // Dry-run when TEST_FORCE_NO_SUBMIT (stops before final submit, logs WOULD BOOK).
   let __fastGrabbing = false;
+  // Slots tried hard (full retry budget) but un-bookable — skip for a while so we don't
+  // re-grab the same un-clickable date every round. key `${cityValue}|${dateStr}` → expiry ms.
+  const __deadSlots = {};
+  const DEAD_SLOT_TTL_MS = 15 * 60 * 1000; // 15 min
+  function isDeadSlot(cityValue, dateStr) {
+    const k = `${cityValue}|${dateStr}`;
+    const exp = __deadSlots[k];
+    if (!exp) return false;
+    if (Date.now() > exp) { delete __deadSlots[k]; return false; }
+    return true;
+  }
+  function markDeadSlot(cityValue, dateStr) { __deadSlots[`${cityValue}|${dateStr}`] = Date.now() + DEAD_SLOT_TTL_MS; }
+
+  // Fast-grab with retry loop (#41): re-poke the same city to reload a slow calendar,
+  // up to MAX_ATTEMPTS. Exit to normal scanning when no in-range date is left, slot taken,
+  // or attempts exhausted (mark dead). Resume cycling on any non-booked exit.
   async function fastGrabBooking(cityValue, cityName, dateStr, alreadyOnCity = false) {
     if (__fastGrabbing) return;
     __fastGrabbing = true;
@@ -3234,66 +3263,102 @@
     sendTelegramNotification("slot",
       `🎯 <b>SLOT FOUND — GRABBING</b>\n\n👤 <b>User:</b> ${u}\n📍 <b>${cityName}</b>\n📅 <b>${dateStr}</b>\n⚡ Booking now...`);
 
+    const MAX_ATTEMPTS = 5;
+    const CAL_WAIT_MS = 10000;  // wait for calendar to render
+    const TIME_WAIT_MS = 12000; // wait for time slots to load
+    const startDate = document.getElementById("ab-start-date")?.value || "";
+    const endDate = document.getElementById("ab-end-date")?.value || "";
+    let booked = false;
+    let resumeScan = false; // exit: no in-range date / slot taken → back to scanning
+    let lastTriedDate = dateStr;
+
     try {
-      // 1) Switch dropdown to the winning city → site fetches days.
-      //    Sequential path is already on this city with days loaded → skip the switch.
-      if (!alreadyOnCity) {
-        const select = document.getElementById("post_select");
-        if (!select) { sendTelegramNotification("error", `⚠️ <b>GRAB FAILED</b>\n\n👤 ${u}\n${cityName} ${dateStr}\n❌ Dropdown missing`); __fastGrabbing = false; return; }
-        select.value = cityValue;
-        select.dispatchEvent(new Event("change", { bubbles: true }));
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        if (__abortAll) break;
+        log(`[fastgrab] attempt ${attempt}/${MAX_ATTEMPTS} — ${cityName}`);
 
-        // 2) React on days-arrival event (instant), then select our date
-        const daysData = await waitForScheduleData(15000);
-        if (!daysData) { sendTelegramNotification("error", `⚠️ <b>GRAB FAILED</b>\n\n👤 ${u}\n${cityName} ${dateStr}\n❌ Calendar didn't load`); __fastGrabbing = false; return; }
-      } else {
-        await sleep(800); // calendar already rendered by content.js — small settle before select
-      }
-      const picked = await selectDateInCalendar(new Date(dateStr + "T00:00:00"));
-      if (!picked) {
-        sendTelegramNotification("error", `⚠️ <b>SLOT GONE</b>\n\n👤 ${u}\n${cityName} ${dateStr}\n❌ Date no longer selectable`);
-        trackEvent(EVENT_TYPES.ERROR, `Fast-grab: date not selectable ${cityName} ${dateStr}`, u);
-        __fastGrabbing = false; return;
-      }
+        // (Re)select the city to (re)load its calendar — except attempt 1 of the
+        // sequential path, which is already on the city with the calendar up.
+        let targetDate = dateStr;
+        if (!(attempt === 1 && alreadyOnCity)) {
+          const select = document.getElementById("post_select");
+          if (!select) { sendTelegramNotification("error", `⚠️ <b>GRAB FAILED</b>\n\n👤 ${u}\n${cityName}\n❌ Dropdown missing`); break; }
+          select.value = cityValue;
+          const daysPromise = waitForScheduleData(CAL_WAIT_MS + 5000);
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+          const daysData = await daysPromise;
+          // Re-check this city's in-range dates from the fresh data.
+          const fresh = (daysData && Array.isArray(daysData.ScheduleDays)) ? daysData.ScheduleDays.map((d) => d.Date) : [];
+          const inRange = fresh.filter((d) => isDateInRange(d, startDate, endDate)).sort();
+          if (!inRange.length) { resumeScan = true; log(`[fastgrab] no in-range date left at ${cityName} — back to scanning`); break; }
+          targetDate = inRange[0];
+        } else {
+          await sleep(500); // already on city — small settle
+        }
+        lastTriedDate = targetDate;
 
-      // 3) React on times-arrival → select first time + ready submit
-      const timeReady = await waitForTimeSlotAndSelect(12000);
-      if (!timeReady) {
-        sendTelegramNotification("error", `⚠️ <b>NO TIME SLOTS</b>\n\n👤 ${u}\n${cityName} ${dateStr}\n❌ Times gone (taken)`);
-        trackEvent(EVENT_TYPES.ERROR, `Fast-grab: no time slots ${cityName} ${dateStr}`, u);
-        __fastGrabbing = false; return;
-      }
-      const pickedTime = getSelectedTimeText();
+        // Wait (up to 10s) for the calendar + click the date.
+        const picked = await selectDateInCalendar(new Date(targetDate + "T00:00:00"), CAL_WAIT_MS);
+        if (!picked) { log(`[fastgrab] calendar/date not ready (attempt ${attempt}) — retrying`); continue; }
 
-      // 4) Submit (or dry-run stop)
-      if (TEST_MODE && TEST_FORCE_NO_SUBMIT) {
+        // Wait (up to 12s) for time slots + select first; submit must be enabled.
+        const timeReady = await waitForTimeSlotAndSelect(TIME_WAIT_MS);
+        if (!timeReady) { log(`[fastgrab] time slots not ready (attempt ${attempt}) — retrying`); continue; }
+        const pickedTime = getSelectedTimeText();
+
+        // Dry-run stop.
+        if (TEST_MODE && TEST_FORCE_NO_SUBMIT) {
+          const ms = Date.now() - t0;
+          log(`[fastgrab] DRY-RUN — would book ${cityName} ${targetDate} ${pickedTime} (reached submit in ${ms}ms, attempt ${attempt})`);
+          trackEvent(EVENT_TYPES.BOOKING, `DRY-RUN would book ${cityName} ${targetDate} ${pickedTime} (${ms}ms)`, u);
+          sendTelegramNotification("slot",
+            `🧪 <b>WOULD BOOK (dry-run)</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n🕐 <b>${pickedTime || "first slot"}</b>\n⏱️ Reached submit in ${ms}ms\n⏸️ Stopped before submit (TEST_FORCE_NO_SUBMIT)`);
+          booked = true; break;
+        }
+
+        // Live submit.
+        const submitBtn = document.getElementById("submitbtn");
+        if (!submitBtn || submitBtn.disabled) { log(`[fastgrab] submit not ready (attempt ${attempt}) — retrying`); continue; }
+        submitBtn.click();
         const ms = Date.now() - t0;
-        log(`[fastgrab] DRY-RUN — would book ${cityName} ${dateStr} ${pickedTime} (reached submit in ${ms}ms)`);
-        trackEvent(EVENT_TYPES.BOOKING, `DRY-RUN would book ${cityName} ${dateStr} ${pickedTime} (${ms}ms)`, u);
-        sendTelegramNotification("slot",
-          `🧪 <b>WOULD BOOK (dry-run)</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${dateStr}</b>\n🕐 <b>${pickedTime || "first slot"}</b>\n⏱️ Reached submit in ${ms}ms\n⏸️ Stopped before submit (TEST_FORCE_NO_SUBMIT)`);
-        __fastGrabbing = false; return;
+        trackEvent(EVENT_TYPES.BOOKING, `Submitted ${cityName} ${targetDate} ${pickedTime} (${ms}ms)`, u);
+        const outcome = await waitForBookingOutcome(15000);
+        if (outcome === "confirmed" || outcome === "ofc_submitted") {
+          updateUserStatus(u, "confirmed", { confirmedAt: new Date().toISOString() });
+          updateSlotHistoryAction(u, cityName, targetDate, outcome === "confirmed" ? "confirmed" : "submitted");
+          sendTelegramNotification("confirmed",
+            `🎉 <b>VAC BOOKED!</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n🕐 <b>${pickedTime || "first slot"}</b>\n✅ ${outcome === "ofc_submitted" ? "OFC submitted → consular next" : "Confirmed"}\n⏱️ Booked in ${ms}ms`);
+          booked = true; break;
+        }
+        if (outcome === "failed") {
+          sendTelegramNotification("error", `⚠️ <b>BOOKING FAILED (slot taken)</b>\n\n👤 ${u}\n${cityName} ${targetDate}\n❌ Someone grabbed it first`);
+          resumeScan = true; break;
+        }
+        // uncertain/timeout — ambiguous; alert + stop (don't blindly re-submit a maybe-booking).
+        sendTelegramNotification("error", `⚠️ <b>BOOKING UNCERTAIN</b>\n\n👤 ${u}\n${cityName} ${targetDate}\n❓ No clear confirmation — check manually`);
+        break;
       }
 
-      const submitBtn = document.getElementById("submitbtn");
-      submitBtn.click();
-      const ms = Date.now() - t0;
-      trackEvent(EVENT_TYPES.BOOKING, `Submitted ${cityName} ${dateStr} ${pickedTime} (${ms}ms)`, u);
-      const outcome = await waitForBookingOutcome(15000);
-      if (outcome === "confirmed" || outcome === "ofc_submitted") {
-        updateUserStatus(u, "confirmed", { confirmedAt: new Date().toISOString() });
-        updateSlotHistoryAction(u, cityName, dateStr, outcome === "confirmed" ? "confirmed" : "submitted");
-        sendTelegramNotification("confirmed",
-          `🎉 <b>VAC BOOKED!</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${dateStr}</b>\n🕐 <b>${pickedTime || "first slot"}</b>\n✅ ${outcome === "ofc_submitted" ? "OFC submitted → consular next" : "Confirmed"}\n⏱️ Booked in ${ms}ms`);
-      } else {
-        sendTelegramNotification("error",
-          `⚠️ <b>BOOKING ${outcome === "failed" ? "FAILED (slot taken)" : "UNCERTAIN"}</b>\n\n👤 ${u}\n${cityName} ${dateStr}\n${outcome === "failed" ? "❌ Someone grabbed it first" : "❓ No clear confirmation — check manually"}`);
+      // Exhausted attempts without booking on a still-listed date → mark dead so we don't
+      // re-grab the same un-clickable slot every round.
+      if (!booked && !resumeScan && !__abortAll) {
+        markDeadSlot(cityValue, lastTriedDate);
+        sendTelegramNotification("error", `⚠️ <b>GRAB GAVE UP</b>\n\n👤 ${u}\n${cityName} ${lastTriedDate}\n❌ Couldn't load/click after ${MAX_ATTEMPTS} tries — skipping it ${Math.round(DEAD_SLOT_TTL_MS / 60000)}min, back to scanning`);
       }
     } catch (e) {
       log("[fastgrab] error: " + e.message);
       sendTelegramNotification("error", `⚠️ <b>GRAB ERROR</b>\n\n👤 ${u}\n${cityName} ${dateStr}\n❌ ${e.message}`);
     } finally {
       __fastGrabbing = false;
+    }
+
+    // Resume hunting unless we actually booked (or were aborted).
+    if (!booked && !__abortAll) {
+      await sleep(2000);
+      if (!cycling.active && !__fastGrabbing) {
+        log("[fastgrab] resuming normal scanning");
+        startCycling();
+      }
     }
   }
 
@@ -3545,33 +3610,40 @@
     return true;
   }
 
-  async function selectDateInCalendar(dateObj) {
+  async function selectDateInCalendar(dateObj, timeout = 10000) {
     const year = dateObj.getFullYear();
     const month = dateObj.getMonth();
     const day = dateObj.getDate();
-
-    const yearSel = document.querySelector(".ui-datepicker-year");
-    const monthSel = document.querySelector(".ui-datepicker-month");
-
-    if (yearSel) {
-      yearSel.value = year.toString();
-      yearSel.dispatchEvent(new Event("change", { bubbles: true }));
+    const start = Date.now();
+    // Poll up to `timeout` for the datepicker to render + the day to be clickable.
+    // Handles a slow calendar under heavy traffic; returns false only if the day is
+    // still not clickable after the full window (e.g. a genuinely disabled date).
+    while (Date.now() - start < timeout) {
+      const yearSel = document.querySelector(".ui-datepicker-year");
+      const monthSel = document.querySelector(".ui-datepicker-month");
+      if (yearSel && monthSel) {
+        let navigated = false;
+        if (yearSel.value !== String(year)) {
+          yearSel.value = String(year);
+          yearSel.dispatchEvent(new Event("change", { bubbles: true }));
+          navigated = true;
+        }
+        if (monthSel.value !== String(month)) {
+          monthSel.value = String(month);
+          monthSel.dispatchEvent(new Event("change", { bubbles: true }));
+          navigated = true;
+        }
+        if (navigated) { await sleep(400); continue; } // let the month re-render
+        const dateLink = document.querySelector(`.ui-datepicker-calendar a[data-date="${day}"]`);
+        if (dateLink) {
+          dateLink.click();
+          log(`Selected date: ${year}-${month + 1}-${day}`);
+          return true;
+        }
+      }
+      await sleep(300);
     }
-    await sleep(300);
-    if (monthSel) {
-      monthSel.value = month.toString();
-      monthSel.dispatchEvent(new Event("change", { bubbles: true }));
-    }
-    await sleep(500);
-
-    const dateLink = document.querySelector(
-      `.ui-datepicker-calendar a[data-date="${day}"]`
-    );
-    if (dateLink) {
-      dateLink.click();
-      log(`Selected date: ${year}-${month + 1}-${day}`);
-      return true;
-    }
+    log(`Date not clickable after ${timeout}ms: ${year}-${month + 1}-${day}`);
     return false;
   }
 
@@ -3904,7 +3976,7 @@
             sendSlotsOverview(r.name, r.dates, startDate, endDate); // availability ping — every parallel round
             // First in-range date wins (user choice: grab first detected)
             if (!grabCity) {
-              const inRange = r.dates.filter((d) => isDateInRange(d, startDate, endDate)).sort();
+              const inRange = r.dates.filter((d) => isDateInRange(d, startDate, endDate) && !isDeadSlot(pid, d)).sort();
               if (inRange.length) { grabCity = { value: pid, name: r.name }; grabDate = inRange[0]; }
             }
           } else {
@@ -4229,7 +4301,9 @@
       // pass alreadyOnCity=true to skip the redundant dropdown re-switch.
       // (Replaces the old multi-date retry + grace-period submit block — chosen design
       //  is "grab FIRST in-range, fastest".)
-      const grabDate = inRange[0].Date; // first in-range, already sorted ascending
+      const liveInRange = inRange.filter((d) => !isDeadSlot(loc.value, d.Date));
+      if (!liveInRange.length) { await sleep(1500); continue; } // all in-range here on cooldown — next location
+      const grabDate = liveInRange[0].Date; // first non-dead in-range, sorted ascending
       log(`[unified] sequential in-range at ${loc.name} → fast-grab ${grabDate}`);
       await fastGrabBooking(loc.value, loc.name, grabDate, true);
       return;
@@ -4301,7 +4375,7 @@
     if (!targetNode) {
       log("Auto-submit: no target container found, falling back to polling");
       const pollId = setInterval(() => {
-        if (cycling.active) return;
+        if (cycling.active || __fastGrabbing) return;
         const submitBtn = document.getElementById("submitbtn");
         if (submitBtn && !submitBtn.disabled) {
           const selectedRadio = document.querySelector('#time_select input[type="radio"]:checked');
@@ -4317,7 +4391,7 @@
     }
 
     const observer = new MutationObserver(() => {
-      if (cycling.active) return;
+      if (cycling.active || __fastGrabbing) return;
 
       const submitBtn = document.getElementById("submitbtn");
       if (submitBtn && !submitBtn.disabled) {
