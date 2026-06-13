@@ -1,97 +1,101 @@
-# CLAUDE.md — SlotHunter TEST Build
+# CLAUDE.md
 
-This is the **TEST build** of the SlotHunter Chrome extension. It runs in ONE isolated test Chrome profile. Production lives in a separate folder and must NEVER be touched from here.
-
-> These instructions OVERRIDE default behavior. Follow them exactly.
-
----
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What This Is
 
-Test/dev copy of the US visa appointment booking Chrome extension, on branch `feature/parallel-booking`. Used to build and prove new booking-logic enhancements (e.g. parallel slot detection) WITHOUT disturbing the production extension that runs all live client profiles.
+Chrome extension for automated US visa appointment booking on https://usvisascheduling.com for Indian consulates (Mumbai, New Delhi, Chennai, Kolkata, Hyderabad). Handles: login with CAPTCHA solving, security questions, dashboard navigation, and OFC/interview slot cycling with auto-submit.
 
-- **Production folder:** `/Users/aruntejagannu/Documents/Claude/Projects/Usa Visa slot Booking/extension/` (branch `main`) — loaded in all client profiles. **Do not edit from this worktree.**
-- **Test folder (this one):** `/Users/aruntejagannu/Documents/Claude/Projects/SlotHunter-test/extension/` (branch `feature/parallel-booking`) — loaded in ONE test profile only.
+## Setup & Run
 
----
+1. Load extension in Chrome:
+   - Go to `chrome://extensions/` → Enable Developer mode → Load unpacked → select `extension/` folder
+2. Start CAPTCHA solver server:
+   ```bash
+   pip install ddddocr
+   python captcha_server.py
+   ```
+3. Open https://usvisascheduling.com → settings panel appears on login page → fill credentials → click SAVE & START
 
-## THE THUMB RULE (most important — never skip)
-
-Every change follows this exact order. **Never jump ahead. Never build without approval.**
+## Architecture
 
 ```
-1. PLAN     → present a plan in plain language. What, why, which files, risks.
-2. APPROVE  → wait for the user's explicit "yes / go / ok to proceed". STOP until then.
-3. ISSUE    → create a GitHub issue on the autobooking repo + add to project board (Todo).
-4. BUILD    → implement. Test-folder files only.
-5. EXPLAIN  → tell the user in LAYMAN ENGLISH what was built (see rule below).
-6. TEST     → user tests. Wait for their confirmation it works.
-7. CLOSE    → on user OK: close issue, commit, push to BOTH repos, move board to Done, write BUILD_LOG entry.
+extension/
+  ├── manifest.json           MV3 manifest — permissions, content scripts, service worker
+  ├── js/auto-booking.js      Main automation (login, CAPTCHA, security Qs, dashboard, cycling)
+  ├── js/sw-enhanced.js       Service worker — relays CAPTCHA images to local solver
+  ├── js/content.js           Original CVS extension — slot display, date selection, XHR processing
+  ├── js/page.js              MAIN world script — intercepts XHR, dispatches vSCP events
+  ├── js/options-init.js      Options page logic (not used in current flow)
+  ├── js/html2canvas.js       Screenshot library
+  ├── js/html2pdf.bundle.min.js  PDF generation for confirmations
+  ├── js/sweetalert2.min.js   Alert dialogs
+  ├── options.html             Options page HTML
+  └── css/sidebar.css          Sidebar styles
+
+captcha_server.py             Local OCR server (ddddocr) on port 5123
 ```
 
-If unsure which step we're on → ask. Do not assume approval.
+### Flow
 
----
-
-## LAYMAN-ENGLISH RULE (every build)
-
-The user is not deeply technical. After ANY build or fix:
-
-1. Explain in plain, simple English — no jargon. What it does, why, what changes for them.
-2. Append the same explanation to `BUILD_LOG.md` (newest entry on top).
-
-Use everyday analogies. Example: "Before, the bot checked one city at a time like reading one page of a menu before flipping to the next. Now it reads all pages at once — much faster."
-
----
-
-## Repos & Branch
-
-- **Public repo (origin):** https://github.com/ArunTeja0040/usvisaslot
-- **Private repo (autobooking):** https://github.com/ArunTeja0040/autobooking
-- **Issues + project board live on:** `autobooking`
-- **Project board:** https://github.com/users/ArunTeja0040/projects/2
-  - Project ID: `PVT_kwHOAp7Gbs4BYH1D`
-  - Status field ID: `PVTSSF_lAHOAp7Gbs4BYH1DzhTP1-U`
-  - Status options: Todo `f75ad846`, In Progress `47fc9ee4`, Done `98236657`
-- **This branch:** `feature/parallel-booking`
-- **Always push to BOTH remotes:** `origin` and `autobooking`.
-
-Commit message footer:
 ```
-Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Login Page (b2clogin.com)
+  → Settings panel injected (position:fixed, left side)
+  → User clicks SAVE & START
+  → Auto-fill username/password
+  → CAPTCHA: capture image → canvas → base64 → service worker → localhost:5123 → ddddocr OCR
+  → CAPTCHA rules: must be exactly 5 alphanumeric chars, uppercase only
+  → Click Continue
+  → If wrong: refresh CAPTCHA, retry (up to 5 attempts)
+
+Security Questions Page (b2clogin.com)
+  → Detect 2 questions from saved answers
+  → Auto-fill and click Continue
+
+Dashboard (usvisascheduling.com)
+  → Auto-click Reschedule/Continue button
+
+Booking Page — OFC or Interview (usvisascheduling.com)
+  → Booking panel injected (date range, location checkboxes, START/STOP)
+  → Cycling: iterate through selected locations
+  → 3-6 second random delay between locations (avoid Cloudflare rate limit)
+  → Listen for vSCP events from page.js for schedule data
+  → If dates found in preferred range → STOP cycling, select date, wait for user to submit
+  → If auto-submit enabled → auto-select time slot and click submit
 ```
 
----
+### Key Design Decisions
 
-## Test-Build Safety (already wired — keep intact)
+- **SAVE & START gate**: All automation (login, security Qs, dashboard, auto-submit) only triggers after user explicitly clicks SAVE & START. Without it, the site works normally. Uses `sessionStorage` flag.
+- **Content script worlds**: auto-booking.js runs in ISOLATED world. page.js runs in MAIN world (intercepts XHR). Communication via CustomEvents (`vSCP`).
+- **CAPTCHA canvas approach**: Image drawn to canvas → toDataURL → base64. Works because CAPTCHA is same-origin on b2clogin.com.
+- **CSP workaround**: `clickSafe()` strips `javascript:` href before clicking to avoid CSP violations on b2clogin.com.
 
-This build has guardrails so testing on a real client never causes harm:
+### Error Handling
 
-- **Manifest name:** "SlotHunter TEST" — distinct in `chrome://extensions`.
-- **`TEST_MODE = true`** (top of `extension/js/auto-booking.js`).
-- **`TEST_FORCE_NO_SUBMIT = true`** — auto-submit is DISABLED. Bot detects slots but never books. Flip to `false` ONLY when the user approves the booking stage.
-- **Telegram:** every message prefixed `🧪 [TEST]`.
-- **Device name:** auto-prefixed `TEST-` → dashboard can filter test noise.
-- **Shared backend:** same Supabase + Telegram as production (tagged, not separate).
+- **401 Unauthorized**: DOM bridge detection (hidden div + MutationObserver crosses MAIN/ISOLATED world boundary). Saves cycling state to sessionStorage, redirects to login, auto-re-logins, restores cycling.
+- **429 Rate Limited (Cloudflare)**: Detected via same DOM bridge. Exponential backoff: 60s → 120s → 240s → max 5min. Resets after successful request.
+- **Rate limit warning** ("approaching maximum number of times"): Auto-logout to protect session.
+- **Session keep-alive**: Page refreshes every ~8 minutes during cycling to prevent session expiry.
 
-Two-stage testing:
-1. **Detection stage** (now): no booking, read-only. Prove speed/accuracy.
-2. **Booking stage** (later, on approval): flip `TEST_FORCE_NO_SUBMIT` to false.
+## Files
 
----
+| File | Purpose |
+|---|---|
+| `extension/js/auto-booking.js` | All automation logic — the main file you'll edit |
+| `extension/js/sw-enhanced.js` | Service worker — CAPTCHA relay + slot data push |
+| `extension/js/content.js` | Original CVS extension (minified, read-only) |
+| `extension/js/page.js` | MAIN world XHR interceptor |
+| `captcha_server.py` | Local ddddocr OCR server |
+| `extension/manifest.json` | Extension config |
 
-## Docs (read these before acting)
+## CAPTCHA Details
 
-| File | Use |
-|------|-----|
-| `WORKFLOW.md` | Exact step-by-step of the thumb rule + commit/push/board conventions |
-| `ARCHITECTURE.md` | How the extension works — files, worlds, events, API, flows |
-| `TESTING.md` | How to load + test the build, what to watch |
-| `SUPABASE_SCHEMA.md` | All cloud tables + columns |
-| `DECISIONS.md` | Past decisions, known issues, deferred items |
-| `BUILD_LOG.md` | Plain-English history of every build (append on each build) |
+- Server: `captcha_server.py` on `localhost:5123` using `ddddocr` library
+- Rules: always 5 characters, alphabets always uppercase, alphanumeric only
+- Flow: image → canvas → base64 → service worker → POST to server → OCR → clean (strip special chars, uppercase, validate 5 chars) → return or reject and refresh
+- Max 5 retry attempts before falling back to manual
 
-## Skills
+## Branch
 
-- `issue-flow` — runs the whole thumb-rule lifecycle.
-- `extension-dev` — safe-edit rules for the codebase.
+Active branch: `extension-v2-enhanced`

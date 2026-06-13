@@ -1,13 +1,13 @@
 (function () {
   "use strict";
 
-  const LOG_PREFIX = "[AutoBook-TEST]";
+  const LOG_PREFIX = "[AutoBook]";
   // ─── TEST MODE ──────────────────────────────────────────────────
   // This is the TEST build (feature/parallel-booking worktree).
   // - Telegram messages prefixed [TEST]
   // - Auto-submit FORCED OFF during detection-stage testing (protect real client)
   // - Device name auto-prefixed TEST- so dashboard can filter test noise
-  const TEST_MODE = true;
+  const TEST_MODE = false;
   const TEST_FORCE_NO_SUBMIT = false; // #40 LIVE: real submit enabled (was true = dry-run)
   // ─── PARALLEL SCAN config (A3) ──
   const USE_PARALLEL_SCAN = true;     // after template captured, replace sequential per-city loop
