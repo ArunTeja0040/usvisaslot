@@ -12,6 +12,24 @@ Format:
 
 ---
 
+## 2026-06-10 — Active clients pinned to top of dashboard (Issue #47)
+**What it does:** Reorders the dashboard cards so the clients currently RUNNING float to the top — the one running on YOUR dashboard first, then ones running on other people's dashboards, then everyone idle (A-Z) below.
+**Why:** With several dashboards each running a different client, you had to scroll to find who's active. Now the running ones are always at the top of your screen.
+**What changed for you:** Open the dashboard → the top row is whoever's running (yours first). Doesn't change the active count or the Start-button rules — just the order. Works with search + filters.
+
+## 2026-06-07 — Adaptive scan: cut off slow requests + fall back to steady mode (Issue #46)
+**What it does:** Two changes to how the bot scans:
+1. **12-second cutoff:** if a fast "2-cities-at-once" check takes longer than 12s (the website slow-walling it), the bot drops that request instead of waiting up to a minute.
+2. **Quick probe + back-off:** when slow-walling happens, the bot does a short **2-check** one-at-a-time probe, then **immediately re-tries the fast way**. If it's still jammed, the next probe is a bit longer (**2 → 4 → 6** checks) so a long jam doesn't flip-flop; the instant the fast way works again, it snaps back to a 2-check probe. (One-at-a-time stays fast — 3-7s — even when the fast way is throttled.)
+3. **Bench it after 3 strikes (#46b):** if the fast way times out **3 rounds in a row** (i.e. it's fully dead, not just slow), the bot stops re-trying it for **5 minutes** and runs purely one-at-a-time. After 5 min it tests the fast way once — works → back to normal; still dead → bench another 5 min. This stops the bot wasting 12s every round on a fast way that never succeeds.
+**Why:** Live testing showed "2-at-once" scans getting throttled to 19-64 seconds (then timing out), which let slots vanish before the bot could book. One-at-a-time stayed fast throughout. So instead of stubbornly retrying the slow way every round, the bot bails to the fast-and-steady method.
+**What changed for you:** When the website starts throttling, the bot no longer wastes a minute per round — it caps at 12s and switches to the steady method, so detection stays fast and slots don't slip away. It returns to the fast method automatically once throttling lifts.
+
+## 2026-06-07 — Removed fake "human activity" (Issue #45)
+**What it does:** Removed the fake mouse-moves / scrolling / tab-switching the bot did between checks.
+**Why:** Those events were fake — the browser tags them "not from a real human" — so they didn't actually fool Cloudflare, but they cluttered the logs and added a few seconds of delay. The fake "tab switch" even pretended the tab was hidden, which can make the website throttle itself.
+**What changed for you:** Cleaner logs (no more "Human sim..."), slightly faster checking between cities. No downside expected — the fake activity wasn't helping. Easily added back if blocks ever rise.
+
 ## 2026-06-07 — Dashboard: delete-sync + rate-limit unblock + search (#42/#43/#44)
 **What it does:**
 - **#42 Delete sync:** deleting a profile now removes it from ALL dashboards, not just the one you clicked on. The cloud is treated as the master list — anything removed there is removed everywhere on the next sync.

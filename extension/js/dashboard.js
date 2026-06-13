@@ -198,6 +198,33 @@
 
     const myDeviceId = SUPA ? SUPA.getDeviceId() : null;
 
+    // #47 Pin active clients to the top: active on THIS device first, then active on
+    // other dashboards, then idle (A-Z). Display order only — doesn't change behavior.
+    const ACTIVE_STATES_SORT = ["cycling", "logging_in", "security_questions", "on_dashboard", "slot_found"];
+    const activeRank = (profile) => {
+      const st = statuses[profile.username] || {};
+      const cl = cloudStatusMap[profile.username] || {};
+      const localSt = st.status || "";
+      const cloudSt = cl.status || "";
+      const userStatus = ACTIVE_STATES_SORT.includes(localSt) ? localSt : (ACTIVE_STATES_SORT.includes(cloudSt) ? cloudSt : (localSt || cloudSt || "idle"));
+      const isActive = ["cycling", "logging_in", "security_questions", "on_dashboard"].includes(userStatus);
+      const cloudIsRunning = cl.isActive || ACTIVE_STATES_SORT.includes(cl.status);
+      const activeOnOtherDevice = cloudIsRunning && cl.activeDeviceId && cl.activeDeviceId !== myDeviceId;
+      if (activeOnOtherDevice) return 1;       // active on another dashboard
+      if (isActive || cloudIsRunning) return 0; // active on THIS dashboard
+      return 2;                                 // idle / other
+    };
+    filtered.sort((a, b) => {
+      const ra = activeRank(a), rb = activeRank(b);
+      if (ra !== rb) return ra - rb;
+      if (ra === 2) {
+        const na = (a.name || deriveProfileName(a.username) || a.username).toLowerCase();
+        const nb = (b.name || deriveProfileName(b.username) || b.username).toLowerCase();
+        return na.localeCompare(nb);
+      }
+      return 0; // active groups: keep stable order
+    });
+
     container.innerHTML = filtered.map((profile) => {
       const status = statuses[profile.username] || {};
       const cloud = cloudStatusMap[profile.username] || {};

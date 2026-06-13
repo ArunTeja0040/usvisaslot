@@ -14,6 +14,17 @@
   const PARALLEL_STAGGER_MS = 300;    // ms between launching each city's request (gentle burst)
   const PARALLEL_ROUND_MS = 20000;    // wait between parallel rounds (tunable in A4)
   const PARALLEL_BATCH_SIZE = 2;      // cities scanned per round (rotating) — keeps 2 concurrent max (fast, no tarpit/429)
+  const PARALLEL_FETCH_TIMEOUT_MS = 12000; // #46 abort a tarpitted request at 12s (don't wait ~60s)
+  const SEQ_PROBE_BASE = 2;                // #46 after a tarpit, probe with this many sequential checks
+  const SEQ_PROBE_MAX = 10;                // #46 cap the escalating probe size
+  let __seqProbeChecks = 0;                // #46 sequential checks to do before re-trying parallel
+  let __seqBackoff = 2;                    // #46 current probe size — escalates on repeat tarpits, resets on success
+  const MAX_PARALLEL_STRIKES = 3;          // #46b after this many timeout rounds in a row, bench parallel
+  const PARALLEL_BENCH_MS = 5 * 60 * 1000;  // #46b run pure-sequential this long before re-testing parallel
+  let __parallelTimeoutStreak = 0;         // #46b consecutive parallel rounds that fully timed out
+  let __parallelBenchUntil = 0;            // #46b skip parallel until this time (sustained-tarpit guard)
+  let __parallelBenchNotified = false;     // #46b send paused/resumed Telegram only once per episode
+  let __parallelStartedNotified = false;   // #46c send "parallel started" once per cycling run
   let __scanCursor = 0;               // rolling pointer into selected locations
   const DISABLE_HUMAN_PAUSES = true;  // remove idle-gap + long-break (caused cold-session 403); keep steady round wait
   const SUPABASE_ENABLED = typeof SupabaseSync !== "undefined";
@@ -3212,15 +3223,20 @@
       const span = randHex(16);
       const headers = { ...baseHeaders, "Request-Id": `|${traceId}.${span}`, "traceparent": `00-${traceId}-${span}-01` };
       const t0 = Date.now();
+      const ctrl = new AbortController();
+      const killer = setTimeout(() => ctrl.abort(), PARALLEL_FETCH_TIMEOUT_MS);
       try {
-        const resp = await fetch(url, { method: "POST", headers, body, credentials: "include" });
+        const resp = await fetch(url, { method: "POST", headers, body, credentials: "include", signal: ctrl.signal });
+        clearTimeout(killer);
         const text = await resp.text();
         const challenge = isCfChallengeBody(text);
         const json = extractScheduleJson(text);
         const dates = (json && Array.isArray(json.ScheduleDays)) ? json.ScheduleDays.map((d) => d.Date) : [];
         results[pid] = { ok: resp.status === 200 && !!json, name, status: resp.status, dates, ms: Date.now() - t0, hasError: json ? json.HasError : null, challenge };
       } catch (e) {
-        results[pid] = { ok: false, name, error: e.message, ms: Date.now() - t0 };
+        clearTimeout(killer);
+        const timedOut = e.name === "AbortError";
+        results[pid] = { ok: false, name, error: timedOut ? "timeout" : e.message, ms: Date.now() - t0, timedOut };
       }
     })());
     await Promise.all(tasks);
@@ -3382,6 +3398,7 @@
     });
     cycling.active = true;
     cycling.round = 0;
+    __parallelStartedNotified = false; // #46c re-arm "parallel started" alert for this run
     // Reset rate tracker and start periodic flush
     rateTrackerReset();
     rateTracker.flushTimer = setInterval(() => {
@@ -3780,58 +3797,8 @@
     return 15 + Math.random() * 10;                    // 15%: 15-25s (distracted)
   }
 
-  // Simulate human browser activity (mouse, scroll, focus) to fool Cloudflare bot detection
-  async function simulateHumanActivity() {
-    const vw = window.innerWidth || 1280;
-    const vh = window.innerHeight || 800;
-
-    // Mouse movements: 3-6 events along a curved path
-    const moveCount = 3 + Math.floor(Math.random() * 4);
-    let cx = Math.floor(Math.random() * vw * 0.8 + vw * 0.1);
-    let cy = Math.floor(Math.random() * vh * 0.8 + vh * 0.1);
-    const tx = Math.floor(Math.random() * vw * 0.8 + vw * 0.1);
-    const ty = Math.floor(Math.random() * vh * 0.8 + vh * 0.1);
-    log(`Human sim: ${moveCount} mouse moves (${cx},${cy})→(${tx},${ty})`);
-
-    for (let m = 0; m < moveCount; m++) {
-      const t = (m + 1) / moveCount;
-      // Bezier-like curve with random offset for natural movement
-      const offsetX = (Math.random() - 0.5) * 80;
-      const offsetY = (Math.random() - 0.5) * 60;
-      const x = Math.floor(cx + (tx - cx) * t + offsetX * Math.sin(t * Math.PI));
-      const y = Math.floor(cy + (ty - cy) * t + offsetY * Math.sin(t * Math.PI));
-      const clampX = Math.max(0, Math.min(vw - 1, x));
-      const clampY = Math.max(0, Math.min(vh - 1, y));
-      document.dispatchEvent(new MouseEvent("mousemove", {
-        clientX: clampX, clientY: clampY, bubbles: true, cancelable: true,
-      }));
-      await sleep(80 + Math.random() * 200);
-    }
-
-    // Scroll: 40% chance of a small scroll
-    if (Math.random() < 0.40) {
-      const scrollAmt = Math.floor((Math.random() - 0.3) * 200); // bias downward
-      log(`Human sim: scroll ${scrollAmt > 0 ? "down" : "up"} ${Math.abs(scrollAmt)}px`);
-      window.scrollBy({ top: scrollAmt, behavior: "smooth" });
-      await sleep(200 + Math.random() * 400);
-    }
-
-    // Focus/blur (tab switch): 15% chance per call
-    if (Math.random() < 0.15) {
-      const blurSec = 2 + Math.random() * 3;
-      log(`Human sim: tab blur for ${blurSec.toFixed(1)}s`);
-      document.dispatchEvent(new Event("blur", { bubbles: true }));
-      window.dispatchEvent(new Event("blur"));
-      Object.defineProperty(document, "hidden", { value: true, writable: true, configurable: true });
-      document.dispatchEvent(new Event("visibilitychange"));
-      await sleep(blurSec * 1000);
-      document.dispatchEvent(new Event("focus", { bubbles: true }));
-      window.dispatchEvent(new Event("focus"));
-      Object.defineProperty(document, "hidden", { value: false, writable: true, configurable: true });
-      document.dispatchEvent(new Event("visibilitychange"));
-      log("Human sim: tab focus restored");
-    }
-  }
+  // Human-activity simulation removed (#45) — synthetic events (isTrusted=false) didn't
+  // fool Cloudflare and added log noise + a few seconds delay between checks.
 
   // Track when next idle gap / long break should trigger
   if (!cycling.nextIdleAt) cycling.nextIdleAt = 0;
@@ -3944,7 +3911,9 @@
     // captures the template, so we jump to parallel next round instead of checking all.
     const hadTemplateAtStart = !!scheduleTemplate;
     let didParallel = false;
-    if (USE_PARALLEL_SCAN && scheduleTemplate && !cycling.gracePeriod.active) {
+    // #46 adaptive: after a parallel tarpit, do a short sequential probe (2 checks, escalating)
+    // before re-trying parallel; reset the probe size the moment parallel succeeds.
+    if (USE_PARALLEL_SCAN && scheduleTemplate && !cycling.gracePeriod.active && __seqProbeChecks <= 0 && Date.now() >= __parallelBenchUntil) {
       // Rotating batch: scan only the next PARALLEL_BATCH_SIZE cities from the STABLE selected list.
       // Keeps max 2 concurrent (fast, no tarpit, low rate); covers all selected over successive rounds.
       const stable = Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map((cb) => ({ value: cb.value, name: cb.dataset.name }));
@@ -3953,12 +3922,17 @@
       for (let k = 0; k < n; k++) batch.push(stable[(__scanCursor + k) % stable.length]);
       __scanCursor = stable.length ? (__scanCursor + n) % stable.length : 0;
       setStatus(`⚡ Parallel scanning ${batch.map((b) => b.name).join(", ")}...`);
+      if (!__parallelStartedNotified) {
+        __parallelStartedNotified = true;
+        chrome.storage.local.get(["loginDetails"], (d) => sendTelegramNotification("rate",
+          `▶️ <b>PARALLEL STARTED</b>\n\n👤 ${d.loginDetails?.username || ""}\n⚡ Fast "2-at-once" scanning is now running.`));
+      }
       const res = await parallelScan(batch.map((l) => l.value));
       if (!cycling.active || __abortAll) return;
       if (!res) {
         log("[parallel] no result — falling back to sequential this round");
       } else {
-        let anyErr = false, any429 = false, anyChallenge = false;
+        let anyErr = false, any429 = false, anyChallenge = false, anyTimeout = false;
         let grabCity = null, grabDate = null; // first in-range hit
         const found = [];
         for (const pid of Object.keys(res)) {
@@ -3968,6 +3942,7 @@
           if (!r.ok) {
             anyErr = true;
             if (r.status === 429) any429 = true;
+            if (r.timedOut) anyTimeout = true;
             rateTrackerRecordError(r.challenge ? "cf_challenge" : (r.status === 429 ? "429" : "parallel_err"));
             log(`[parallel] ${r.name}: ERROR ${r.challenge ? "CF-CHALLENGE" : (r.error || r.status)}`);
           } else if (r.dates.length) {
@@ -3989,15 +3964,45 @@
         if (anyChallenge) { await handleCloudflareChallenge(); return; }
         if (any429) { handleSevereError("429 Rate Limited (parallel)"); return; }
         if (anyErr) {
-          log("[parallel] some requests failed — falling back to sequential this round");
+          if (anyTimeout) {
+            __parallelTimeoutStreak++;
+            if (__parallelTimeoutStreak >= MAX_PARALLEL_STRIKES) {
+              // Sustained tarpit — stop wasting 12s/round re-probing a dead parallel. Bench it.
+              __parallelBenchUntil = Date.now() + PARALLEL_BENCH_MS;
+              __seqProbeChecks = 0; // full sequential sweeps while benched
+              const benchMin = Math.round(PARALLEL_BENCH_MS / 60000);
+              log(`[parallel] ${__parallelTimeoutStreak} timeouts in a row — benching parallel ${benchMin}min, sequential only`);
+              if (!__parallelBenchNotified) {
+                __parallelBenchNotified = true;
+                chrome.storage.local.get(["loginDetails"], (d) => sendTelegramNotification("rate",
+                  `⏸️ <b>PARALLEL PAUSED</b>\n\n👤 ${d.loginDetails?.username || ""}\n🐢 Fast "2-at-once" scan timed out ${MAX_PARALLEL_STRIKES}× in a row — switching to steady one-at-a-time for ${benchMin} min.`));
+              }
+            } else {
+              __seqProbeChecks = __seqBackoff;
+              log(`[parallel] tarpit (timeout #${__parallelTimeoutStreak}) — sequential probe of ${__seqProbeChecks} check(s), then retry parallel`);
+              __seqBackoff = Math.min(__seqBackoff + 2, SEQ_PROBE_MAX); // escalate if it keeps jamming
+            }
+          } else {
+            log("[parallel] some requests failed — falling back to sequential this round");
+          }
         } else {
           didParallel = true;
+          __seqBackoff = SEQ_PROBE_BASE;     // parallel healthy → reset probe size to base
+          __parallelTimeoutStreak = 0;       // #46b parallel recovered → clear strikes + bench
+          __parallelBenchUntil = 0;
+          if (__parallelBenchNotified) {
+            __parallelBenchNotified = false;
+            chrome.storage.local.get(["loginDetails"], (d) => sendTelegramNotification("rate",
+              `▶️ <b>PARALLEL RESUMED</b>\n\n👤 ${d.loginDetails?.username || ""}\n⚡ Fast "2-at-once" scan working again — back to normal speed.`));
+          }
           setStatus(`⚡ Parallel done — ${found.length ? "SLOTS: " + found.join(", ") : "no slots"} — ${rateTrackerGetRate()} req/min`);
         }
       }
     }
 
-    for (let i = 0; !didParallel && i < locations.length; i++) {
+    // #46 probe mode: cap the sweep to __seqProbeChecks checks (else full sweep).
+    const seqCap = __seqProbeChecks > 0 ? Math.min(__seqProbeChecks, locations.length) : locations.length;
+    for (let i = 0; !didParallel && i < seqCap; i++) {
       if (!cycling.active) return;
 
       if (await checkStopSignal()) return;
@@ -4022,9 +4027,6 @@
           await sleep(1000);
         }
       }
-
-      // Simulate human activity (mouse, scroll, focus) between location checks
-      await simulateHumanActivity();
 
       // ── Layer 2: Cloudflare Turnstile challenge detection ──
       if (detectTurnstileChallenge()) {
@@ -4308,6 +4310,9 @@
       await fastGrabBooking(loc.value, loc.name, grabDate, true);
       return;
     }
+
+    // #46 probe consumed this round — next round re-tries parallel.
+    if (!didParallel && __seqProbeChecks > 0) __seqProbeChecks = 0;
 
     // Smart range expansion offer — check at end of round
     await maybeOfferRangeExpansion();

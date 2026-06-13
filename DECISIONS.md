@@ -52,6 +52,43 @@ Running memory across sessions. Newest on top.
   3. Winning pattern likely: ONE controlled parallel burst per round, then a healthy wait. Never parallel + sequential together.
 - A2 parallel fetch itself works (valid data, 3.7s for 5). The risk is frequency/burst, not correctness.
 
+### Faster-grab deep research (2026-06-10, no build — research only)
+**Question:** any other options to grab appointments very fast?
+
+**Web findings:**
+- All public usvisascheduling/usvisa-info bots only DETECT + notify (Selenium, check every few seconds), book MANUALLY. None replay the booking API or do event-driven grab. We are ahead (our event-driven fast-grab is more advanced than anything public).
+- Commercial trackers (CheckVisaSlots) poll at most every ~3 min (paid), recommend ≥4h to avoid the site blocking slot visibility. Our ~20s cadence is FAR more aggressive → exactly why we hit tarpit/429. The site throttles fast polling for everyone.
+- "Slots appear and disappear within seconds" — the race is brutal; detection speed + being early is everything.
+- Slot RELEASE TIMING: consulates drop new slots at specific times (varies by post — some ~4pm, some morning, some late night; often weekly). Reddit groups reverse-engineer these. Sniper bots (e.g. Resy bot) SLEEP until release time then wake to snipe.
+- Cloudflare: counters NOT shared across data centers → multiple IPs/regions (residential proxies) multiply allowed throughput. cf_clearance is IP-bound + rate-limited per value. Residential IPs favored.
+
+**Hard limits (confirmed earlier, unchanged):**
+- Booking floor = 3 token-chained calls (days→times→submit). Can't shrink. Pure-API booking infeasible (date encrypted in site-built token).
+- So the GRAB itself is near-optimal already. The remaining wins are about being EARLY + staying reliable under throttle, not shrinking the grab.
+
+**Options, tiered:**
+- TIER 1 (high value, doable): (1) **Slot-release timing intelligence** — learn each consulate's release window from our slot-history + community intel, scan HARD then, idle otherwise (be first = win, saves rate budget). Highest ROI. (2) **Pre-warm**: HTTP keep-alive + optionally pre-stage likely city's calendar so grab skips the days-call (~1-2s). (3) Smarter (not faster) detection cadence = avoid tarpit so you're not stuck in a 60s jam when a slot drops (#46 direction).
+- TIER 2 (more infra/risk): (4) **Multiple IPs / residential proxies for DETECTION only** — poll more often without per-IP rate limits (CF counters not shared cross-region). Caveats: cf_clearance IP-bound (per-IP challenge solve), booking must run on the logged-in session, account-risk + cost. (5) **Distributed detector + local booker** — cloud detector (many IPs, high freq) pings the instant a slot drops; warm logged-in browser books.
+- TIER 3 (no): pure-API booking (encrypted token); shrinking the 3 calls.
+
+**Recommendation:** #1 timing-intelligence = best next bet (we already store slot history → analyze when slots actually appeared per post → auto-intensify scanning in those windows). Everything past that hits the token floor + Cloudflare wall with rising risk.
+
+### Cloudflare + site mechanics deep-dive (2026-06-10, research only) — IMPORTANT
+**Two SEPARATE throttles, plus a non-issue:**
+1. **Cloudflare edge — Error 1015** = the SITE OWNER's Rate Limiting Rule. Counts requests **per IP** over a window; exceed → block for a configured `retry_after` (mins). Per-IP. More IPs = more edge budget.
+2. **Cloudflare Turnstile / cf_clearance** = the "verify human" challenge. Passing gives a cf_clearance cookie valid ~30min–24h, **bound to IP + User-Agent + browser fingerprint**. Solve on the machine's own IP (we already do: Telegram + remote solve).
+3. **Bot fingerprint (JA3/JA4 TLS) = NOT our problem.** We run `fetch()` **inside the real Chrome** with the user's real session → our TLS/HTTP fingerprint IS real Chrome → indistinguishable from the user clicking. So Cloudflare's bot-fingerprint detection does NOT flag us. **Confirms the removed human-sim/mimicry was wasted effort.** Only RATE + behavioral timing flag us.
+
+**The TARPIT is the ORIGIN, not Cloudflare.** usvisascheduling = Microsoft Power Pages → **Dataverse** backend. Dataverse "service protection limits" are **per USER**: ~6000 req/300s, a combined **execution-time** budget, **concurrency cap (~52)**, and search-type queries **~1 req/sec/user**; exceed → 429 / slow-walling. The schedule-days query is **expensive** (computes a calendar) → firing 2+ concurrently piles up execution-time/concurrency → the 19–64s tarpit. Sequential (1-at-a-time, paced) each completes fast. **This is exactly why parallel tarpits and sequential stays 3-7s.**
+
+**Two ceilings:** Cloudflare per-IP (1015) AND Dataverse per-USER (429/exec-time/concurrency). For ONE user, the **per-user origin ceiling binds** → more IPs raise the edge ceiling but NOT the per-user origin one → **more IPs give little detection-rate gain for a single client.**
+
+**Derived solution direction:**
+- **Sequential-first + pacing** (respect ~1 expensive query/sec/user) — fights neither limit. Parallel-as-default is the wrong primary strategy here; it fights the origin concurrency/exec-time cap. (#46 adaptive probe already leans this way; consider making sequential the default.)
+- **Stop spending effort on stealth/mimicry** — we're already a legit real-browser session; the wall is purely rate/throttle, not "do we look like a bot."
+- **Timing intelligence** — spend the limited per-user budget when slots actually drop.
+- Multiple IPs only help if we ever hit the Cloudflare per-IP rule BEFORE the Dataverse per-user one — marginal for one client; more relevant if watching many users.
+
 ### Fast-booking research + chosen approach (Issue #36, 2026-06-04)
 **User decisions:** grab FIRST in-range slot detected; FASTEST method (accept fragility); VAC only for now (consular later, same flow).
 
