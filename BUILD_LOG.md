@@ -12,6 +12,17 @@ Format:
 
 ---
 
+## 2026-06-10 — Smarter error handling: 3-then-logout + change-IP on rate limit (Issue #49)
+**What it does:** Two error fixes. (1) **"Unable to load"** — the bot tries returning to the dashboard up to **3 times**; if still failing after 3, it sends a Telegram alert and **logs out** (clean reset) instead of retrying forever. (2) **"Too many requests" (429 / rate limit)** — the bot **no longer logs out** (logging out doesn't help — the new login is on the same blocked IP). Instead it goes to the dashboard, **stays logged in**, and sends **"🚫 RATE LIMITED — CHANGE IP"**. You switch network/IP and restart the client.
+**Why:** Logging out on a rate limit wasted the session for nothing (same IP = still blocked). And "unable to load" could keep looping. Each error now gets the right response.
+**What changed for you:** Rate limit → Telegram "change IP", bot paused at dashboard (still logged in) → you change IP + restart. Repeated "unable to load" → after 3 tries it alerts + logs out.
+
+## 2026-06-10 — Consular / interview page support (Issue #48)
+**What it does:** Extends everything the bot does on the OFC (VAC) page — fast parallel scanning, fast-grab live booking, adaptive scan, alerts — to the **interview/consular** page (the second step, at the consulate) too.
+**Why:** The bot was fully wired for the OFC page only. The interview page needs the same speed.
+**What changed for you:** Almost all the machinery was already shared between the two pages — the one missing piece was the fast "all-at-once" scan, which was locked to the OFC request. Now it also recognises the interview page's request, so parallel scanning + fast-grab work there too. The consulate list comes from the page's own dropdown automatically.
+**NOTE:** must be tested on a real interview-stage account — the interview page only opens after OFC is already booked, so it can't be verified until a client reaches that step. The change is safe for OFC (OFC behaviour unchanged).
+
 ## 2026-06-10 — Active clients pinned to top of dashboard (Issue #47)
 **What it does:** Reorders the dashboard cards so the clients currently RUNNING float to the top — the one running on YOUR dashboard first, then ones running on other people's dashboards, then everyone idle (A-Z) below.
 **Why:** With several dashboards each running a different client, you had to scroll to find who's active. Now the running ones are always at the top of your screen.

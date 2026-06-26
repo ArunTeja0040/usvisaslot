@@ -11,7 +11,7 @@
   XMLHttpRequest.prototype.setRequestHeader = function(k, v){ if (this.__th) this.__th[k] = v; return oSetH.apply(this, arguments); };
   XMLHttpRequest.prototype.send = function(body){
     try {
-      if (this.__tu && /get-family-ofc-schedule-days/i.test(this.__tu)) {
+      if (this.__tu && /get-family-(?:ofc|consular)-schedule-days/i.test(this.__tu)) {
         dispatchEvent(new CustomEvent("vSCPTemplate", { detail: {
           url: this.__tu, method: this.__tm || "POST", headers: this.__th || {}, body: String(body || "")
         }}));

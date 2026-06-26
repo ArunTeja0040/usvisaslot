@@ -2147,6 +2147,18 @@
     const autoUser = await new Promise((r) => {
       chrome.storage.local.get(["activeAutomationUser"], (d) => r(d.activeAutomationUser || null));
     });
+
+    // #49 rate-limit pause: stay at dashboard (no Continue, no logout) until the operator
+    // changes IP and restarts. Restart sets activeAutomationUser → clears pause + proceeds.
+    const pausedRL = sessionStorage.getItem("__abPausedRateLimit");
+    if (pausedRL && !autoUser) {
+      updateUserStatus(activeUser, "rate_limited");
+      log(`Paused (${pausedRL}) — staying at dashboard; change IP then restart`);
+      trackEvent(EVENT_TYPES.DASHBOARD, `Paused at dashboard (${pausedRL}) — awaiting IP change + restart`, activeUser);
+      return; // do NOT auto-continue
+    }
+    if (pausedRL && autoUser) sessionStorage.removeItem("__abPausedRateLimit"); // operator restarted → clear
+
     const savedState = getReloginState();
 
     if (savedState && savedState.active) {
@@ -2710,54 +2722,57 @@
   }
 
   // Handle "unable to load" alert — stop cycling, cooldown, navigate to dashboard
-  let __reentryCount = 0;  // tracks how many dashboard re-entries
-  let __reentryTimes = []; // timestamps of recent re-entries (runaway-loop guard)
-  const REENTRY_COOLDOWN_MS = 0;          // #39: immediate dashboard re-entry (no wait)
-  const REENTRY_GUARD_WINDOW_MS = 120000; // if re-entries pile up within this window…
-  const REENTRY_GUARD_MAX = 4;            // …after this many, force one breather
-  const REENTRY_GUARD_COOLDOWN_MS = 60000; // breather length (avoid hammering Cloudflare → 1015)
+  let __reentryCount = 0;  // #49 consecutive "unable to load" dashboard re-entries (resets on a successful fetch)
+  const UNABLE_MAX_REENTRIES = 3; // #49 after this many failed re-entries → alert + log out
 
   function onUnableToLoadAlert(alertText) {
     // Prevent multiple triggers from same round (multiple locations fail)
     if (window.__unableToLoadHandling) return;
     window.__unableToLoadHandling = true;
 
-    __reentryCount++;
+    // #49 persist the counter in sessionStorage — survives the dashboard/login/booking
+    // page navigations (in-memory var resets on every page load → was stuck at 1/3).
+    const reentry = (parseInt(sessionStorage.getItem("__abUnableCount") || "0", 10) || 0) + 1;
+    sessionStorage.setItem("__abUnableCount", String(reentry));
+    __reentryCount = reentry; // keep module var in sync (resume logging)
     const roundsCompleted = cycling.round;
-
-    // #39: re-enter immediately (0s). Runaway-loop guard — if "unable to load" keeps
-    // firing rapidly, insert ONE breather so we don't tight-loop and trip a 1015 IP ban.
-    const now = Date.now();
-    __reentryTimes = __reentryTimes.filter((t) => now - t < REENTRY_GUARD_WINDOW_MS);
-    __reentryTimes.push(now);
-    const rapid = __reentryTimes.length >= REENTRY_GUARD_MAX;
-    const cooldownSec = Math.round((rapid ? REENTRY_GUARD_COOLDOWN_MS : REENTRY_COOLDOWN_MS) / 1000);
-
-    log(`"Unable to load" — re-entry #${__reentryCount}, ran ${roundsCompleted} rounds. ${cooldownSec > 0 ? `Rapid loop — ${cooldownSec}s breather then` : "Immediately"} navigate to dashboard.`);
-
-    // Stop cycling immediately
     rateTrackerRecordError("unable_to_load");
     if (cycling.active) stopCycling("Unable to load — navigating to dashboard");
 
     chrome.storage.local.get(["loginDetails"], async (d) => {
       const u = d.loginDetails?.username || "";
-      trackEvent(EVENT_TYPES.ERROR, `Unable to load — re-entry #${__reentryCount}, ${roundsCompleted} rounds, cooldown ${cooldownSec}s`, u);
+
+      // #49: after 3 dashboard re-entries still failing → alert + LOG OUT.
+      if (reentry > UNABLE_MAX_REENTRIES) {
+        log(`"Unable to load" — still failing after ${UNABLE_MAX_REENTRIES} re-entries → alert + logout`);
+        trackEvent(EVENT_TYPES.ERROR, `Unable to load — ${UNABLE_MAX_REENTRIES} re-entries failed → logging out`, u);
+        sendTelegramNotification("error",
+          `🚫 <b>UNABLE TO LOAD</b>\n\n` +
+          `👤 <b>User:</b> ${u}\n` +
+          `❌ Still failing after <b>${UNABLE_MAX_REENTRIES}</b> dashboard re-entries\n` +
+          `🔒 Logging out — check the session / network, then restart this client.`
+        );
+        updateUserStatus(u, "idle");
+        __abortAll = true;
+        window.__autoBookingLoginActive = false;
+        if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
+        chrome.storage.local.remove(["activeAutomationUser"]);
+        sessionStorage.removeItem("ab-cycling-state");                          // don't auto-resume after logout
+        sessionStorage.removeItem("__abUnableCount"); // #49 reset persisted counter on logout
+        sessionStorage.setItem("__abSevereLogout", "Unable to load — 3 re-entries failed"); // dashboard signs out
+        window.__unableToLoadHandling = false;
+        window.location.href = window.location.origin + "/en-US/";
+        return;
+      }
+
+      // Attempts 1..3: immediate dashboard re-entry (auto-resume cycling).
+      trackEvent(EVENT_TYPES.ERROR, `Unable to load — dashboard re-entry ${reentry}/${UNABLE_MAX_REENTRIES}, ${roundsCompleted} rounds`, u);
       sendTelegramNotification("rate",
         `⚠️ <b>UNABLE TO LOAD</b>\n\n` +
         `👤 <b>User:</b> ${u}\n` +
         `🔁 Ran <b>${roundsCompleted}</b> rounds before error\n` +
-        `🔄 Re-entry attempt: <b>${__reentryCount}</b>\n` +
-        (cooldownSec > 0
-          ? `⏳ Rapid errors — <b>${cooldownSec}s</b> breather → dashboard`
-          : `⚡ Navigating to dashboard immediately`)
+        `🔄 Dashboard re-entry <b>${reentry}/${UNABLE_MAX_REENTRIES}</b> → retrying`
       );
-
-      // Countdown (skipped entirely when cooldownSec === 0 → immediate re-entry)
-      for (let s = cooldownSec; s > 0; s--) {
-        if (__abortAll) { window.__unableToLoadHandling = false; return; }
-        setStatus(`⚠️ Unable to load — ${s}s breather before dashboard re-entry...`);
-        await sleep(1000);
-      }
 
       // Save cycling state for auto-resume (fresh round count)
       const state = {
@@ -2768,7 +2783,7 @@
         interval: document.getElementById("ab-interval")?.value || "30",
         locations: Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map(cb => cb.value),
         timestamp: Date.now(),
-        reentryCount: __reentryCount,
+        reentryCount: reentry,
       };
       sessionStorage.setItem("ab-cycling-state", JSON.stringify(state));
 
@@ -2778,65 +2793,39 @@
     });
   }
 
-  // Handle severe errors (429, Error 1015, Cloudflare blocked) — auto-logout
-  const SEVERE_MAX_ATTEMPTS = 2;  // try dashboard logout this many times, then give up
+  // Handle severe rate errors (429, Error 1015) — these are PER-IP. Logging out doesn't help
+  // (re-login is on the same rate-limited IP). #49: pause at dashboard + alert to change IP.
   function handleSevereError(reason) {
-    // Re-entry guard — prevent flood within the same page (1015 detected repeatedly)
+    // Re-entry guard — prevent flood within the same page
     if (window.__severeErrorHandling) return;
     window.__severeErrorHandling = true;
 
-    // Attempt counter survives navigation (same-origin sessionStorage)
-    const attempts = parseInt(sessionStorage.getItem("__abSevereCount") || "0") + 1;
-
-    if (cycling.active) stopCycling(`${reason} — auto-logout`);
+    if (cycling.active) stopCycling(`${reason} — paused, change IP`);
 
     chrome.storage.local.get(["loginDetails"], (d) => {
       const u = d.loginDetails?.username || "";
-
-      // If we've already tried navigating to dashboard MAX times and still blocked,
-      // the whole site is rate-limited — stop looping. Log once and wait (stable behavior).
-      if (attempts > SEVERE_MAX_ATTEMPTS) {
-        log(`Severe error: ${reason} — site still blocked after ${SEVERE_MAX_ATTEMPTS} attempts. Stopping, will wait.`);
-        trackEvent(EVENT_TYPES.ERROR, `Severe: ${reason} — site fully blocked, waiting (no more retries)`, u);
-        sendTelegramNotification("error",
-          `🚫 <b>${reason.toUpperCase()}</b>\n\n` +
-          `👤 <b>User:</b> ${u}\n` +
-          `⚠️ Whole site blocked — logout not possible\n` +
-          `⏸️ Stopped. Wait a few minutes before retrying.`
-        );
-        updateUserStatus(u, "rate_limited");
-        __abortAll = true;
-        window.__autoBookingLoginActive = false;
-        if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
-        chrome.storage.local.remove(["activeAutomationUser"]);
-        sessionStorage.removeItem("__abSevereCount");
-        return; // stay on page, do nothing further
-      }
-
-      // Otherwise: try dashboard logout
-      sessionStorage.setItem("__abSevereCount", String(attempts));
-      log(`Severe error: ${reason} — navigating to dashboard for logout (attempt ${attempts}/${SEVERE_MAX_ATTEMPTS})`);
-      trackEvent(EVENT_TYPES.ERROR, `Severe: ${reason} — auto-logout triggered (attempt ${attempts}/${SEVERE_MAX_ATTEMPTS})`, u);
+      log(`Severe rate error: ${reason} — pausing at dashboard, alerting to change IP (NO logout)`);
+      trackEvent(EVENT_TYPES.ERROR, `Severe: ${reason} — paused at dashboard, change IP (no logout)`, u);
       sendTelegramNotification("error",
-        `🚫 <b>${reason.toUpperCase()}</b>\n\n` +
+        `🚫 <b>RATE LIMITED — CHANGE IP</b>\n\n` +
         `👤 <b>User:</b> ${u}\n` +
+        `⚠️ ${reason}\n` +
         `🔁 Ran <b>${cycling.round}</b> rounds\n` +
-        `🔒 <b>AUTO-LOGOUT</b> — navigating to dashboard to sign out (attempt ${attempts}/${SEVERE_MAX_ATTEMPTS})`
+        `🌐 This IP is being rate-limited (per-IP block). <b>Change the IP address</b> (different network / proxy), then restart this client.\n` +
+        `⏸️ Paused at dashboard — staying logged in (no logout).`
       );
-      updateUserStatus(u, "idle");
+      updateUserStatus(u, "rate_limited");
 
       __abortAll = true;
       window.__autoBookingLoginActive = false;
       if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
+      chrome.storage.local.remove(["activeAutomationUser"]); // stop auto-cycling on the next page
+      sessionStorage.removeItem("ab-cycling-state");          // don't auto-resume
+      sessionStorage.removeItem("__abSevereLogout");          // ensure we do NOT sign out
+      sessionStorage.removeItem("__abSevereCount");
+      sessionStorage.setItem("__abPausedRateLimit", reason);  // #49 pause at dashboard (no continue, no logout)
 
-      // Don't clear loginDetails yet — dashboard needs username for logout Telegram
-      // Only clear after actual sign-out click in handleDashboard()
-      chrome.storage.local.remove(["activeAutomationUser"]);
-
-      // Set flag so dashboard knows to logout instead of auto-clicking Continue
-      sessionStorage.setItem("__abSevereLogout", reason);
-
-      // Navigate to dashboard where sign-out link always exists
+      // Get off the rate-limited page to the dashboard; stay logged in, paused.
       window.location.href = window.location.origin + "/en-US/";
     });
   }
@@ -3390,6 +3379,7 @@
 
     __abortAll = false;
     chrome.storage.local.remove("__stopSignal");
+    sessionStorage.removeItem("__abPausedRateLimit"); // #49 manual start clears any rate-limit pause
     // Ensure activeAutomationUser is set when starting from OFC panel
     chrome.storage.local.get(["loginDetails", "activeAutomationUser"], (d) => {
       if (d.loginDetails?.username && !d.activeAutomationUser) {
@@ -4056,6 +4046,7 @@
         if (!cycling.active) return;
         // Reset re-entry count since user just solved challenge
         __reentryCount = 0;
+        sessionStorage.removeItem("__abUnableCount"); // #49
         chrome.storage.local.get(["loginDetails"], (d) => {
           const u = d.loginDetails?.username || "";
           trackEvent(EVENT_TYPES.SESSION, "Cloudflare challenge solved — cycling resumed", u);
@@ -4151,9 +4142,10 @@
       // Reset backoff on successful request
       cycling.backoffMs = 0;
       // Reset re-entry count on successful request
-      if (__reentryCount > 0) {
+      if (__reentryCount > 0 || sessionStorage.getItem("__abUnableCount")) {
         log(`Successful fetch — resetting re-entry counter (was ${__reentryCount})`);
         __reentryCount = 0;
+        sessionStorage.removeItem("__abUnableCount"); // #49 genuine recovery → reset persisted counter
       }
 
       // Check for 401 / session expiry
