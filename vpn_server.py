@@ -17,6 +17,7 @@ import random
 import re
 import threading
 import time
+import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = 5124
@@ -61,12 +62,12 @@ def run_cmd(cmd, timeout=15):
 
 
 def get_ip():
-    if IS_WINDOWS:
-        out, rc = run_cmd(["powershell", "-Command",
-                           "(Invoke-WebRequest -Uri ifconfig.me -TimeoutSec 5 -UseBasicParsing).Content"])
-    else:
-        out, rc = run_cmd(["curl", "-s", "--max-time", "5", "ifconfig.me"])
-    return out if rc == 0 and out else "unknown"
+    try:
+        req = urllib.request.Request("https://api.ipify.org", headers={"User-Agent": "curl/8.0"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.read().decode().strip()
+    except Exception:
+        return "unknown"
 
 
 def do_rotate():
