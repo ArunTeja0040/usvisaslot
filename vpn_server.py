@@ -1,5 +1,6 @@
 """
 VPN Rotation Control Server — localhost:5124
+Cross-platform (macOS + Windows). No launchd/task-scheduler dependency.
 Endpoints:
   GET /vpn/start   — enable auto-rotation + connect
   GET /vpn/stop    — disable auto-rotation + disconnect
@@ -11,21 +12,27 @@ import subprocess
 import json
 import signal
 import atexit
+import platform
+import random
+import re
+import threading
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = 5124
-LAUNCHD_LABEL = "com.vpn.rotate"
-LAUNCHD_PLIST = f"/Users/aruntejagannu/Library/LaunchAgents/{LAUNCHD_LABEL}.plist"
-ROTATE_SCRIPT = "/Users/aruntejagannu/vpn-rotate.sh"
+ROTATE_INTERVAL = 600  # 10 minutes
 
+IS_WINDOWS = platform.system() == "Windows"
 
-def run_cmd(cmd, timeout=15):
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.stdout.strip(), r.returncode
-    except Exception as e:
-        return str(e), 1
+if IS_WINDOWS:
+    MULLVAD = r"C:\Program Files\Mullvad VPN\resources\mullvad.exe"
+else:
+    MULLVAD = "/usr/local/bin/mullvad"
 
+CITIES = [
+    "qas", "atl", "bos", "chi", "dal", "den", "hou",
+    "mkc", "lax", "mia", "nyc", "phx", "rag", "slc", "sjc",
+]
 
 CITY_NAMES = {
     "qas": "Ashburn, VA", "atl": "Atlanta, GA", "bos": "Boston, MA",
@@ -36,17 +43,95 @@ CITY_NAMES = {
     "sfo": "San Francisco, CA", "sjc": "San Jose, CA", "txc": "McAllen, TX",
 }
 
+SAFE_PROVIDERS = ["Tzulo", "DataPacket", "xtom", "hostuniversal"]
+
+rotation_timer = None
+auto_rotating = False
+
+
+def run_cmd(cmd, timeout=15):
+    try:
+        kwargs = {"capture_output": True, "text": True, "timeout": timeout}
+        if IS_WINDOWS:
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        r = subprocess.run(cmd, **kwargs)
+        return r.stdout.strip(), r.returncode
+    except Exception as e:
+        return str(e), 1
+
+
+def get_ip():
+    if IS_WINDOWS:
+        out, rc = run_cmd(["powershell", "-Command",
+                           "(Invoke-WebRequest -Uri ifconfig.me -TimeoutSec 5 -UseBasicParsing).Content"])
+    else:
+        out, rc = run_cmd(["curl", "-s", "--max-time", "5", "ifconfig.me"])
+    return out if rc == 0 and out else "unknown"
+
+
+def do_rotate():
+    out, _ = run_cmd([MULLVAD, "status"])
+    current = ""
+    m = re.search(r"us-(\w+)-wg", out)
+    if m:
+        current = m.group(1)
+
+    candidates = [c for c in CITIES if c != current]
+    selected = random.choice(candidates) if candidates else random.choice(CITIES)
+
+    run_cmd([MULLVAD, "disconnect"])
+    time.sleep(1)
+    run_cmd([MULLVAD, "relay", "set", "provider"] + SAFE_PROVIDERS)
+    run_cmd([MULLVAD, "relay", "set", "location", "us", selected])
+    run_cmd([MULLVAD, "connect", "--wait"])
+    time.sleep(3)
+
+    ip = get_ip()
+    city = CITY_NAMES.get(selected, selected)
+    print(f"[VPN] Rotated → us-{selected} ({city}) | IP: {ip}")
+    return selected, ip
+
+
+def rotation_loop():
+    global rotation_timer, auto_rotating
+    if not auto_rotating:
+        return
+    try:
+        do_rotate()
+    except Exception as e:
+        print(f"[VPN] Rotation error: {e}")
+    if auto_rotating:
+        rotation_timer = threading.Timer(ROTATE_INTERVAL, rotation_loop)
+        rotation_timer.daemon = True
+        rotation_timer.start()
+
+
+def start_rotation():
+    global auto_rotating, rotation_timer
+    if auto_rotating:
+        return
+    auto_rotating = True
+    rotation_timer = threading.Timer(ROTATE_INTERVAL, rotation_loop)
+    rotation_timer.daemon = True
+    rotation_timer.start()
+    print(f"[VPN] Auto-rotation started (every {ROTATE_INTERVAL}s)")
+
+
+def stop_rotation():
+    global auto_rotating, rotation_timer
+    auto_rotating = False
+    if rotation_timer:
+        rotation_timer.cancel()
+        rotation_timer = None
+    print("[VPN] Auto-rotation stopped")
+
 
 def get_status():
-    out, _ = run_cmd(["mullvad", "status"])
-    ip_out, _ = run_cmd(["curl", "-s", "--max-time", "5", "ifconfig.me"])
-
-    loaded, _ = run_cmd(["launchctl", "list"])
-    auto_rotating = LAUNCHD_LABEL in loaded
+    out, _ = run_cmd([MULLVAD, "status"])
+    ip = get_ip()
 
     connected = "Connected" in out and "Disconnected" not in out
 
-    import re
     relay_match = re.search(r"us-(\w+)-wg", out)
     city_code = relay_match.group(1) if relay_match else ""
     city_name = CITY_NAMES.get(city_code, city_code)
@@ -55,7 +140,7 @@ def get_status():
         "connected": connected,
         "auto_rotating": auto_rotating,
         "vpn_status": out,
-        "public_ip": ip_out if ip_out else "unknown",
+        "public_ip": ip,
         "server": f"us-{city_code}" if city_code else "",
         "city": city_name,
     }
@@ -67,19 +152,19 @@ class Handler(BaseHTTPRequestHandler):
         resp = {"ok": False}
 
         if path == "/vpn/start":
-            run_cmd(["mullvad", "relay", "set", "provider", "any"])
-            run_cmd(["mullvad", "relay", "set", "location", "us"])
-            run_cmd(["mullvad", "connect", "--wait"])
-            run_cmd(["launchctl", "load", LAUNCHD_PLIST])
+            run_cmd([MULLVAD, "relay", "set", "provider"] + SAFE_PROVIDERS)
+            run_cmd([MULLVAD, "relay", "set", "location", "us"])
+            run_cmd([MULLVAD, "connect", "--wait"])
+            start_rotation()
             resp = {"ok": True, "action": "started", **get_status()}
 
         elif path == "/vpn/stop":
-            run_cmd(["launchctl", "unload", LAUNCHD_PLIST])
-            run_cmd(["mullvad", "disconnect"])
+            stop_rotation()
+            run_cmd([MULLVAD, "disconnect"])
             resp = {"ok": True, "action": "stopped", **get_status()}
 
         elif path == "/vpn/rotate":
-            run_cmd(["bash", ROTATE_SCRIPT])
+            do_rotate()
             resp = {"ok": True, "action": "rotated", **get_status()}
 
         elif path == "/vpn/status":
@@ -109,17 +194,19 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def cleanup():
-    print("\n[VPN] Server shutting down — stopping VPN rotation and disconnecting...")
-    run_cmd(["launchctl", "unload", LAUNCHD_PLIST])
-    run_cmd(["mullvad", "disconnect"])
+    print("\n[VPN] Server shutting down — stopping rotation and disconnecting...")
+    stop_rotation()
+    run_cmd([MULLVAD, "disconnect"])
     print("[VPN] Cleanup done.")
 
 
 if __name__ == "__main__":
     atexit.register(cleanup)
-    signal.signal(signal.SIGTERM, lambda *_: exit(0))
+    if not IS_WINDOWS:
+        signal.signal(signal.SIGTERM, lambda *_: exit(0))
 
     print(f"VPN control server on http://localhost:{PORT}")
+    print(f"Platform: {platform.system()} | Mullvad: {MULLVAD}")
     try:
         HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
     except KeyboardInterrupt:
