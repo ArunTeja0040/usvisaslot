@@ -48,6 +48,7 @@ SAFE_PROVIDERS = ["Tzulo", "DataPacket", "xtom", "hostuniversal"]
 
 rotation_timer = None
 auto_rotating = False
+cached_ip = "unknown"
 
 
 def run_cmd(cmd, timeout=15):
@@ -61,13 +62,23 @@ def run_cmd(cmd, timeout=15):
         return str(e), 1
 
 
-def get_ip():
-    try:
-        req = urllib.request.Request("https://api.ipify.org", headers={"User-Agent": "curl/8.0"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return r.read().decode().strip()
-    except Exception:
-        return "unknown"
+def fetch_ip():
+    for url in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                ip = r.read().decode().strip()
+                if ip and len(ip) < 50:
+                    return ip
+        except Exception:
+            continue
+    return "unknown"
+
+
+def refresh_ip():
+    global cached_ip
+    cached_ip = fetch_ip()
+    return cached_ip
 
 
 def do_rotate():
@@ -87,7 +98,7 @@ def do_rotate():
     run_cmd([MULLVAD, "connect", "--wait"])
     time.sleep(3)
 
-    ip = get_ip()
+    ip = refresh_ip()
     city = CITY_NAMES.get(selected, selected)
     print(f"[VPN] Rotated → us-{selected} ({city}) | IP: {ip}")
     return selected, ip
@@ -129,7 +140,6 @@ def stop_rotation():
 
 def get_status():
     out, _ = run_cmd([MULLVAD, "status"])
-    ip = get_ip()
 
     connected = "Connected" in out and "Disconnected" not in out
 
@@ -141,7 +151,7 @@ def get_status():
         "connected": connected,
         "auto_rotating": auto_rotating,
         "vpn_status": out,
-        "public_ip": ip,
+        "public_ip": cached_ip,
         "server": f"us-{city_code}" if city_code else "",
         "city": city_name,
     }
@@ -156,6 +166,7 @@ class Handler(BaseHTTPRequestHandler):
             run_cmd([MULLVAD, "relay", "set", "provider"] + SAFE_PROVIDERS)
             run_cmd([MULLVAD, "relay", "set", "location", "us"])
             run_cmd([MULLVAD, "connect", "--wait"])
+            refresh_ip()
             start_rotation()
             resp = {"ok": True, "action": "started", **get_status()}
 
@@ -190,8 +201,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, fmt, *args):
-        if "/vpn/" in str(args[0]):
-            print(f"[VPN] {args[0]}")
+        req = str(args[0]) if args else ""
+        if "/vpn/" in req and "/vpn/status" not in req:
+            print(f"[VPN] {req}")
 
 
 def cleanup():
