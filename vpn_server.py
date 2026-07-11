@@ -63,15 +63,23 @@ def run_cmd(cmd, timeout=15):
 
 
 def fetch_ip():
-    for url in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
-            with urllib.request.urlopen(req, timeout=5) as r:
-                ip = r.read().decode().strip()
-                if ip and len(ip) < 50:
-                    return ip
-        except Exception:
-            continue
+    urls = [
+        "https://am.i.mullvad.net/ip",
+        "https://api.ipify.org",
+        "https://icanhazip.com",
+    ]
+    for attempt in range(2):
+        for url in urls:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    ip = r.read().decode().strip()
+                    if ip and len(ip) < 50 and ip[0].isdigit():
+                        return ip
+            except Exception:
+                continue
+        if attempt == 0:
+            time.sleep(3)
     return "unknown"
 
 
@@ -96,7 +104,7 @@ def do_rotate():
     run_cmd([MULLVAD, "relay", "set", "provider"] + SAFE_PROVIDERS)
     run_cmd([MULLVAD, "relay", "set", "location", "us", selected])
     run_cmd([MULLVAD, "connect", "--wait"])
-    time.sleep(3)
+    time.sleep(5)
 
     ip = refresh_ip()
     city = CITY_NAMES.get(selected, selected)
