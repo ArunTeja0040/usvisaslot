@@ -15,6 +15,7 @@ import atexit
 import platform
 import random
 import re
+import ssl
 import threading
 import time
 import urllib.request
@@ -63,6 +64,9 @@ def run_cmd(cmd, timeout=15):
 
 
 def fetch_ip():
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
     urls = [
         "https://am.i.mullvad.net/ip",
         "https://api.ipify.org",
@@ -72,7 +76,7 @@ def fetch_ip():
         for url in urls:
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
-                with urllib.request.urlopen(req, timeout=8) as r:
+                with urllib.request.urlopen(req, timeout=8, context=ctx) as r:
                     ip = r.read().decode().strip()
                     if ip and len(ip) < 50 and ip[0].isdigit():
                         return ip
