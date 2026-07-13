@@ -174,6 +174,7 @@ class Handler(BaseHTTPRequestHandler):
             run_cmd([MULLVAD, "relay", "set", "provider"] + SAFE_PROVIDERS)
             run_cmd([MULLVAD, "relay", "set", "location", "us"])
             run_cmd([MULLVAD, "connect", "--wait"])
+            time.sleep(5)
             refresh_ip()
             start_rotation()
             resp = {"ok": True, "action": "started", **get_status()}
