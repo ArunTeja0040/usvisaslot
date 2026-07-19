@@ -39,6 +39,18 @@ create index if not exists idx_staff_key      on public.staff (staff_key);
 comment on table  public.staff            is 'Hired staff who manage a subset of clients (issue #50).';
 comment on column public.staff.staff_key  is 'Secret sent by the extension as the x-staff-key header. Deactivate to revoke access instantly.';
 
+-- SECURITY: this table holds the staff secrets — lock it to the owner key immediately.
+-- (A Supabase table with RLS disabled is readable by anyone holding the anon key.)
+alter table public.staff enable row level security;
+
+drop policy if exists staff_owner_all on public.staff;
+create policy staff_owner_all on public.staff
+  for all
+  using      (operator_id = public.get_operator_id())
+  with check (operator_id = public.get_operator_id());
+-- Note: get_staff_id() is SECURITY DEFINER, so staff key lookups still work
+-- even though staff themselves cannot read this table.
+
 -- ---------------------------------------------------------------------------
 -- 2) Which staff member owns which client
 --    NULL = unassigned (visible to the owner only).
@@ -98,6 +110,15 @@ create index if not exists idx_client_billing_operator on public.client_billing 
 
 comment on table public.client_billing
   is 'Per-client pricing. Owner-only — staff keys get no access (issue #50).';
+
+-- SECURITY: owner key only. Staff have no operator key, so they get nothing here.
+alter table public.client_billing enable row level security;
+
+drop policy if exists client_billing_owner_all on public.client_billing;
+create policy client_billing_owner_all on public.client_billing
+  for all
+  using      (operator_id = public.get_operator_id())
+  with check (operator_id = public.get_operator_id());
 
 -- Copy existing pricing across (safe to re-run; never overwrites).
 insert into public.client_billing (profile_id, operator_id, price_per_person, agreed_price)
