@@ -898,6 +898,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // VPN rotation control — relay to localhost:5124
+  if (msg.action === "vpnControl") {
+    (async () => {
+      try {
+        const resp = await fetch(`http://localhost:5124/vpn/${msg.command}`, {
+          signal: AbortSignal.timeout(msg.command === "status" ? 5000 : 20000),
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          sendResponse(data);
+          return;
+        }
+      } catch (e) {
+        console.log("VPN server error:", e);
+      }
+      sendResponse({ ok: false, error: "VPN server unreachable" });
+    })();
+    return true;
+  }
+
   // Telegram notification
   if (msg.action === "sendTelegram") {
     (async () => {

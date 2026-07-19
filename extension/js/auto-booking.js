@@ -2425,6 +2425,15 @@
           <span id="ab-cycle-info" style="font-size:12px;color:#888;margin-left:10px;"></span>
         </div>
         <div id="ab-parallel-result" style="font-size:12px;color:#6c5ce7;margin-top:8px;white-space:pre-wrap;"></div>
+        <div id="ab-vpn-section" style="margin-top:12px;padding:10px 12px;background:#f0f4f8;border:1px solid #d5dfe8;border-radius:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+          <strong style="font-size:13px;color:#1a5276;">VPN Rotation:</strong>
+          <label style="position:relative;display:inline-block;width:50px;height:26px;cursor:pointer;">
+            <input type="checkbox" id="ab-vpn-toggle" style="opacity:0;width:0;height:0;">
+            <span id="ab-vpn-slider" style="position:absolute;top:0;left:0;right:0;bottom:0;background:#ccc;border-radius:26px;transition:.3s;"></span>
+          </label>
+          <span id="ab-vpn-label" style="font-size:13px;font-weight:600;color:#7f8c8d;">OFF</span>
+          <span id="ab-vpn-info" style="font-size:12px;color:#888;margin-left:auto;"></span>
+        </div>
       </div>`;
 
     mainContainer.parentNode.insertBefore(panel, mainContainer);
@@ -2514,6 +2523,72 @@
           }
         });
       });
+
+    // ─── VPN ROTATION TOGGLE ───────────────────────────────────────────
+    const vpnToggle = document.getElementById("ab-vpn-toggle");
+    const vpnSlider = document.getElementById("ab-vpn-slider");
+    const vpnLabel = document.getElementById("ab-vpn-label");
+    const vpnInfo = document.getElementById("ab-vpn-info");
+
+    function vpnSend(command) {
+      return new Promise((resolve) => {
+        chrome.runtime.sendMessage({ action: "vpnControl", command }, (resp) => {
+          resolve(resp || { ok: false, error: "no response" });
+        });
+      });
+    }
+
+    function vpnUpdateUI(data) {
+      if (!vpnToggle) return;
+      const on = data.connected && data.auto_rotating;
+      vpnToggle.checked = on;
+      vpnSlider.style.background = on ? "#27ae60" : "#ccc";
+      vpnSlider.innerHTML = `<span style="position:absolute;height:20px;width:20px;left:${on ? "26px" : "3px"};bottom:3px;background:white;border-radius:50%;transition:.3s;"></span>`;
+      vpnLabel.textContent = on ? "ON" : "OFF";
+      vpnLabel.style.color = on ? "#27ae60" : "#7f8c8d";
+      if (data.connected && data.city) {
+        vpnInfo.textContent = `IP: ${data.public_ip} | ${data.city}`;
+        vpnInfo.style.color = "#27ae60";
+      } else if (data.connected) {
+        vpnInfo.textContent = `IP: ${data.public_ip}`;
+        vpnInfo.style.color = "#27ae60";
+      } else {
+        vpnInfo.textContent = "";
+      }
+    }
+
+    function vpnSetOffline() {
+      if (!vpnToggle) return;
+      vpnToggle.checked = false;
+      vpnToggle.disabled = true;
+      vpnSlider.style.background = "#eee";
+      vpnSlider.innerHTML = `<span style="position:absolute;height:20px;width:20px;left:3px;bottom:3px;background:#ddd;border-radius:50%;"></span>`;
+      vpnLabel.textContent = "OFFLINE";
+      vpnLabel.style.color = "#bbb";
+      vpnInfo.textContent = "Run: python vpn_server.py";
+      vpnInfo.style.color = "#e74c3c";
+    }
+
+    async function vpnFetchStatus() {
+      const data = await vpnSend("status");
+      if (data.error) { vpnSetOffline(); return null; }
+      vpnToggle.disabled = false;
+      vpnUpdateUI(data);
+      return data;
+    }
+
+    vpnFetchStatus();
+    const vpnPollTimer = setInterval(vpnFetchStatus, 30000);
+
+    if (vpnToggle) vpnToggle.addEventListener("change", async () => {
+      const command = vpnToggle.checked ? "start" : "stop";
+      vpnLabel.textContent = "...";
+      vpnInfo.textContent = command === "start" ? "Connecting..." : "Disconnecting...";
+      const data = await vpnSend(command);
+      if (data.error) { vpnSetOffline(); log("VPN server unreachable"); return; }
+      vpnUpdateUI(data);
+      log(`VPN rotation ${command === "start" ? "enabled" : "disabled"} — IP: ${data.public_ip}`);
+    });
 
     log("Booking panel injected");
   }
