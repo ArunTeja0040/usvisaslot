@@ -12,6 +12,11 @@ Format:
 
 ---
 
+## 2026-07-20 — VPN toggle brought into the test build (Issue #51)
+**What it does:** The VPN rotation switch (the one that changes your Mullvad location) existed in your **production** extension but had never been added to the **test** extension. This copies it across, so the test build now has the exact same VPN switch, plus the small helper program it talks to (`vpn_server.py`).
+**Why:** Two reasons. First, testing was misleading — you couldn't try VPN rotation in the test build because it simply wasn't there. Second, and more serious: because the test copy said "no VPN here", the next time we pushed test work up to production, the computer could have decided the VPN switch was meant to be **deleted** and quietly removed it from your live extension. You'd only have noticed when the switch disappeared. This closes that hole permanently — the two copies now agree.
+**What changed for you:** The test extension gets the VPN switch, working exactly as it does in production (verified line-for-line identical). Nothing about production changed — your live extension is untouched, still on the same version, with its VPN switch intact. The test build also stays a test build: it still says **SlotHunter TEST**, still logs as **[AutoBook-TEST]**, and still keeps its own set of rules.
+
 ## 2026-06-10 — Smarter error handling: 3-then-logout + change-IP on rate limit (Issue #49)
 **What it does:** Two error fixes. (1) **"Unable to load"** — the bot tries returning to the dashboard up to **3 times**; if still failing after 3, it sends a Telegram alert and **logs out** (clean reset) instead of retrying forever. (2) **"Too many requests" (429 / rate limit)** — the bot **no longer logs out** (logging out doesn't help — the new login is on the same blocked IP). Instead it goes to the dashboard, **stays logged in**, and sends **"🚫 RATE LIMITED — CHANGE IP"**. You switch network/IP and restart the client.
 **Why:** Logging out on a rate limit wasted the session for nothing (same IP = still blocked). And "unable to load" could keep looping. Each error now gets the right response.
