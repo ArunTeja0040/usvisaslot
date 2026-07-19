@@ -12,15 +12,33 @@
 -- ORDER: run 10 (this) → 01-staff-schema → 02-staff-security → then test.
 -- ============================================================================
 
+-- ---------------------------------------------------------------------------
+-- SAFETY GUARD — refuses to run on anything that isn't an empty project.
+-- If user_profiles already exists, this is a real database (production or a
+-- restored copy) and this script must NOT run. Nothing below executes.
+-- ---------------------------------------------------------------------------
+do $$
+begin
+  if exists (
+    select 1 from information_schema.tables
+    where table_schema = 'public' and table_name = 'user_profiles'
+  ) then
+    raise exception
+      'REFUSING TO RUN: this project already has a user_profiles table, so it is not an empty test project. To add the staff feature to an existing database, run 01-staff-schema.sql instead.';
+  end if;
+end $$;
+
 create extension if not exists pgcrypto;
 
 -- ---------------------------------------------------------------------------
 -- Tables (mirrors production structure)
 -- ---------------------------------------------------------------------------
 create table if not exists public.operators (
-  id      uuid primary key default gen_random_uuid(),
-  api_key text not null unique,
-  name    text
+  id         uuid primary key default gen_random_uuid(),
+  email      text,
+  name       text,
+  api_key    text not null unique,
+  created_at timestamptz default now()
 );
 
 create table if not exists public.user_profiles (
@@ -185,8 +203,8 @@ create policy "Allow insert for all" on public.request_stats for insert with che
 -- ---------------------------------------------------------------------------
 -- Sample data to test with
 -- ---------------------------------------------------------------------------
-insert into public.operators (api_key, name)
-values ('TEST-OPERATOR-KEY-0001', 'Test Owner')
+insert into public.operators (api_key, name, email)
+values ('TEST-OPERATOR-KEY-0001', 'Test Owner', 'test-owner@example.com')
 on conflict (api_key) do nothing;
 
 insert into public.user_profiles (operator_id, username, password_enc, visa_type,
