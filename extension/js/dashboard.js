@@ -13,6 +13,7 @@
   // Team mode (#52) — off by default, so the dashboard looks exactly as it
   // always has until the owner switches it on in Cloud Sync.
   let teamMode = false;
+  let staffMode = false;   // #53 — connected with a staff key, not the owner key
   let staffList = [];                 // [{ id, name, email, staffKey, active }]
   let staffById = {};                 // id → staff
   const bulkSelected = new Set();     // usernames ticked for bulk assign
@@ -310,10 +311,10 @@
               <span class="detail-label">Applicants:</span>
               <span class="detail-value">${profile.applicantCount || 1}</span>
             </div>
-            <div class="card-detail">
+            ${staffMode ? "" : `<div class="card-detail">
               <span class="detail-label">Price:</span>
               <span class="detail-value">${profile.agreedPrice ? "₹" + Number(profile.agreedPrice).toLocaleString() + (profile.applicantCount > 1 ? " (" + (profile.pricePerPerson || profile.agreedPrice) + "/pp)" : "") : "—"}</span>
-            </div>
+            </div>`}
             <div class="card-detail">
               <span class="detail-label">CAPTCHA:</span>
               <span class="detail-value">${esc(profile.captchaMode) || "manual"}</span>
@@ -1198,6 +1199,7 @@
       if (captchaRadio) captchaRadio.checked = true;
 
       document.getElementById("edit-delete-btn").style.display = "inline-block";
+      applyStaffModeToEditModal();
       document.getElementById("edit-modal").style.display = "flex";
     });
   }
@@ -1253,7 +1255,23 @@
       // Write to Supabase first (primary), then local cache
       const saved = idx >= 0 ? profiles[idx] : updated;
       if (SUPA && SUPA.isReady()) {
-        try { await SUPA.pushProfile(saved); } catch (e) { console.warn("Supabase push failed:", e.message); }
+        if (staffMode) {
+          // Staff may only change the date range and the cities. Sending just
+          // those fields keeps the credentials untouched — a whole-profile push
+          // would re-encrypt the password and be rejected by the database.
+          try {
+            await SUPA.updateProfileFields(originalUsername, {
+              startDate: updated.startDate,
+              endDate: updated.endDate,
+              locations: updated.locations,
+            });
+          } catch (e) {
+            window.alert("Could not save: " + e.message);
+            return;
+          }
+        } else {
+          try { await SUPA.pushProfile(saved); } catch (e) { console.warn("Supabase push failed:", e.message); }
+        }
       }
       chrome.storage.local.set({ userProfilesList: profiles }, () => {
         closeEditModal();
@@ -1743,6 +1761,7 @@
   const SUPA = typeof SupabaseSync !== "undefined" ? SupabaseSync : null;
 
   async function updateCloudUI() {
+    syncStaffMode();   // #53 — the view follows whichever key is connected
     const statusEl = document.getElementById("cloud-status");
     const pullBtn = document.getElementById("cloud-pull-btn");
     const pushBtn = document.getElementById("cloud-push-btn");
@@ -1756,7 +1775,7 @@
       statusEl.style.color = "#81c784";
       pullBtn.style.display = "inline-block";
       pushBtn.style.display = "inline-block";
-      if (exportBtn) exportBtn.style.display = "inline-block";
+      if (exportBtn) exportBtn.style.display = staffMode ? "none" : "inline-block";
       if (importSection) importSection.style.display = "none";
       deviceIdEl.textContent = SUPA.getDeviceId() || "—";
       const savedName = await SUPA.getDeviceName();
@@ -2086,10 +2105,96 @@
   if (SUPA) {
     SUPA.initFromStorage().then(connected => {
       if (connected) {
-        updateCloudUI();
+        updateCloudUI();      // calls syncStaffMode()
         startCloudPolling();
       }
     }).catch(() => {});
+  }
+
+  // ─── STAFF VIEW (#53) ──────────────────────────────────────────────
+  // What a staff member is allowed to do is decided by the database, not by
+  // this file. Hiding controls here is about not showing someone buttons that
+  // would only fail — it is presentation, not security.
+
+  // Owner-only controls. Anything that would carry credentials or pricing off
+  // the machine (export/import/sheets) is included deliberately.
+  const OWNER_ONLY_IDS = [
+    "add-user-btn",
+    "export-btn", "export-csv-btn", "import-btn",
+    "sheets-sync-btn", "sheets-url-input", "sheets-link",
+    "cloud-export-btn",
+    "team-mode-section",
+    "staff-btn",
+  ];
+
+  function applyStaffModeUI() {
+    OWNER_ONLY_IDS.forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.style.display = staffMode ? "none" : "";
+    });
+
+    const badge = document.getElementById("staff-mode-badge");
+    if (badge) badge.style.display = staffMode ? "" : "none";
+    const banner = document.getElementById("staff-mode-banner");
+    if (banner) banner.style.display = staffMode ? "" : "none";
+
+    // A staff member has no team of their own to manage.
+    if (staffMode) {
+      teamMode = false;
+      const bar = document.getElementById("bulk-assign-bar");
+      if (bar) bar.style.display = "none";
+    }
+
+    const keyLabel = document.getElementById("cloud-api-key-label");
+    if (keyLabel) keyLabel.textContent = staffMode ? "Your Access Key" : "Operator API Key";
+  }
+
+  // Called whenever the connection changes, so the view follows the key in use.
+  function syncStaffMode() {
+    const now = !!(SUPA && SUPA.isStaffMode && SUPA.isStaffMode());
+    if (now === staffMode) return;
+    staffMode = now;
+    applyStaffModeUI();
+    refresh();
+  }
+
+  // Trim the edit form down to what a staff member may actually change:
+  // the date range and the cities. Everything else is hidden rather than
+  // shown-and-rejected.
+  function applyStaffModeToEditModal() {
+    const modal = document.getElementById("edit-modal");
+    if (!modal) return;
+    const hide = (sel, on) => modal.querySelectorAll(sel).forEach((el) => {
+      el.style.display = on ? "none" : "";
+    });
+    // form-row order: 0 username, 1 password ... price row is matched by its input
+    const pwRow = document.getElementById("edit-password")?.closest(".form-row");
+    if (pwRow) pwRow.style.display = staffMode ? "none" : "";
+    const priceRow = document.getElementById("edit-price")?.closest(".form-row");
+    if (priceRow) priceRow.style.display = staffMode ? "none" : "";
+    const visaRow = document.getElementById("edit-visa-type")?.closest(".form-row");
+    if (visaRow) visaRow.style.display = staffMode ? "none" : "";
+    document.querySelectorAll(".edit-q-select").forEach((el) => {
+      const row = el.closest(".form-row");
+      if (row) row.style.display = staffMode ? "none" : "";
+    });
+    const pasteSection = document.getElementById("paste-section");
+    if (pasteSection) pasteSection.style.display = staffMode ? "none" : "";
+    const delBtn = document.getElementById("edit-delete-btn");
+    if (delBtn) delBtn.style.display = staffMode ? "none" : "";
+    const userRow = document.getElementById("edit-username")?.closest(".form-row");
+    if (userRow && staffMode) document.getElementById("edit-username").readOnly = true;
+    // hide the "Security Questions" / "Booking Preferences" style headings that
+    // now have nothing under them
+    modal.querySelectorAll(".form-section").forEach((h) => {
+      const t = (h.textContent || "").trim().toLowerCase();
+      if (t === "security questions" || t === "automation") {
+        h.style.display = staffMode ? "none" : "";
+      }
+    });
+    hide(".edit-checks", staffMode);
+    const captchaRow = document.querySelector('input[name="edit-captcha"]')?.closest(".form-row");
+    if (captchaRow) captchaRow.style.display = staffMode ? "none" : "";
   }
 
   // ─── TEAM MODE / STAFF (#52) ───────────────────────────────────────
@@ -2109,8 +2214,10 @@
   function applyTeamModeUI() {
     const btn = document.getElementById("staff-btn");
     const bar = document.getElementById("bulk-assign-bar");
-    if (btn) btn.style.display = teamMode ? "" : "none";
-    if (bar) bar.style.display = teamMode ? "flex" : "none";
+    // #53 — a staff member never manages a team, whatever is saved locally.
+    const on = teamMode && !staffMode;
+    if (btn) btn.style.display = on ? "" : "none";
+    if (bar) bar.style.display = on ? "flex" : "none";
     if (!teamMode) bulkSelected.clear();
     updateBulkCount();
   }
@@ -2160,6 +2267,7 @@
   }
 
   async function setTeamMode(on) {
+    if (staffMode) return;   // #53 — not a staff member's control
     const statusEl = document.getElementById("team-mode-status");
     const setStatus = (msg, colour) => {
       if (!statusEl) return;
@@ -2351,7 +2459,7 @@
 
   // Restore the switch on load
   chrome.storage.local.get(["__team_mode"], (d) => {
-    teamMode = !!d.__team_mode;
+    teamMode = !!d.__team_mode && !staffMode;
     const toggle = document.getElementById("team-mode-toggle");
     if (toggle) toggle.checked = teamMode;
     applyTeamModeUI();

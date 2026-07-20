@@ -24,6 +24,7 @@
       <input type="file" id="import-file" accept=".json" style="display:none">
       <button id="toggle-logs-btn" class="btn btn-small" style="background:#546e7a;color:#fff;">Logs ▶</button>
       <span id="active-user-status" class="queue-badge">No active user</span>
+      <span id="staff-mode-badge" style="display:none;background:#8e44ad;color:#fff;padding:4px 10px;border-radius:4px;font-size:12px;font-weight:bold;">STAFF VIEW</span>
     </div>
   </header>
 
@@ -102,6 +103,9 @@
             <option value="12">December</option>
           </select>
         </div>
+      </div>
+      <div id="staff-mode-banner" style="display:none;margin:0 0 10px;padding:8px 12px;background:#8e44ad22;border:1px solid #8e44ad88;border-radius:6px;font-size:12px;color:#ce93d8;">
+        <b>Staff view</b> — you are seeing only the clients assigned to you. Pricing and client passwords are not shown here. To have a client added, removed or reassigned, contact the owner.
       </div>
       <div id="bulk-assign-bar" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0 10px;padding:8px 10px;background:#141e2b;border:1px solid #2d3e50;border-radius:6px;">
         <label style="font-size:12px;color:#b0bec5;display:flex;align-items:center;gap:5px;">
@@ -236,7 +240,7 @@
         </p>
         <div class="form-section">Connection</div>
         <div class="form-row">
-          <label>Operator API Key</label>
+          <label id="cloud-api-key-label">Operator API Key</label>
           <input type="text" id="cloud-api-key" placeholder="Your operator API key">
         </div>
         <div class="form-row">
@@ -266,6 +270,7 @@
             <button id="cloud-rename-btn" class="btn btn-small btn-gray" style="padding:3px 8px;font-size:10px;">Rename</button>
           </div>
         </div>
+        <div id="team-mode-section">
         <div class="form-section" style="margin-top:14px;">Team Mode (staff dashboards)</div>
         <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#b0bec5;">
           <input type="checkbox" id="team-mode-toggle"> Enable staff &amp; client assignment
@@ -275,6 +280,7 @@
           an &quot;Assigned to&quot; picker on each client card.
         </div>
         <div id="team-mode-status" style="font-size:11px;color:#78909c;margin-top:4px;"></div>
+        </div>
         <div class="form-section" style="margin-top:14px;">Connected Devices</div>
         <div id="cloud-devices-list" style="font-size:12px;color:#b0bec5;">No data</div>
       </div>
