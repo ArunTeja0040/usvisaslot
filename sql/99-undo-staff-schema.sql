@@ -27,6 +27,10 @@ drop policy if exists daily_stats_staff_read       on public.daily_stats;
 drop policy if exists daily_stats_staff_insert     on public.daily_stats;
 drop policy if exists daily_stats_staff_update     on public.daily_stats;
 
+-- 2a) Deactivate-release trigger (from 03) -------------------------------------
+drop trigger  if exists trg_staff_deactivate_release on public.staff;
+drop function if exists public.release_clients_on_staff_deactivate();
+
 -- 2) Column-limit trigger (from 02) -------------------------------------------
 drop trigger  if exists trg_staff_update_limits on public.user_profiles;
 drop function if exists public.enforce_staff_update_limits();

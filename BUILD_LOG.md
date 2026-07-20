@@ -12,6 +12,26 @@ Format:
 
 ---
 
+## 2026-07-20 — Staff & client assignment, owner side (Issue #52)
+**What it does:** Adds the owner's control panel for handing clients to your hired staff. Three new pieces, all switched off until you turn them on:
+1. A **Team Mode** tick-box inside Cloud Sync. Off = your dashboard behaves exactly as it always has. On = the two things below appear.
+2. A **Staff** button in the top row. Opens a popup where you add a person (name + email). Each person gets a long random key — that key is what makes their extension show only the clients you gave them. Buttons per person: **Copy key**, **Rename**, **New key** (kills the old one instantly, for when a key leaks), and **Deactivate**.
+3. On each client card, an **"Assigned to"** picker, plus tick-boxes and an **Apply** bar at the top so you can hand over many clients at once instead of one by one.
+
+**Why:** You have around 100 clients and 5 staff. Handing out logins one at a time was never going to work, and you needed a way to give someone 15 clients without showing them the other 85 — or what you charge.
+
+**What changed for you:**
+- **Nothing, until you switch Team Mode on.** Default is off, and the Staff button and assignment picker are hidden until then.
+- Turning it on **checks the database first**. If the team tables aren't set up there yet, it refuses politely and tells you which files to run, rather than half-working.
+- **Deactivating someone** cuts their access straight away and their clients come back to you automatically. That's enforced inside the database itself, not just by the dashboard — so it holds even if someone changes it another way. Before each client is released, a line is written into your activity log recording who used to hold it, so you don't lose that history.
+- The **pricing you charge stays invisible** to staff. That part is enforced by the database and was already proven with 8 out of 8 tests.
+
+**Still to be straight about:** a staff member's computer has to be able to unlock client logins, otherwise their extension can't do the booking. So logins are hidden from their *screen*, but a determined technical person could dig them out of their own browser. Pricing isolation is real; login hiding is screen-level only.
+
+**Before testing:** run `sql/03-staff-deactivate-unassign.sql` on the test database — that's the piece that releases clients when someone is deactivated.
+
+---
+
 ## 2026-07-20 — VPN toggle brought into the test build (Issue #51)
 **What it does:** The VPN rotation switch (the one that changes your Mullvad location) existed in your **production** extension but had never been added to the **test** extension. This copies it across, so the test build now has the exact same VPN switch, plus the small helper program it talks to (`vpn_server.py`).
 **Why:** Two reasons. First, testing was misleading — you couldn't try VPN rotation in the test build because it simply wasn't there. Second, and more serious: because the test copy said "no VPN here", the next time we pushed test work up to production, the computer could have decided the VPN switch was meant to be **deleted** and quietly removed it from your live extension. You'd only have noticed when the switch disappeared. This closes that hole permanently — the two copies now agree.

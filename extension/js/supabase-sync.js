@@ -313,6 +313,7 @@ const SupabaseSync = (() => {
           ].filter(q => q.question),
           updatedAt: p.updated_at,
           rateLimitedAt: p.rate_limited_at,
+          assignedStaffId: p.assigned_staff_id || null,
         });
       }
 
@@ -654,6 +655,108 @@ const SupabaseSync = (() => {
     return d.toISOString();
   }
 
+  // ─── STAFF / TEAM (issue #52) ─────────────────────────────────────
+  // Owner-only. Every call below goes out with the operator key, so the
+  // database's own rules are what actually enforce ownership — this layer
+  // just talks to them.
+
+  // Human-friendly but unguessable: 20 random chars from a 32-symbol alphabet
+  // (~100 bits). Ambiguous characters (I, O, 0, 1) are left out so a key can be
+  // read aloud or retyped without mistakes.
+  function generateStaffKey() {
+    const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    const bytes = new Uint8Array(20);
+    crypto.getRandomValues(bytes);
+    let out = "";
+    for (let i = 0; i < bytes.length; i++) {
+      if (i > 0 && i % 5 === 0) out += "-";
+      out += ALPHABET[bytes[i] % ALPHABET.length];
+    }
+    return "SH-" + out;
+  }
+
+  async function listStaff() {
+    if (!isReady()) return [];
+    const rows = await query("staff", "select=*&order=name.asc");
+    return rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      email: r.email,
+      staffKey: r.staff_key,
+      role: r.role,
+      active: r.active,
+      createdAt: r.created_at,
+    }));
+  }
+
+  async function createStaff(name, email) {
+    if (!isReady()) throw new Error("Cloud sync not connected");
+    const [row] = await insert("staff", {
+      operator_id: operatorId,
+      name: name,
+      email: email || null,
+      staff_key: generateStaffKey(),
+      role: "staff",
+      active: true,
+    });
+    return row;
+  }
+
+  async function updateStaff(id, fields) {
+    if (!isReady()) throw new Error("Cloud sync not connected");
+    const data = {};
+    if (fields.name !== undefined) data.name = fields.name;
+    if (fields.email !== undefined) data.email = fields.email || null;
+    if (fields.active !== undefined) data.active = !!fields.active;
+    const [row] = await update("staff", { id: id }, data);
+    return row;
+  }
+
+  // Issues a brand new key. The old one stops working the moment this returns —
+  // use it if a key was shared by mistake or a person left.
+  async function regenerateStaffKey(id) {
+    if (!isReady()) throw new Error("Cloud sync not connected");
+    const [row] = await update("staff", { id: id }, { staff_key: generateStaffKey() });
+    return row;
+  }
+
+  // Assign / unassign one client. staffId === null puts it back in the owner pool.
+  async function assignClient(username, staffId) {
+    if (!isReady()) throw new Error("Cloud sync not connected");
+    await update("user_profiles", { operator_id: operatorId, username: username },
+                 { assigned_staff_id: staffId || null });
+  }
+
+  // Bulk assign. PostgREST has no "IN" on the update helper, so this walks the
+  // list; ~100 clients is small enough that a batch endpoint isn't worth it.
+  // Returns { ok, failed } so a partial failure is visible rather than silent.
+  async function assignClients(usernames, staffId) {
+    let ok = 0;
+    const failed = [];
+    for (const u of usernames) {
+      try {
+        await assignClient(u, staffId);
+        ok++;
+      } catch (e) {
+        failed.push({ username: u, error: e.message });
+      }
+    }
+    return { ok, failed };
+  }
+
+  // True only when the database has actually had the staff tables added.
+  // Lets the dashboard refuse to switch team mode on against a database where
+  // the SQL hasn't been run yet, instead of failing halfway through.
+  async function staffTablesReady() {
+    if (!isReady()) return false;
+    try {
+      await query("staff", "select=id&limit=1");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   // ─── CLEANUP ──────────────────────────────────────────────────────
 
   function destroy() {
@@ -707,6 +810,15 @@ const SupabaseSync = (() => {
     getDevices,
     renameDevice,
     deleteDevice,
+
+    // Staff / team (#52)
+    listStaff,
+    createStaff,
+    updateStaff,
+    regenerateStaffKey,
+    assignClient,
+    assignClients,
+    staffTablesReady,
 
     // Full sync
     fullPull,

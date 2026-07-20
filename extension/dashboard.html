@@ -14,6 +14,7 @@
     <div class="header-right">
       <button id="cloud-btn" class="btn btn-small" style="background:#3ecf8e;color:#fff;">Cloud Sync</button>
       <button id="telegram-btn" class="btn btn-small" style="background:#0088cc;color:#fff;">Telegram</button>
+      <button id="staff-btn" class="btn btn-small" style="background:#8e44ad;color:#fff;display:none;">Staff</button>
       <button id="export-btn" class="btn btn-small btn-blue">Export</button>
       <button id="export-csv-btn" class="btn btn-small" style="background:#0f9d58;color:#fff;">Export CSV</button>
       <button id="sheets-sync-btn" class="btn btn-small" style="background:#4285f4;color:#fff;">📊 Sheets Sync</button>
@@ -101,6 +102,17 @@
             <option value="12">December</option>
           </select>
         </div>
+      </div>
+      <div id="bulk-assign-bar" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0 10px;padding:8px 10px;background:#141e2b;border:1px solid #2d3e50;border-radius:6px;">
+        <label style="font-size:12px;color:#b0bec5;display:flex;align-items:center;gap:5px;">
+          <input type="checkbox" id="bulk-select-all"> Select all shown
+        </label>
+        <span id="bulk-count" style="font-size:12px;color:#78909c;">0 selected</span>
+        <span style="flex:1;"></span>
+        <label style="font-size:12px;color:#b0bec5;">Assign to</label>
+        <select id="bulk-staff-select" style="padding:4px 6px;background:#0f1923;color:#e0e0e0;border:1px solid #2d3e50;border-radius:4px;font-size:12px;min-width:150px;"></select>
+        <button id="bulk-assign-btn" class="btn btn-small btn-green">Apply</button>
+        <span id="bulk-status" style="font-size:11px;color:#78909c;"></span>
       </div>
       <div id="user-cards" class="user-cards-grid"></div>
     </div>
@@ -254,8 +266,43 @@
             <button id="cloud-rename-btn" class="btn btn-small btn-gray" style="padding:3px 8px;font-size:10px;">Rename</button>
           </div>
         </div>
+        <div class="form-section" style="margin-top:14px;">Team Mode (staff dashboards)</div>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#b0bec5;">
+          <input type="checkbox" id="team-mode-toggle"> Enable staff &amp; client assignment
+        </label>
+        <div style="font-size:11px;color:#78909c;margin-top:4px;">
+          Off = dashboard behaves exactly as before. On = adds the Staff button and
+          an &quot;Assigned to&quot; picker on each client card.
+        </div>
+        <div id="team-mode-status" style="font-size:11px;color:#78909c;margin-top:4px;"></div>
         <div class="form-section" style="margin-top:14px;">Connected Devices</div>
         <div id="cloud-devices-list" style="font-size:12px;color:#b0bec5;">No data</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Staff Modal (#52) -->
+  <div id="staff-modal" class="modal-overlay" style="display:none;">
+    <div class="modal" style="width:620px;">
+      <div class="modal-header">
+        <h3>Staff</h3>
+        <button id="staff-close-btn" class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size:12px;color:#90a4ae;margin-bottom:12px;">
+          Each person gets their own key. That key is what makes their extension show
+          only the clients you assign to them. Deactivating someone cuts their access
+          straight away and returns their clients to you.
+        </p>
+        <div class="form-section">Add someone</div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+          <input type="text" id="staff-new-name" placeholder="Name" style="flex:1;min-width:130px;padding:5px 8px;background:#0f1923;color:#e0e0e0;border:1px solid #2d3e50;border-radius:4px;font-size:12px;">
+          <input type="email" id="staff-new-email" placeholder="Email (optional)" style="flex:1;min-width:150px;padding:5px 8px;background:#0f1923;color:#e0e0e0;border:1px solid #2d3e50;border-radius:4px;font-size:12px;">
+          <button id="staff-add-btn" class="btn btn-small btn-green">Add</button>
+        </div>
+        <div id="staff-add-status" style="font-size:11px;color:#78909c;margin-top:5px;"></div>
+        <div class="form-section" style="margin-top:14px;">Your team</div>
+        <div id="staff-list" style="font-size:12px;color:#b0bec5;">No data</div>
       </div>
     </div>
   </div>
