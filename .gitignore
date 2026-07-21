@@ -14,3 +14,6 @@ test_report.html
 .bot_chrome_profile/
 .bot_chrome_data/
 .DS_Store
+
+# local Supabase test keys for sql/11-verify.sh — never commit
+sql/verify-env.sh

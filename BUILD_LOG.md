@@ -12,6 +12,56 @@ Format:
 
 ---
 
+## 2026-07-21 — Fix: Deactivate did nothing on production (Issue #53 follow-up)
+**What was wrong:** Clicking **Deactivate** on a staff member did nothing at all — the person didn't grey out, and their clients didn't come back to you. The database was rejecting the whole action.
+**Why:** When someone is deactivated, the system writes a note into the activity log for each client it returns to you. That note was written to a column called `type` — but your real activity-log table names that column `event_type`. (The mismatch came from a throwaway test database that happened to use the other name.) So every deactivate hit an error and the database undid the entire thing, leaving nothing changed.
+**The fix:** Two parts. (1) Use the correct column name so the note saves. (2) Wrap the note-writing so that even if it ever fails again, it can **never** block the actual job of releasing the clients — the note is skipped, the clients still come back. Also corrected the test database blueprint so it matches your real one and can't cause this kind of surprise again.
+**What changed for you:** Deactivate now works: the person greys out to "Reactivate", and their clients return to your pool immediately.
+
+---
+
+## 2026-07-20 — Staff login and their own dashboard (Issue #53)
+**What it does:** Turns the keys you hand out into something real. A staff member pastes their key into the same Cloud Sync box you use. The extension spots that it's a staff key (they all start `SH-`) and switches into staff view on its own — no separate app, no separate download.
+
+**What they see:** only the clients you assigned them. Their screen carries a purple **STAFF VIEW** badge and a line explaining they're seeing a subset, so nobody ever confuses it for your dashboard.
+
+**What's hidden from them:** every price, client passwords and security answers, Add User, Delete, Export, Import, Sheets Sync, Export Config, and the Staff button. What's left is what you agreed they should have: start, stop, and edit the date range and cities.
+
+**A bug this caught before it bit:** the password is scrambled with a different random starting value every single time it's saved — so re-saving an *unchanged* password still produces different-looking text. The protection built in Phase 1 would have read that as "this staff member is meddling with the login" and blocked it. Since the booking engine re-saves profiles during normal running, **every staff member's automation would have died** with a baffling message about date ranges. Now the extension simply never re-saves whole profiles in staff view; date and city edits send only those two fields.
+
+**Why that fix matters beyond the bug:** it lives in one shared file, so the booking engine itself needed no changes at all. The part that books your live appointments is untouched by this work.
+
+**What changed for you:** nothing. Your dashboard behaves exactly as before — all of this only activates for someone connecting with a staff key.
+
+**Still to be straight about:** the prices are hidden from their *screen*, but the price is still stored alongside each client, so someone technical could still reach it. It becomes genuinely unreachable in the next step, which moves pricing out of that table for good. Same for client passwords — their computer must be able to unlock logins to do the booking at all, so that one is screen-level only and always will be.
+
+---
+
+## 2026-07-20 — Staff & client assignment, owner side (Issue #52)
+**What it does:** Adds the owner's control panel for handing clients to your hired staff. Three new pieces, all switched off until you turn them on:
+1. A **Team Mode** tick-box inside Cloud Sync. Off = your dashboard behaves exactly as it always has. On = the two things below appear.
+2. A **Staff** button in the top row. Opens a popup where you add a person (name + email). Each person gets a long random key — that key is what makes their extension show only the clients you gave them. Buttons per person: **Copy key**, **Rename**, **New key** (kills the old one instantly, for when a key leaks), and **Deactivate**.
+3. On each client card, an **"Assigned to"** picker, plus tick-boxes and an **Apply** bar at the top so you can hand over many clients at once instead of one by one.
+
+**Why:** You have around 100 clients and 5 staff. Handing out logins one at a time was never going to work, and you needed a way to give someone 15 clients without showing them the other 85 — or what you charge.
+
+**What changed for you:**
+- **Nothing, until you switch Team Mode on.** Default is off, and the Staff button and assignment picker are hidden until then.
+- Turning it on **checks the database first**. If the team tables aren't set up there yet, it refuses politely and tells you which files to run, rather than half-working.
+- **Deactivating someone** cuts their access straight away and their clients come back to you automatically. That's enforced inside the database itself, not just by the dashboard — so it holds even if someone changes it another way. Before each client is released, a line is written into your activity log recording who used to hold it, so you don't lose that history.
+- The **pricing you charge stays invisible** to staff. That part is enforced by the database and was already proven with 8 out of 8 tests.
+
+**Still to be straight about:** a staff member's computer has to be able to unlock client logins, otherwise their extension can't do the booking. So logins are hidden from their *screen*, but a determined technical person could dig them out of their own browser. Pricing isolation is real; login hiding is screen-level only.
+
+**Before testing:** run `sql/03-staff-deactivate-unassign.sql` on the test database — that's the piece that releases clients when someone is deactivated.
+
+---
+
+## 2026-07-20 — VPN toggle brought into the test build (Issue #51)
+**What it does:** The VPN rotation switch (the one that changes your Mullvad location) existed in your **production** extension but had never been added to the **test** extension. This copies it across, so the test build now has the exact same VPN switch, plus the small helper program it talks to (`vpn_server.py`).
+**Why:** Two reasons. First, testing was misleading — you couldn't try VPN rotation in the test build because it simply wasn't there. Second, and more serious: because the test copy said "no VPN here", the next time we pushed test work up to production, the computer could have decided the VPN switch was meant to be **deleted** and quietly removed it from your live extension. You'd only have noticed when the switch disappeared. This closes that hole permanently — the two copies now agree.
+**What changed for you:** The test extension gets the VPN switch, working exactly as it does in production (verified line-for-line identical). Nothing about production changed — your live extension is untouched, still on the same version, with its VPN switch intact. The test build also stays a test build: it still says **SlotHunter TEST**, still logs as **[AutoBook-TEST]**, and still keeps its own set of rules.
+
 ## 2026-06-10 — Smarter error handling: 3-then-logout + change-IP on rate limit (Issue #49)
 **What it does:** Two error fixes. (1) **"Unable to load"** — the bot tries returning to the dashboard up to **3 times**; if still failing after 3, it sends a Telegram alert and **logs out** (clean reset) instead of retrying forever. (2) **"Too many requests" (429 / rate limit)** — the bot **no longer logs out** (logging out doesn't help — the new login is on the same blocked IP). Instead it goes to the dashboard, **stays logged in**, and sends **"🚫 RATE LIMITED — CHANGE IP"**. You switch network/IP and restart the client.
 **Why:** Logging out on a rate limit wasted the session for nothing (same IP = still blocked). And "unable to load" could keep looping. Each error now gets the right response.

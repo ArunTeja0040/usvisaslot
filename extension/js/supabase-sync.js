@@ -17,6 +17,13 @@ const SupabaseSync = (() => {
   let deviceId = null;
   let masterKey = null; // CryptoKey for encryption
   let eventBuffer = [];
+  // Staff mode (#53): when the key handed in starts with STAFF_KEY_PREFIX we are
+  // a hired staff member, not the owner. The only wire-level difference is which
+  // header goes out — every existing call then scopes itself automatically,
+  // because the database decides what a staff key may see.
+  const STAFF_KEY_PREFIX = "SH-";
+  let staffKey = null;
+
   let flushTimer = null;
   let heartbeatTimer = null;
   let initialized = false;
@@ -30,7 +37,10 @@ const SupabaseSync = (() => {
       "Content-Type": "application/json",
       "Prefer": "return=representation",
     };
-    if (operatorKey) h["x-operator-key"] = operatorKey;
+    // Never send both. A staff member holding an operator key would match the
+    // owner policies and see every client — that is the whole security hinge.
+    if (staffKey) h["x-staff-key"] = staffKey;
+    else if (operatorKey) h["x-operator-key"] = operatorKey;
     return h;
   }
 
@@ -132,13 +142,50 @@ const SupabaseSync = (() => {
 
   // ─── INIT ─────────────────────────────────────────────────────────
 
-  async function init(opKey, masterPassword, deviceName) {
-    operatorKey = opKey;
+  // A staff key cannot read the operators table, so the operator id is taken
+  // off their own assigned client rows — that works under the staff read policy
+  // with no extra database surface. staff_operator_id() covers the one case
+  // that cannot: a staff member with nothing assigned yet.
+  async function resolveStaffOperatorId() {
+    try {
+      const rows = await query("user_profiles", "select=operator_id&limit=1");
+      if (rows && rows.length && rows[0].operator_id) return rows[0].operator_id;
+    } catch (e) {
+      console.warn("[SupabaseSync] staff operator lookup via profiles failed:", e.message);
+    }
+    try {
+      const res = await fetch(`${REST_URL}/rpc/staff_operator_id`, {
+        method: "POST",
+        headers: headers(),
+        body: "{}",
+      });
+      if (res.ok) {
+        const val = await res.json();
+        if (typeof val === "string" && val) return val;
+      }
+    } catch (e) {
+      console.warn("[SupabaseSync] staff operator lookup via rpc failed:", e.message);
+    }
+    return null;
+  }
 
-    // Get operator ID
-    const ops = await query("operators", "select=id");
-    if (!ops || ops.length === 0) throw new Error("Invalid operator key");
-    operatorId = ops[0].id;
+  async function init(opKey, masterPassword, deviceName) {
+    const isStaff = typeof opKey === "string" && opKey.startsWith(STAFF_KEY_PREFIX);
+
+    if (isStaff) {
+      staffKey = opKey;
+      operatorKey = null;
+      operatorId = await resolveStaffOperatorId();
+      if (!operatorId) {
+        throw new Error("Key not recognised, or no clients assigned to you yet. Ask the owner to assign at least one.");
+      }
+    } else {
+      staffKey = null;
+      operatorKey = opKey;
+      const ops = await query("operators", "select=id");
+      if (!ops || ops.length === 0) throw new Error("Invalid operator key");
+      operatorId = ops[0].id;
+    }
 
     // Derive encryption key
     if (masterPassword) {
@@ -175,6 +222,7 @@ const SupabaseSync = (() => {
       __supabase_operator_key: opKey,
       __supabase_operator_id: operatorId,
       __supabase_master_pw: masterPassword || "",
+      __supabase_is_staff: isStaff,
     });
 
     // Start event flush timer
@@ -196,9 +244,16 @@ const SupabaseSync = (() => {
       "__supabase_operator_id",
       "__supabase_device_id",
       "__supabase_master_pw",
+      "__supabase_is_staff",
     ]);
     if (stored.__supabase_operator_key) {
-      operatorKey = stored.__supabase_operator_key;
+      const key = stored.__supabase_operator_key;
+      // Route the saved key to the right header. Sending a staff key as
+      // x-operator-key matches no operator, so the dashboard would silently come
+      // back empty on every reload.
+      const isStaff = stored.__supabase_is_staff === true || key.startsWith(STAFF_KEY_PREFIX);
+      staffKey    = isStaff ? key : null;
+      operatorKey = isStaff ? null : key;
       operatorId = stored.__supabase_operator_id;
       deviceId = stored.__supabase_device_id;
 
@@ -214,7 +269,7 @@ const SupabaseSync = (() => {
       heartbeatTimer = setInterval(() => heartbeat(), DEVICE_HEARTBEAT_MS);
 
       initialized = true;
-      console.log("[SupabaseSync] Restored from storage — operator:", operatorId, "encryption:", !!masterKey);
+      console.log("[SupabaseSync] Restored from storage —", staffKey ? "STAFF mode" : "owner", "operator:", operatorId, "encryption:", !!masterKey);
       return true;
     }
     return false;
@@ -236,6 +291,16 @@ const SupabaseSync = (() => {
 
   async function pushProfile(profile) {
     if (!isReady()) return null;
+
+    // #53 — staff must never push a whole profile. encrypt() uses a fresh random
+    // IV each time, so re-encrypting an UNCHANGED password still yields different
+    // ciphertext; the column-limit trigger reads that as "staff edited the
+    // credentials" and rejects the write. Guarding here (rather than in
+    // auto-booking.js) keeps the live booking path untouched.
+    if (staffKey) {
+      console.log("[SupabaseSync] pushProfile skipped — staff mode");
+      return null;
+    }
 
     const data = {
       operator_id: operatorId,
@@ -313,6 +378,7 @@ const SupabaseSync = (() => {
           ].filter(q => q.question),
           updatedAt: p.updated_at,
           rateLimitedAt: p.rate_limited_at,
+          assignedStaffId: p.assigned_staff_id || null,
         });
       }
 
@@ -322,6 +388,20 @@ const SupabaseSync = (() => {
       console.error("[SupabaseSync] pullProfiles failed:", e.message);
       return [];
     }
+  }
+
+  // The only profile write a staff member may make: date range and cities.
+  // Sends ONLY those fields, so nothing else is rewritten and the column-limit
+  // trigger has nothing to object to.
+  async function updateProfileFields(username, fields) {
+    if (!isReady()) throw new Error("Cloud sync not connected");
+    const allowed = {};
+    if (fields.startDate !== undefined) allowed.start_date = fields.startDate || null;
+    if (fields.endDate !== undefined) allowed.end_date = fields.endDate || null;
+    if (fields.locations !== undefined) allowed.locations = fields.locations || [];
+    if (Object.keys(allowed).length === 0) return null;
+    const rows = await update("user_profiles", { username: username }, allowed);
+    return rows && rows[0];
   }
 
   async function deleteProfile(username) {
@@ -654,6 +734,108 @@ const SupabaseSync = (() => {
     return d.toISOString();
   }
 
+  // ─── STAFF / TEAM (issue #52) ─────────────────────────────────────
+  // Owner-only. Every call below goes out with the operator key, so the
+  // database's own rules are what actually enforce ownership — this layer
+  // just talks to them.
+
+  // Human-friendly but unguessable: 20 random chars from a 32-symbol alphabet
+  // (~100 bits). Ambiguous characters (I, O, 0, 1) are left out so a key can be
+  // read aloud or retyped without mistakes.
+  function generateStaffKey() {
+    const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    const bytes = new Uint8Array(20);
+    crypto.getRandomValues(bytes);
+    let out = "";
+    for (let i = 0; i < bytes.length; i++) {
+      if (i > 0 && i % 5 === 0) out += "-";
+      out += ALPHABET[bytes[i] % ALPHABET.length];
+    }
+    return "SH-" + out;
+  }
+
+  async function listStaff() {
+    if (!isReady()) return [];
+    const rows = await query("staff", "select=*&order=name.asc");
+    return rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      email: r.email,
+      staffKey: r.staff_key,
+      role: r.role,
+      active: r.active,
+      createdAt: r.created_at,
+    }));
+  }
+
+  async function createStaff(name, email) {
+    if (!isReady()) throw new Error("Cloud sync not connected");
+    const [row] = await insert("staff", {
+      operator_id: operatorId,
+      name: name,
+      email: email || null,
+      staff_key: generateStaffKey(),
+      role: "staff",
+      active: true,
+    });
+    return row;
+  }
+
+  async function updateStaff(id, fields) {
+    if (!isReady()) throw new Error("Cloud sync not connected");
+    const data = {};
+    if (fields.name !== undefined) data.name = fields.name;
+    if (fields.email !== undefined) data.email = fields.email || null;
+    if (fields.active !== undefined) data.active = !!fields.active;
+    const [row] = await update("staff", { id: id }, data);
+    return row;
+  }
+
+  // Issues a brand new key. The old one stops working the moment this returns —
+  // use it if a key was shared by mistake or a person left.
+  async function regenerateStaffKey(id) {
+    if (!isReady()) throw new Error("Cloud sync not connected");
+    const [row] = await update("staff", { id: id }, { staff_key: generateStaffKey() });
+    return row;
+  }
+
+  // Assign / unassign one client. staffId === null puts it back in the owner pool.
+  async function assignClient(username, staffId) {
+    if (!isReady()) throw new Error("Cloud sync not connected");
+    await update("user_profiles", { operator_id: operatorId, username: username },
+                 { assigned_staff_id: staffId || null });
+  }
+
+  // Bulk assign. PostgREST has no "IN" on the update helper, so this walks the
+  // list; ~100 clients is small enough that a batch endpoint isn't worth it.
+  // Returns { ok, failed } so a partial failure is visible rather than silent.
+  async function assignClients(usernames, staffId) {
+    let ok = 0;
+    const failed = [];
+    for (const u of usernames) {
+      try {
+        await assignClient(u, staffId);
+        ok++;
+      } catch (e) {
+        failed.push({ username: u, error: e.message });
+      }
+    }
+    return { ok, failed };
+  }
+
+  // True only when the database has actually had the staff tables added.
+  // Lets the dashboard refuse to switch team mode on against a database where
+  // the SQL hasn't been run yet, instead of failing halfway through.
+  async function staffTablesReady() {
+    if (!isReady()) return false;
+    try {
+      await query("staff", "select=id&limit=1");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   // ─── CLEANUP ──────────────────────────────────────────────────────
 
   function destroy() {
@@ -661,6 +843,8 @@ const SupabaseSync = (() => {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     flushEvents();
     initialized = false;
+    staffKey = null;
+    operatorKey = null;
   }
 
   // ─── PUBLIC API ───────────────────────────────────────────────────
@@ -707,6 +891,19 @@ const SupabaseSync = (() => {
     getDevices,
     renameDevice,
     deleteDevice,
+
+    // Staff mode (#53)
+    isStaffMode: () => !!staffKey,
+    updateProfileFields,
+
+    // Staff / team (#52)
+    listStaff,
+    createStaff,
+    updateStaff,
+    regenerateStaffKey,
+    assignClient,
+    assignClients,
+    staffTablesReady,
 
     // Full sync
     fullPull,

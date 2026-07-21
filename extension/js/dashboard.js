@@ -10,6 +10,14 @@
   let cloudProfiles = [];
   let cloudDevices = {};  // deviceId → { device_name, last_seen }
 
+  // Team mode (#52) — off by default, so the dashboard looks exactly as it
+  // always has until the owner switches it on in Cloud Sync.
+  let teamMode = false;
+  let staffMode = false;   // #53 — connected with a staff key, not the owner key
+  let staffList = [];                 // [{ id, name, email, staffKey, active }]
+  let staffById = {};                 // id → staff
+  const bulkSelected = new Set();     // usernames ticked for bulk assign
+
   function sendDashboardTelegram(type, message) {
     chrome.storage.local.get(["telegramBotToken", "telegramChatId", "telegramNotify"], (data) => {
       if (!data.telegramBotToken || !data.telegramChatId) return;
@@ -115,6 +123,12 @@
 
   function renderUserCards(profiles, statuses, slotHistory) {
     const container = document.getElementById("user-cards");
+
+    // Cards redraw every 2s. If the owner has an "Assigned to" dropdown open,
+    // redrawing would destroy it mid-choice — so skip this tick.
+    const focused = document.activeElement;
+    if (focused && focused.tagName === "SELECT" && container.contains(focused)) return;
+
     const filterStatus = document.getElementById("filter-status").value;
     const filterVisa = document.getElementById("filter-visa")?.value || "all";
     const filterMonth = document.getElementById("filter-month")?.value || "all";
@@ -193,7 +207,7 @@
     // Build cloud status map: username → { status, activeDeviceId, isActive }
     const cloudStatusMap = {};
     cloudProfiles.forEach(cp => {
-      cloudStatusMap[cp.username] = { status: cp.status, activeDeviceId: cp.activeDeviceId, isActive: cp.isActive, rateLimitedAt: cp.rateLimitedAt };
+      cloudStatusMap[cp.username] = { status: cp.status, activeDeviceId: cp.activeDeviceId, isActive: cp.isActive, rateLimitedAt: cp.rateLimitedAt, assignedStaffId: cp.assignedStaffId };
     });
 
     const myDeviceId = SUPA ? SUPA.getDeviceId() : null;
@@ -266,12 +280,21 @@
       return `
         <div class="${cardClass}" data-username="${safeUser}">
           <div class="card-header">
-            <div>
-              <div class="card-name">${name}</div>
-              <div class="card-username">${safeUser}</div>
+            <div style="display:flex;align-items:flex-start;gap:6px;">
+              ${teamMode ? `<input type="checkbox" class="bulk-tick" data-user="${safeUser}" ${bulkSelected.has(profile.username) ? "checked" : ""} title="Select for bulk assign" style="margin-top:3px;">` : ""}
+              <div>
+                <div class="card-name">${name}</div>
+                <div class="card-username">${safeUser}</div>
+              </div>
             </div>
             <span class="status-badge status-${userStatus}">${statusLabel(userStatus)}</span>
           </div>
+          ${teamMode ? `<div style="display:flex;align-items:center;gap:6px;margin:4px 0;font-size:11px;color:#90a4ae;">
+            <span>Assigned to</span>
+            <select class="assign-select" data-user="${safeUser}" style="flex:1;padding:3px 5px;background:#0f1923;color:#e0e0e0;border:1px solid #2d3e50;border-radius:3px;font-size:11px;">
+              ${staffOptionsHtml(cloud.assignedStaffId)}
+            </select>
+          </div>` : ""}
           ${activeOnOtherDevice ? `<div style="background:#e74c3c22;border:1px solid #e74c3c55;border-radius:4px;padding:4px 8px;margin:4px 0;font-size:11px;color:#ef5350;">⚠️ Active on <b>${esc(activeDeviceName || "another device")}</b> ${deviceLastSeen ? `(${deviceLastSeen})` : ""} ${isStaleDevice ? '<span style="color:#f39c12;"> — stale</span>' : ""}</div>` : ""}
           ${isActive && activeDeviceName && !activeOnOtherDevice ? `<div style="font-size:11px;color:#3ecf8e;margin:2px 0;">📍 Running on <b>${esc(activeDeviceName)}</b> ${deviceLastSeen ? `(${deviceLastSeen})` : ""}</div>` : ""}
           ${isRateLimited ? `<div style="background:#e74c3c33;border:1px solid #e74c3c88;border-radius:4px;padding:6px 8px;margin:4px 0;font-size:11px;color:#ef5350;font-weight:bold;">🔴 RATE LIMITED — blocked for ~${rateLimitHoursLeft}h. Do NOT login this user from any profile.</div>` : ""}
@@ -288,10 +311,10 @@
               <span class="detail-label">Applicants:</span>
               <span class="detail-value">${profile.applicantCount || 1}</span>
             </div>
-            <div class="card-detail">
+            ${staffMode ? "" : `<div class="card-detail">
               <span class="detail-label">Price:</span>
               <span class="detail-value">${profile.agreedPrice ? "₹" + Number(profile.agreedPrice).toLocaleString() + (profile.applicantCount > 1 ? " (" + (profile.pricePerPerson || profile.agreedPrice) + "/pp)" : "") : "—"}</span>
-            </div>
+            </div>`}
             <div class="card-detail">
               <span class="detail-label">CAPTCHA:</span>
               <span class="detail-value">${esc(profile.captchaMode) || "manual"}</span>
@@ -1176,6 +1199,7 @@
       if (captchaRadio) captchaRadio.checked = true;
 
       document.getElementById("edit-delete-btn").style.display = "inline-block";
+      applyStaffModeToEditModal();
       document.getElementById("edit-modal").style.display = "flex";
     });
   }
@@ -1231,7 +1255,23 @@
       // Write to Supabase first (primary), then local cache
       const saved = idx >= 0 ? profiles[idx] : updated;
       if (SUPA && SUPA.isReady()) {
-        try { await SUPA.pushProfile(saved); } catch (e) { console.warn("Supabase push failed:", e.message); }
+        if (staffMode) {
+          // Staff may only change the date range and the cities. Sending just
+          // those fields keeps the credentials untouched — a whole-profile push
+          // would re-encrypt the password and be rejected by the database.
+          try {
+            await SUPA.updateProfileFields(originalUsername, {
+              startDate: updated.startDate,
+              endDate: updated.endDate,
+              locations: updated.locations,
+            });
+          } catch (e) {
+            window.alert("Could not save: " + e.message);
+            return;
+          }
+        } else {
+          try { await SUPA.pushProfile(saved); } catch (e) { console.warn("Supabase push failed:", e.message); }
+        }
       }
       chrome.storage.local.set({ userProfilesList: profiles }, () => {
         closeEditModal();
@@ -1721,6 +1761,7 @@
   const SUPA = typeof SupabaseSync !== "undefined" ? SupabaseSync : null;
 
   async function updateCloudUI() {
+    syncStaffMode();   // #53 — the view follows whichever key is connected
     const statusEl = document.getElementById("cloud-status");
     const pullBtn = document.getElementById("cloud-pull-btn");
     const pushBtn = document.getElementById("cloud-push-btn");
@@ -1734,7 +1775,7 @@
       statusEl.style.color = "#81c784";
       pullBtn.style.display = "inline-block";
       pushBtn.style.display = "inline-block";
-      if (exportBtn) exportBtn.style.display = "inline-block";
+      if (exportBtn) exportBtn.style.display = staffMode ? "none" : "inline-block";
       if (importSection) importSection.style.display = "none";
       deviceIdEl.textContent = SUPA.getDeviceId() || "—";
       const savedName = await SUPA.getDeviceName();
@@ -2064,11 +2105,369 @@
   if (SUPA) {
     SUPA.initFromStorage().then(connected => {
       if (connected) {
-        updateCloudUI();
+        updateCloudUI();      // calls syncStaffMode()
         startCloudPolling();
       }
     }).catch(() => {});
   }
+
+  // ─── STAFF VIEW (#53) ──────────────────────────────────────────────
+  // What a staff member is allowed to do is decided by the database, not by
+  // this file. Hiding controls here is about not showing someone buttons that
+  // would only fail — it is presentation, not security.
+
+  // Owner-only controls. Anything that would carry credentials or pricing off
+  // the machine (export/import/sheets) is included deliberately.
+  const OWNER_ONLY_IDS = [
+    "add-user-btn",
+    "export-btn", "export-csv-btn", "import-btn",
+    "sheets-sync-btn", "sheets-url-input", "sheets-link",
+    "cloud-export-btn",
+    "team-mode-section",
+    "staff-btn",
+  ];
+
+  function applyStaffModeUI() {
+    OWNER_ONLY_IDS.forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.style.display = staffMode ? "none" : "";
+    });
+
+    const badge = document.getElementById("staff-mode-badge");
+    if (badge) badge.style.display = staffMode ? "" : "none";
+    const banner = document.getElementById("staff-mode-banner");
+    if (banner) banner.style.display = staffMode ? "" : "none";
+
+    // A staff member has no team of their own to manage.
+    if (staffMode) {
+      teamMode = false;
+      const bar = document.getElementById("bulk-assign-bar");
+      if (bar) bar.style.display = "none";
+    }
+
+    const keyLabel = document.getElementById("cloud-api-key-label");
+    if (keyLabel) keyLabel.textContent = staffMode ? "Your Access Key" : "Operator API Key";
+  }
+
+  // Called whenever the connection changes, so the view follows the key in use.
+  function syncStaffMode() {
+    const now = !!(SUPA && SUPA.isStaffMode && SUPA.isStaffMode());
+    if (now === staffMode) return;
+    staffMode = now;
+    applyStaffModeUI();
+    refresh();
+  }
+
+  // Trim the edit form down to what a staff member may actually change:
+  // the date range and the cities. Everything else is hidden rather than
+  // shown-and-rejected.
+  function applyStaffModeToEditModal() {
+    const modal = document.getElementById("edit-modal");
+    if (!modal) return;
+    const hide = (sel, on) => modal.querySelectorAll(sel).forEach((el) => {
+      el.style.display = on ? "none" : "";
+    });
+    // form-row order: 0 username, 1 password ... price row is matched by its input
+    const pwRow = document.getElementById("edit-password")?.closest(".form-row");
+    if (pwRow) pwRow.style.display = staffMode ? "none" : "";
+    const priceRow = document.getElementById("edit-price")?.closest(".form-row");
+    if (priceRow) priceRow.style.display = staffMode ? "none" : "";
+    const visaRow = document.getElementById("edit-visa-type")?.closest(".form-row");
+    if (visaRow) visaRow.style.display = staffMode ? "none" : "";
+    document.querySelectorAll(".edit-q-select").forEach((el) => {
+      const row = el.closest(".form-row");
+      if (row) row.style.display = staffMode ? "none" : "";
+    });
+    const pasteSection = document.getElementById("paste-section");
+    if (pasteSection) pasteSection.style.display = staffMode ? "none" : "";
+    const delBtn = document.getElementById("edit-delete-btn");
+    if (delBtn) delBtn.style.display = staffMode ? "none" : "";
+    const userRow = document.getElementById("edit-username")?.closest(".form-row");
+    if (userRow && staffMode) document.getElementById("edit-username").readOnly = true;
+    // hide the "Security Questions" / "Booking Preferences" style headings that
+    // now have nothing under them
+    modal.querySelectorAll(".form-section").forEach((h) => {
+      const t = (h.textContent || "").trim().toLowerCase();
+      if (t === "security questions" || t === "automation") {
+        h.style.display = staffMode ? "none" : "";
+      }
+    });
+    hide(".edit-checks", staffMode);
+    const captchaRow = document.querySelector('input[name="edit-captcha"]')?.closest(".form-row");
+    if (captchaRow) captchaRow.style.display = staffMode ? "none" : "";
+  }
+
+  // ─── TEAM MODE / STAFF (#52) ───────────────────────────────────────
+  // Owner-side only. Everything here is inert while teamMode is false, so an
+  // owner who never switches it on sees the dashboard exactly as before.
+
+  function staffOptionsHtml(selectedId) {
+    const opts = [`<option value=""${!selectedId ? " selected" : ""}>— me (unassigned) —</option>`];
+    staffList.forEach((st) => {
+      if (!st.active && st.id !== selectedId) return; // hide retired people, unless still shown on a card
+      const sel = st.id === selectedId ? " selected" : "";
+      opts.push(`<option value="${esc(st.id)}"${sel}>${esc(st.name)}${st.active ? "" : " (inactive)"}</option>`);
+    });
+    return opts.join("");
+  }
+
+  function applyTeamModeUI() {
+    const btn = document.getElementById("staff-btn");
+    const bar = document.getElementById("bulk-assign-bar");
+    // #53 — a staff member never manages a team, whatever is saved locally.
+    const on = teamMode && !staffMode;
+    if (btn) btn.style.display = on ? "" : "none";
+    if (bar) bar.style.display = on ? "flex" : "none";
+    if (!teamMode) bulkSelected.clear();
+    updateBulkCount();
+  }
+
+  function updateBulkCount() {
+    const el = document.getElementById("bulk-count");
+    if (el) el.textContent = `${bulkSelected.size} selected`;
+  }
+
+  async function refreshStaff() {
+    if (!teamMode || !SUPA || !SUPA.isReady()) return;
+    try {
+      staffList = await SUPA.listStaff();
+    } catch (e) {
+      staffList = [];
+      console.warn("[Dashboard] listStaff failed:", e.message);
+    }
+    staffById = {};
+    staffList.forEach((st) => { staffById[st.id] = st; });
+    renderStaffList();
+    const bulkSel = document.getElementById("bulk-staff-select");
+    if (bulkSel) bulkSel.innerHTML = staffOptionsHtml(bulkSel.value || null);
+  }
+
+  function renderStaffList() {
+    const box = document.getElementById("staff-list");
+    if (!box) return;
+    if (staffList.length === 0) {
+      box.innerHTML = '<div class="log-empty">Nobody added yet</div>';
+      return;
+    }
+    const counts = {};
+    cloudProfiles.forEach((cp) => {
+      if (cp.assignedStaffId) counts[cp.assignedStaffId] = (counts[cp.assignedStaffId] || 0) + 1;
+    });
+    box.innerHTML = staffList.map((st) => `
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 8px;margin-bottom:6px;background:#0f1923;border:1px solid #2d3e50;border-radius:5px;${st.active ? "" : "opacity:0.55;"}">
+        <div style="flex:1;min-width:140px;">
+          <div style="color:#e0e0e0;font-weight:bold;">${esc(st.name)}${st.active ? "" : ' <span style="color:#e67e22;font-weight:normal;">(inactive)</span>'}</div>
+          <div style="font-size:11px;color:#78909c;">${esc(st.email) || "no email"} · ${counts[st.id] || 0} client(s)</div>
+        </div>
+        <button class="btn btn-small btn-gray staff-copy-key" data-id="${esc(st.id)}" title="Copy this person's key">Copy key</button>
+        <button class="btn btn-small staff-rename" data-id="${esc(st.id)}" style="background:#34495e;color:#fff;">Rename</button>
+        <button class="btn btn-small staff-newkey" data-id="${esc(st.id)}" style="background:#d35400;color:#fff;" title="Issue a new key — the old one stops working immediately">New key</button>
+        <button class="btn btn-small ${st.active ? "btn-red" : "btn-green"} staff-toggle" data-id="${esc(st.id)}" data-active="${st.active}">${st.active ? "Deactivate" : "Reactivate"}</button>
+      </div>`).join("");
+  }
+
+  async function setTeamMode(on) {
+    if (staffMode) return;   // #53 — not a staff member's control
+    const statusEl = document.getElementById("team-mode-status");
+    const setStatus = (msg, colour) => {
+      if (!statusEl) return;
+      statusEl.textContent = msg || "";
+      statusEl.style.color = colour || "#78909c";
+    };
+
+    if (on) {
+      if (!SUPA || !SUPA.isReady()) {
+        setStatus("Connect Cloud Sync first — team mode needs the database.", "#ef5350");
+        document.getElementById("team-mode-toggle").checked = false;
+        return;
+      }
+      // Refuse to switch on against a database that hasn't had the staff tables
+      // added yet — better a clear message now than a half-working screen later.
+      const ready = await SUPA.staffTablesReady();
+      if (!ready) {
+        setStatus("This database isn't set up for team mode yet — run sql/01, 02 and 03 first.", "#ef5350");
+        document.getElementById("team-mode-toggle").checked = false;
+        return;
+      }
+      setStatus("Team mode on.", "#3ecf8e");
+    } else {
+      setStatus("Team mode off — dashboard back to normal.", "#78909c");
+    }
+
+    teamMode = on;
+    await chrome.storage.local.set({ __team_mode: on });
+    applyTeamModeUI();
+    await refreshStaff();
+    refresh();
+  }
+
+  // ── wiring ──────────────────────────────────────────────────────────
+
+  document.getElementById("team-mode-toggle")?.addEventListener("change", (e) => {
+    setTeamMode(e.target.checked);
+  });
+
+  document.getElementById("staff-btn")?.addEventListener("click", async () => {
+    document.getElementById("staff-modal").style.display = "flex";
+    await refreshStaff();
+  });
+
+  document.getElementById("staff-close-btn")?.addEventListener("click", () => {
+    document.getElementById("staff-modal").style.display = "none";
+  });
+
+  document.getElementById("staff-modal")?.addEventListener("click", (e) => {
+    if (e.target.id === "staff-modal") e.target.style.display = "none";
+  });
+
+  document.getElementById("staff-add-btn")?.addEventListener("click", async () => {
+    const nameEl = document.getElementById("staff-new-name");
+    const emailEl = document.getElementById("staff-new-email");
+    const statusEl = document.getElementById("staff-add-status");
+    const name = nameEl.value.trim();
+    if (!name) {
+      statusEl.textContent = "Name is required.";
+      statusEl.style.color = "#ef5350";
+      return;
+    }
+    try {
+      const row = await SUPA.createStaff(name, emailEl.value.trim());
+      nameEl.value = "";
+      emailEl.value = "";
+      await refreshStaff();
+      // Show the key once, right after creating, so it can be copied and sent.
+      statusEl.innerHTML = `Added <b>${esc(name)}</b>. Their key: <code style="color:#3ecf8e;">${esc(row.staff_key)}</code> — use "Copy key" to send it.`;
+      statusEl.style.color = "#3ecf8e";
+    } catch (e) {
+      statusEl.textContent = "Could not add: " + e.message;
+      statusEl.style.color = "#ef5350";
+    }
+  });
+
+  document.getElementById("staff-list")?.addEventListener("click", async (e) => {
+    const btn = e.target.closest("button");
+    if (!btn) return;
+    const id = btn.dataset.id;
+    const staff = staffById[id];
+    if (!staff) return;
+
+    if (btn.classList.contains("staff-copy-key")) {
+      try {
+        await navigator.clipboard.writeText(staff.staffKey);
+        btn.textContent = "Copied!";
+        setTimeout(() => { btn.textContent = "Copy key"; }, 1500);
+      } catch {
+        window.prompt("Copy this key and send it to " + staff.name + ":", staff.staffKey);
+      }
+      return;
+    }
+
+    if (btn.classList.contains("staff-rename")) {
+      const name = window.prompt("Name:", staff.name);
+      if (name === null) return;
+      if (!name.trim()) return;
+      const email = window.prompt("Email (leave blank for none):", staff.email || "");
+      if (email === null) return;
+      await SUPA.updateStaff(id, { name: name.trim(), email: email.trim() });
+      await refreshStaff();
+      return;
+    }
+
+    if (btn.classList.contains("staff-newkey")) {
+      if (!window.confirm(`Issue a NEW key for ${staff.name}?\n\nTheir current key stops working straight away and they will have to enter the new one.`)) return;
+      const row = await SUPA.regenerateStaffKey(id);
+      await refreshStaff();
+      window.prompt("New key for " + staff.name + " — copy and send it:", row.staff_key);
+      return;
+    }
+
+    if (btn.classList.contains("staff-toggle")) {
+      const nowActive = btn.dataset.active === "true";
+      if (nowActive) {
+        const held = cloudProfiles.filter((cp) => cp.assignedStaffId === id).length;
+        if (!window.confirm(`Deactivate ${staff.name}?\n\nTheir access stops immediately and their ${held} client(s) come back to you.`)) return;
+      }
+      await SUPA.updateStaff(id, { active: !nowActive });
+      await pullCloudProfiles();   // assignments changed underneath us
+      await refreshStaff();
+      refresh();
+    }
+  });
+
+  // Per-card assignment
+  document.getElementById("user-cards")?.addEventListener("change", async (e) => {
+    const sel = e.target.closest(".assign-select");
+    if (sel) {
+      const username = sel.dataset.user;
+      try {
+        await SUPA.assignClient(username, sel.value || null);
+        const cp = cloudProfiles.find((c) => c.username === username);
+        if (cp) cp.assignedStaffId = sel.value || null;
+        await refreshStaff();
+      } catch (err) {
+        window.alert("Could not assign: " + err.message);
+      }
+      return;
+    }
+    const tick = e.target.closest(".bulk-tick");
+    if (tick) {
+      if (tick.checked) bulkSelected.add(tick.dataset.user);
+      else bulkSelected.delete(tick.dataset.user);
+      updateBulkCount();
+    }
+  });
+
+  // Bulk assign
+  document.getElementById("bulk-select-all")?.addEventListener("change", (e) => {
+    document.querySelectorAll("#user-cards .bulk-tick").forEach((cb) => {
+      cb.checked = e.target.checked;
+      if (e.target.checked) bulkSelected.add(cb.dataset.user);
+      else bulkSelected.delete(cb.dataset.user);
+    });
+    updateBulkCount();
+  });
+
+  document.getElementById("bulk-assign-btn")?.addEventListener("click", async () => {
+    const statusEl = document.getElementById("bulk-status");
+    const target = document.getElementById("bulk-staff-select").value || null;
+    const names = Array.from(bulkSelected);
+    if (names.length === 0) {
+      statusEl.textContent = "Nothing selected.";
+      statusEl.style.color = "#e67e22";
+      return;
+    }
+    const who = target ? (staffById[target]?.name || "that person") : "you (unassigned)";
+    if (!window.confirm(`Assign ${names.length} client(s) to ${who}?`)) return;
+
+    statusEl.textContent = `Assigning ${names.length}…`;
+    statusEl.style.color = "#78909c";
+    const { ok, failed } = await SUPA.assignClients(names, target);
+    if (failed.length) {
+      statusEl.textContent = `${ok} assigned, ${failed.length} failed (${failed[0].error})`;
+      statusEl.style.color = "#ef5350";
+    } else {
+      statusEl.textContent = `${ok} assigned to ${who}.`;
+      statusEl.style.color = "#3ecf8e";
+    }
+    bulkSelected.clear();
+    document.getElementById("bulk-select-all").checked = false;
+    updateBulkCount();
+    await pullCloudProfiles();
+    await refreshStaff();
+    refresh();
+  });
+
+  // Restore the switch on load
+  chrome.storage.local.get(["__team_mode"], (d) => {
+    teamMode = !!d.__team_mode && !staffMode;
+    const toggle = document.getElementById("team-mode-toggle");
+    if (toggle) toggle.checked = teamMode;
+    applyTeamModeUI();
+    if (teamMode) {
+      refresh();                          // first paint happened before this read
+      setTimeout(refreshStaff, 1500);     // let cloud sync connect first
+    }
+  });
 
   refresh();
   setInterval(refresh, REFRESH_INTERVAL);
