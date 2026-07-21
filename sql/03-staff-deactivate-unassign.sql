@@ -31,18 +31,30 @@ begin
   end if;
 
   -- Record the history BEFORE clearing it, one row per released client.
-  insert into public.event_logs (operator_id, username, type, message, metadata)
-  select p.operator_id,
-         p.username,
-         'staff',
-         format('Unassigned from %s (staff deactivated)', old.name),
-         jsonb_build_object(
-           'staff_id',   old.id,
-           'staff_name', old.name,
-           'reason',     'staff_deactivated'
-         )
-  from public.user_profiles p
-  where p.assigned_staff_id = old.id;
+  -- Column names match production's event_logs (event_type / created_at).
+  --
+  -- Best-effort: the audit log must NEVER block the client release. If the
+  -- log table's shape ever differs, the release still happens and only the
+  -- log line is skipped. (An earlier version referenced a wrong column name
+  -- and rolled the whole deactivate back — this guard prevents that class of
+  -- failure from ever silently breaking deactivation again.)
+  begin
+    insert into public.event_logs (operator_id, username, event_type, message, metadata, created_at)
+    select p.operator_id,
+           p.username,
+           'staff',
+           format('Unassigned from %s (staff deactivated)', old.name),
+           jsonb_build_object(
+             'staff_id',   old.id,
+             'staff_name', old.name,
+             'reason',     'staff_deactivated'
+           ),
+           now()
+    from public.user_profiles p
+    where p.assigned_staff_id = old.id;
+  exception when others then
+    raise notice 'deactivate release: audit log skipped (%)', sqlerrm;
+  end;
 
   update public.user_profiles
   set assigned_staff_id = null

@@ -88,14 +88,18 @@ create table if not exists public.slot_history (
   found_at    timestamptz default now()
 );
 
+-- NOTE: column names MUST match production (event_type / created_at, plus
+-- device_id). An earlier version used type/timestamp, which diverged from the
+-- real database and let a trigger pass on test but fail on production.
 create table if not exists public.event_logs (
   id          uuid primary key default gen_random_uuid(),
   operator_id uuid not null,
+  device_id   uuid,
   username    text,
-  type        text,
+  event_type  text,
   message     text,
   metadata    jsonb,
-  timestamp   timestamptz default now()
+  created_at  timestamptz default now()
 );
 
 create table if not exists public.daily_stats (
