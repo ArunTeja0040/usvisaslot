@@ -12,6 +12,23 @@ Format:
 
 ---
 
+## 2026-07-22 — Choose Sequential or Parallel scanning from the booking panel (Issue #55)
+**What it does:** Adds a **Scan mode** choice to the booking panel, right under the VPN Rotation row: **Parallel** or **Sequential**.
+- **Parallel** (the default) is exactly what the bot does today — checks 2 cities at once, and if the website starts stalling it automatically slows to one-at-a-time, then speeds back up on its own.
+- **Sequential** switches that off completely. It checks one city at a time, every time, moving through your selected cities by changing the city dropdown on the page — no page reload between cities.
+
+**Why:** The bot already decides this for itself, and it recovers well. But it only gives up on the fast mode after it has failed 3 rounds in a row, then waits 5 minutes before trying again. When you can already see the website is being difficult, you shouldn't have to wait for it to work that out — now you can just pin it to Sequential.
+
+**What changed for you:** Nothing unless you touch it. It starts on Parallel, which is today's behaviour. You can switch **while the bot is running** — it takes effect from the next round, no stopping or restarting.
+
+**Two details worth knowing:**
+1. In Sequential mode it checks **every** city you've selected, each round. (Normally the bot deliberately checks just the first city on the very first round as a shortcut to get into fast mode quicker — that shortcut is skipped when you've asked for Sequential, otherwise it would only ever check one city.)
+2. Your choice is remembered on that computer, and it survives the automatic page refresh the bot does every few minutes to keep the session alive. Without that, a Sequential choice would have quietly flipped back to Parallel after a refresh.
+
+**Note:** this is a per-computer setting, not per-client. It isn't stored in the database, so nothing changed there and staff can set it themselves.
+
+---
+
 ## 2026-07-21 — Fix: Deactivate did nothing on production (Issue #53 follow-up)
 **What was wrong:** Clicking **Deactivate** on a staff member did nothing at all — the person didn't grey out, and their clients didn't come back to you. The database was rejecting the whole action.
 **Why:** When someone is deactivated, the system writes a note into the activity log for each client it returns to you. That note was written to a column called `type` — but your real activity-log table names that column `event_type`. (The mismatch came from a throwaway test database that happened to use the other name.) So every deactivate hit an error and the database undid the entire thing, leaving nothing changed.

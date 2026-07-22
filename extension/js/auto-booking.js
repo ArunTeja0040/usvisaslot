@@ -19,6 +19,13 @@
   const SEQ_PROBE_MAX = 10;                // #46 cap the escalating probe size
   let __seqProbeChecks = 0;                // #46 sequential checks to do before re-trying parallel
   let __seqBackoff = 2;                    // #46 current probe size — escalates on repeat tarpits, resets on success
+  // #55 scan mode — operator override for the automatic scan strategy.
+  //   "parallel"   = default, today's behaviour (parallel + auto fallback + bench)
+  //   "sequential" = never parallel; one city at a time, switching the dropdown
+  //                  in-page (no refresh), full sweep of every selected city.
+  // Per machine (chrome.storage.local), switchable mid-cycle, applies next round.
+  let __scanMode = "parallel";
+
   const MAX_PARALLEL_STRIKES = 3;          // #46b after this many timeout rounds in a row, bench parallel
   const PARALLEL_BENCH_MS = 5 * 60 * 1000;  // #46b run pure-sequential this long before re-testing parallel
   let __parallelTimeoutStreak = 0;         // #46b consecutive parallel rounds that fully timed out
@@ -2434,6 +2441,16 @@
           <span id="ab-vpn-label" style="font-size:13px;font-weight:600;color:#7f8c8d;">OFF</span>
           <span id="ab-vpn-info" style="font-size:12px;color:#888;margin-left:auto;"></span>
         </div>
+        <div id="ab-scan-section" style="margin-top:8px;padding:10px 12px;background:#f0f4f8;border:1px solid #d5dfe8;border-radius:6px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+          <strong style="font-size:13px;color:#1a5276;">Scan mode:</strong>
+          <label style="cursor:pointer;font-size:13px;display:flex;align-items:center;gap:5px;">
+            <input type="radio" name="ab-scan-mode" value="parallel" checked> Parallel
+          </label>
+          <label style="cursor:pointer;font-size:13px;display:flex;align-items:center;gap:5px;">
+            <input type="radio" name="ab-scan-mode" value="sequential"> Sequential
+          </label>
+          <span id="ab-scan-info" style="font-size:12px;color:#888;margin-left:auto;"></span>
+        </div>
       </div>`;
 
     mainContainer.parentNode.insertBefore(panel, mainContainer);
@@ -2523,6 +2540,43 @@
           }
         });
       });
+
+    // ─── SCAN MODE SELECTOR (#55) ──────────────────────────────────────
+    // Restore the saved choice, then keep __scanMode in step with the radios.
+    // Changing it mid-cycle is fine: the gate is re-read at the top of every
+    // round, so the next round picks it up without a restart.
+    const scanInfo = document.getElementById("ab-scan-info");
+
+    function scanUpdateInfo() {
+      if (!scanInfo) return;
+      scanInfo.textContent = __scanMode === "sequential"
+        ? "One city at a time — no parallel"
+        : "2-at-once, auto-fallback when throttled";
+    }
+
+    chrome.storage.local.get(["__abScanMode"], (d) => {
+      __scanMode = d.__abScanMode === "sequential" ? "sequential" : "parallel";
+      const radio = document.querySelector(`input[name="ab-scan-mode"][value="${__scanMode}"]`);
+      if (radio) radio.checked = true;
+      scanUpdateInfo();
+    });
+
+    document.querySelectorAll('input[name="ab-scan-mode"]').forEach((r) => {
+      r.addEventListener("change", () => {
+        if (!r.checked) return;
+        __scanMode = r.value === "sequential" ? "sequential" : "parallel";
+        chrome.storage.local.set({ __abScanMode: __scanMode });
+        scanUpdateInfo();
+        log(`[scan] mode set to ${__scanMode.toUpperCase()} — applies from next round`);
+        // Leaving sequential: clear the bench/probe state so parallel gets a
+        // clean start rather than inheriting an old episode's penalties.
+        if (__scanMode === "parallel") {
+          __parallelBenchUntil = 0;
+          __parallelTimeoutStreak = 0;
+          __seqProbeChecks = 0;
+        }
+      });
+    });
 
     // ─── VPN ROTATION TOGGLE ───────────────────────────────────────────
     const vpnToggle = document.getElementById("ab-vpn-toggle");
@@ -3976,9 +4030,19 @@
     // captures the template, so we jump to parallel next round instead of checking all.
     const hadTemplateAtStart = !!scheduleTemplate;
     let didParallel = false;
+
+    // #55: re-read the mode from storage each round. The in-memory value resets
+    // on every page load, and the session keep-alive reloads the page roughly
+    // every 8 minutes — without this, a Sequential choice would silently revert
+    // to Parallel after a refresh. Also picks up a change made from another tab.
+    try {
+      const __sm = await new Promise((r) => chrome.storage.local.get(["__abScanMode"], r));
+      __scanMode = __sm.__abScanMode === "sequential" ? "sequential" : "parallel";
+    } catch { /* keep the current value if storage is unavailable */ }
     // #46 adaptive: after a parallel tarpit, do a short sequential probe (2 checks, escalating)
     // before re-trying parallel; reset the probe size the moment parallel succeeds.
-    if (USE_PARALLEL_SCAN && scheduleTemplate && !cycling.gracePeriod.active && __seqProbeChecks <= 0 && Date.now() >= __parallelBenchUntil) {
+    // #55: in Sequential mode the parallel block is skipped entirely.
+    if (__scanMode !== "sequential" && USE_PARALLEL_SCAN && scheduleTemplate && !cycling.gracePeriod.active && __seqProbeChecks <= 0 && Date.now() >= __parallelBenchUntil) {
       // Rotating batch: scan only the next PARALLEL_BATCH_SIZE cities from the STABLE selected list.
       // Keeps max 2 concurrent (fast, no tarpit, low rate); covers all selected over successive rounds.
       const stable = Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map((cb) => ({ value: cb.value, name: cb.dataset.name }));
@@ -4066,7 +4130,11 @@
     }
 
     // #46 probe mode: cap the sweep to __seqProbeChecks checks (else full sweep).
-    const seqCap = __seqProbeChecks > 0 ? Math.min(__seqProbeChecks, locations.length) : locations.length;
+    // #55: Sequential mode always sweeps every selected city (the probe cap is a
+    // parallel-recovery device and has no meaning when parallel is switched off).
+    const seqCap = (__scanMode !== "sequential" && __seqProbeChecks > 0)
+      ? Math.min(__seqProbeChecks, locations.length)
+      : locations.length;
     for (let i = 0; !didParallel && i < seqCap; i++) {
       if (!cycling.active) return;
 
@@ -4075,7 +4143,10 @@
       // Bootstrap fast-start (#38): once the first city has captured the template,
       // stop the slow sequential sweep — next round runs parallel. (Fallback rounds,
       // where a template already existed, still check every city.)
-      if (i > 0 && !hadTemplateAtStart && scheduleTemplate) {
+      // #55: this fast-start break exists only to jump to parallel next round.
+      // In Sequential mode it must not fire, or only the first city would ever
+      // be checked.
+      if (__scanMode !== "sequential" && i > 0 && !hadTemplateAtStart && scheduleTemplate) {
         log("[bootstrap] template captured on first city — switching to parallel next round");
         break;
       }
