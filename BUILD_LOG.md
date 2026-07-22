@@ -12,6 +12,16 @@ Format:
 
 ---
 
+## 2026-07-22 — Fix: it was still checking every 10 seconds sometimes (Issue #56 follow-up)
+**What was wrong:** Even after setting 15 seconds, the bot sometimes checked every 10 seconds instead.
+**Why:** There's a "grace period" — when the bot spots a slot but can't grab it in time, it hammers that one location for 5 quick rounds, hoping someone cancels again. That burst used a **hardcoded 10 seconds** and ignored whatever you'd set in the panel. It only kicks in after a near-miss, which is why it looked random.
+**The fix:** the grace period now uses your configured interval like everything else. Whatever number is in the box is the gap before every check, with no exceptions anywhere in the bot.
+**Also fixed:** a few leftover spots still assumed the old 30-second default. After the bot refreshed the page to keep the session alive, those could quietly reset your setting. They're all on 15 now.
+**Throttle switched off:** the bot's own self-imposed brake is now **disabled** so we can see the true speed. Protection against the website's actual rate-limit responses (the 429 errors) is completely untouched — that still detects and backs off as before. If we see 429s, one line switches the brake back on.
+**Trade-off worth knowing:** the grace-period burst is now 15 seconds instead of 10, so it's slightly slower at chasing a slot you just missed. If you'd rather keep that one burst fast, say so and I'll make it the exception.
+
+---
+
 ## 2026-07-22 — Steady 15-second checking, and a clearer round count (Issue #56)
 **What it does:** The bot now checks on an even beat — one check every **15 seconds**, over and over, in both Sequential and Parallel. No more long pause at the end of a lap.
 

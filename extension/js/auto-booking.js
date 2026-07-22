@@ -2271,6 +2271,11 @@
   // the "30 second gap". Parallel at 15s is 8 req/min and blew past the old hard
   // cap entirely. These sit far below the site's real ceiling; 429/1015 detection
   // plus exponential backoff remain the actual safety net.
+  // #56b Local throttle switched OFF for testing. The site's own documented
+  // ceiling is far above anything we produce, and the real protection is the
+  // 429/1015 detection with exponential backoff, which is untouched. Flip this
+  // back to false to re-arm the brake without touching anything else.
+  const DISABLE_RATE_THROTTLE = true;
   const RATE_SOFT_LIMIT = 10;  // req/min → add extra delay
   const RATE_HARD_LIMIT = 14;  // req/min → pause 60s
   const RATE_WINDOW_MS = 60000; // 60 second sliding window
@@ -2921,7 +2926,7 @@
         round: 0,  // fresh start
         startDate: document.getElementById("ab-start-date")?.value || "",
         endDate: document.getElementById("ab-end-date")?.value || "",
-        interval: document.getElementById("ab-interval")?.value || "30",
+        interval: document.getElementById("ab-interval")?.value || "15",
         locations: Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map(cb => cb.value),
         timestamp: Date.now(),
         reentryCount: reentry,
@@ -3204,7 +3209,7 @@
       round: cycling.round,
       startDate: document.getElementById("ab-start-date")?.value || "",
       endDate: document.getElementById("ab-end-date")?.value || "",
-      interval: document.getElementById("ab-interval")?.value || "30",
+      interval: document.getElementById("ab-interval")?.value || "15",
       locations: Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map(
         (cb) => cb.value
       ),
@@ -3295,7 +3300,7 @@
       active: true, round: 0,
       startDate: document.getElementById("ab-start-date")?.value || "",
       endDate: document.getElementById("ab-end-date")?.value || "",
-      interval: document.getElementById("ab-interval")?.value || "30",
+      interval: document.getElementById("ab-interval")?.value || "15",
       locations: Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map((cb) => cb.value),
       timestamp: Date.now(),
     };
@@ -3994,7 +3999,7 @@
     const startDate = document.getElementById("ab-start-date")?.value || "";
     const endDate = document.getElementById("ab-end-date")?.value || "";
     const interval =
-      parseInt(document.getElementById("ab-interval")?.value || "30") * 1000;
+      parseInt(document.getElementById("ab-interval")?.value || "15") * 1000;
 
     // On first round, wait for page to be fully ready (no "Loading..." state)
     if (cycling.round === 1) {
@@ -4223,7 +4228,7 @@
 
       // ── Rate throttle check before request ──
       const currentRate = rateTrackerGetRate();
-      if (currentRate >= RATE_HARD_LIMIT) {
+      if (!DISABLE_RATE_THROTTLE && currentRate >= RATE_HARD_LIMIT) {
         log(`Rate hard cap hit: ${currentRate} req/min — pausing 60s`);
         rateTrackerRecordError("hard_cap");
         chrome.storage.local.get(["loginDetails"], (d) => {
@@ -4235,7 +4240,7 @@
           setStatus(`⚠️ Rate cap (${currentRate}/min) — cooling ${s}s...`);
           await sleep(1000);
         }
-      } else if (currentRate >= RATE_SOFT_LIMIT) {
+      } else if (!DISABLE_RATE_THROTTLE && currentRate >= RATE_SOFT_LIMIT) {
         const extraWait = 15;
         log(`Rate soft throttle: ${currentRate} req/min — adding ${extraWait}s delay`);
         for (let s = extraWait; s > 0; s--) {
@@ -4503,7 +4508,10 @@
     // #56 The gap after the last check equals the gap between checks, so the
     // cadence stays even across the round boundary instead of stalling there.
     // Grace period keeps its own faster interval.
-    const waitMs = cycling.gracePeriod.active ? cycling.gracePeriod.fastIntervalMs : interval;
+    // #56b The grace period used to force a hardcoded 10s, ignoring the panel
+    // setting — that was the "sometimes 10 seconds" behaviour. It now uses the
+    // configured interval too, so the cadence is what you set, always.
+    const waitMs = interval;
     const sec = Math.round(waitMs / 1000);
     for (let s = sec; s > 0; s--) {
       if (!cycling.active || __abortAll) return;
@@ -5105,7 +5113,7 @@
             round: 0,
             startDate: "",
             endDate: "",
-            interval: "30",
+            interval: "15",   // #56b keep the re-login bootstrap on the new default
             locations: [],
             timestamp: Date.now()
           }));
