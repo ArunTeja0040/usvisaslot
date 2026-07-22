@@ -12,7 +12,8 @@
   // ─── PARALLEL SCAN config (A3) ──
   const USE_PARALLEL_SCAN = true;     // after template captured, replace sequential per-city loop
   const PARALLEL_STAGGER_MS = 300;    // ms between launching each city's request (gentle burst)
-  const PARALLEL_ROUND_MS = 20000;    // wait between parallel rounds (tunable in A4)
+  // PARALLEL_ROUND_MS removed in #56 — parallel now waits the same configurable
+  // interval as sequential, so the cadence is even across both modes.
   const PARALLEL_BATCH_SIZE = 2;      // cities scanned per round (rotating) — keeps 2 concurrent max (fast, no tarpit/429)
   const PARALLEL_FETCH_TIMEOUT_MS = 12000; // #46 abort a tarpitted request at 12s (don't wait ~60s)
   const SEQ_PROBE_BASE = 2;                // #46 after a tarpit, probe with this many sequential checks
@@ -25,6 +26,12 @@
   //                  in-page (no refresh), full sweep of every selected city.
   // Per machine (chrome.storage.local), switchable mid-cycle, applies next round.
   let __scanMode = "parallel";
+
+  // #56 a "round" = one full pass over every selected city. Sequential already
+  // worked that way; parallel counted a round per batch of 2. Counting cities
+  // covered (rather than watching the rotating cursor return to 0) is what makes
+  // an odd number of cities come out right.
+  let __coveredSinceRound = 0;
 
   const MAX_PARALLEL_STRIKES = 3;          // #46b after this many timeout rounds in a row, bench parallel
   const PARALLEL_BENCH_MS = 5 * 60 * 1000;  // #46b run pure-sequential this long before re-testing parallel
@@ -2259,8 +2266,13 @@
   };
 
   // ─── RATE TRACKER ───────────────────────────────────────────────
-  const RATE_SOFT_LIMIT = 4;   // req/min → add extra delay
-  const RATE_HARD_LIMIT = 6;   // req/min → pause 60s
+  // #56 raised from 4/6. A 15s sequential cadence is exactly 4 req/min, so the
+  // old soft limit fired on every check and added a flat +15s — that penalty WAS
+  // the "30 second gap". Parallel at 15s is 8 req/min and blew past the old hard
+  // cap entirely. These sit far below the site's real ceiling; 429/1015 detection
+  // plus exponential backoff remain the actual safety net.
+  const RATE_SOFT_LIMIT = 10;  // req/min → add extra delay
+  const RATE_HARD_LIMIT = 14;  // req/min → pause 60s
   const RATE_WINDOW_MS = 60000; // 60 second sliding window
   const RATE_FLUSH_INTERVAL_MS = 60000; // flush stats every 60s
 
@@ -2403,8 +2415,8 @@
           <label style="font-weight:600;font-size:13px;">End Date:
             <input type="date" id="ab-end-date" style="margin-left:4px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;">
           </label>
-          <label style="font-weight:600;font-size:13px;">Cycle Interval (sec):
-            <input type="number" id="ab-interval" value="30" min="10" max="300"
+          <label style="font-weight:600;font-size:13px;" title="Gap between every single check, in both scan modes">Seconds between checks:
+            <input type="number" id="ab-interval" value="15" min="5" max="300"
                    style="width:65px;margin-left:4px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;">
           </label>
         </div>
@@ -3908,13 +3920,8 @@
     });
   }
 
-  // Weighted random delay — mimics human attention patterns
-  function humanDelay() {
-    const r = Math.random();
-    if (r < 0.60) return 4 + Math.random() * 4;       // 60%: 4-8s (normal)
-    if (r < 0.85) return 8 + Math.random() * 7;       // 25%: 8-15s (reading)
-    return 15 + Math.random() * 10;                    // 15%: 15-25s (distracted)
-  }
+  // humanDelay() removed in #56 — the gap between checks is now the single
+  // configurable interval, identical before every check in both scan modes.
 
   // Human-activity simulation removed (#45) — synthetic events (isTrusted=false) didn't
   // fool Cloudflare and added log noise + a few seconds delay between checks.
@@ -3927,14 +3934,21 @@
     if (!cycling.active || __abortAll) return;
     if (await checkStopSignal()) return;
 
-    cycling.round++;
+    // #56 Only start a new round once every selected city has been covered.
+    // In sequential one pass sweeps them all, so this is every pass. In parallel
+    // a pass covers 2, so a 4-city run takes 2 passes per round.
+    const __selCount = document.querySelectorAll(".ab-loc-cb:checked").length || 1;
+    const __newRound = cycling.round === 0 || __coveredSinceRound >= __selCount;
+    if (__newRound) {
+      cycling.round++;
+      __coveredSinceRound = 0;
+      // Per-user counter tracks rounds, so it moves with them.
+      chrome.storage.local.get(["loginDetails"], (d) => {
+        const u = d.loginDetails?.username || "";
+        if (u) incrementUserCounter(u, "roundCount", 1);
+      });
+    }
     cycling.lastRefresh = Date.now();
-
-    // Increment per-user round counter
-    chrome.storage.local.get(["loginDetails"], (d) => {
-      const u = d.loginDetails?.username || "";
-      if (u) incrementUserCounter(u, "roundCount", 1);
-    });
 
     // Schedule idle gap and long break thresholds on first round
     if (cycling.nextIdleAt === 0) cycling.nextIdleAt = cycling.round + 4 + Math.floor(Math.random() * 5);   // 4-8 rounds
@@ -4050,6 +4064,7 @@
       const n = Math.min(PARALLEL_BATCH_SIZE, stable.length);
       for (let k = 0; k < n; k++) batch.push(stable[(__scanCursor + k) % stable.length]);
       __scanCursor = stable.length ? (__scanCursor + n) % stable.length : 0;
+      __coveredSinceRound += n;   // #56 count toward this round's full pass
       setStatus(`⚡ Parallel scanning ${batch.map((b) => b.name).join(", ")}...`);
       if (!__parallelStartedNotified) {
         __parallelStartedNotified = true;
@@ -4151,10 +4166,9 @@
         break;
       }
 
-      // Layer 1: Human-like weighted random delay between locations
+      // #56 Even cadence: the same gap before every check, no random spread.
       if (i > 0) {
-        const delaySec = humanDelay();
-        const totalSec = Math.ceil(delaySec);
+        const totalSec = Math.max(1, Math.round(interval / 1000));
         const rateInfo = rateTrackerGetRate();
         for (let s = totalSec; s > 0; s--) {
           if (!cycling.active || __abortAll) return;
@@ -4478,18 +4492,18 @@
       }
     }
 
+    // #56 Record how many cities this pass covered, so the round counter above
+    // ticks over only after a full pass.
+    if (!didParallel) __coveredSinceRound += seqCap;
+
     // All locations checked — wait and repeat
     if (!cycling.active) return;
 
     // Use fast interval during grace period, parallel interval after a parallel round, else normal jitter
-    let waitMs;
-    if (cycling.gracePeriod.active) {
-      waitMs = cycling.gracePeriod.fastIntervalMs;
-    } else if (didParallel) {
-      waitMs = PARALLEL_ROUND_MS * (0.85 + Math.random() * 0.3); // ~38-52s jitter
-    } else {
-      waitMs = interval * (0.8 + Math.random() * 0.4);
-    }
+    // #56 The gap after the last check equals the gap between checks, so the
+    // cadence stays even across the round boundary instead of stalling there.
+    // Grace period keeps its own faster interval.
+    const waitMs = cycling.gracePeriod.active ? cycling.gracePeriod.fastIntervalMs : interval;
     const sec = Math.round(waitMs / 1000);
     for (let s = sec; s > 0; s--) {
       if (!cycling.active || __abortAll) return;

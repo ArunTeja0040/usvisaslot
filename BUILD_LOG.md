@@ -12,6 +12,21 @@ Format:
 
 ---
 
+## 2026-07-22 — Steady 15-second checking, and a clearer round count (Issue #56)
+**What it does:** The bot now checks on an even beat — one check every **15 seconds**, over and over, in both Sequential and Parallel. No more long pause at the end of a lap.
+
+**Why the old way felt lumpy:** it used a *random* 4-to-25 second gap between cities, and then an **extra 24-36 second pause** once it had been through them all. So the wait you got was never the same twice.
+
+**The 30-second gap mystery — solved.** The bot has a built-in brake that slows it down if it thinks it's asking the website too often. That brake was set to trip at 4 checks per minute, and adds a flat 15 seconds when it does. A check every 15 seconds *is* exactly 4 per minute — so the brake fired on literally every check and turned your 15 seconds into 30. **The bot was slowing itself down.** The brake is now set at 10 per minute, so normal running no longer trips it.
+
+**Rounds now mean what you'd expect:** one round = the bot has checked **every** city you selected, once. Before, Parallel counted a round for every 2 cities, so with 4 cities you'd see the round number climb twice as fast as it should. Sequential was already correct. With 4 cities: Sequential finishes a round every 60 seconds, Parallel every 30.
+
+**What changed for you:** the "Cycle Interval" box is now **"Seconds between checks"** and starts at **15**. Whatever you put there is the gap before every single check — nothing else is added on top. You can still change it live per client.
+
+**One honest note on risk:** this does mean the bot asks the website a bit more often than before in Parallel (about 8 times a minute instead of 5-6). That's still far below what the site actually allows, and the existing protection against rate-limit errors is untouched — if the site starts pushing back, we lower the number. Sequential is unchanged in practice; it just spends its time checking instead of pausing.
+
+---
+
 ## 2026-07-22 — Choose Sequential or Parallel scanning from the booking panel (Issue #55)
 **What it does:** Adds a **Scan mode** choice to the booking panel, right under the VPN Rotation row: **Parallel** or **Sequential**.
 - **Parallel** (the default) is exactly what the bot does today — checks 2 cities at once, and if the website starts stalling it automatically slows to one-at-a-time, then speeds back up on its own.
