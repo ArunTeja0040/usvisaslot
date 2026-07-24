@@ -4,7 +4,7 @@ const SheetsSync = (function () {
   const HEADERS = [
     "S.No", "Username", "Password", "Dates (From to To)", "Location",
     "Security Que Ans 1", "Security Que Ans 2", "Security Que Ans 3",
-    "No of Applicants", "Price Agreed", "Category"
+    "No of Applicants", "Price Agreed", "Category", "Assigned To"
   ];
 
   // #57 Per-staff backup — same as HEADERS but WITHOUT "Price Agreed".
@@ -124,7 +124,7 @@ const SheetsSync = (function () {
     return { spreadsheetId: data.spreadsheetId, sheetName };
   }
 
-  function profileToRow(profile, index) {
+  function profileToRow(profile, index, assignee) {
     const qas = Object.entries(profile.securityQuestions || {});
     const qa1 = qas[0] ? qas[0][0] + ": " + qas[0][1] : "";
     const qa2 = qas[1] ? qas[1][0] + ": " + qas[1][1] : "";
@@ -143,15 +143,17 @@ const SheetsSync = (function () {
       profile.applicantCount || 1,
       profile.agreedPrice || "",
       profile.visaType || "",
+      assignee || "",
     ];
   }
 
-  async function fullSync(profiles) {
+  async function fullSync(profiles, assigneeByUsername) {
     const stored = await getStored();
     if (!stored.spreadsheetId || !stored.sheetName) throw new Error("Not connected");
 
     const rows = [HEADERS];
-    profiles.forEach((p, i) => rows.push(profileToRow(p, i)));
+    const amap = assigneeByUsername || {};
+    profiles.forEach((p, i) => rows.push(profileToRow(p, i, amap[p.username])));
 
     const range = `'${stored.sheetName}'!A1`;
     await api(
@@ -162,7 +164,7 @@ const SheetsSync = (function () {
       }
     );
 
-    const clearRange = `'${stored.sheetName}'!A${rows.length + 1}:K1000`;
+    const clearRange = `'${stored.sheetName}'!A${rows.length + 1}:L1000`;
     await api(
       `https://sheets.googleapis.com/v4/spreadsheets/${stored.spreadsheetId}/values/${encodeURIComponent(clearRange)}:clear`,
       { method: "POST", body: JSON.stringify({}) }

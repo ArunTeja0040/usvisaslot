@@ -13,6 +13,8 @@ Format:
 ---
 
 ## 2026-07-22 — Per-staff backup sheet (safe to share) (Issue #57)
+
+**Your own sheet too:** your master Sheets Sync now has an extra **"Assigned To"** column at the end, showing which staff member each client belongs to (blank = still yours). So you can filter your own sheet by person at a glance. Your sheet keeps everything it had, including pricing — it's yours. Only the separate per-staff backup sheets leave out the price.
 **What it does:** In the Staff popup, each person now has an **Export backup** button. It makes a Google Sheet containing **only that person's assigned clients**, and gives you a link to send them.
 
 **The danger it avoids — please read this:** if you had just filtered your main sheet and sent the link, it would NOT have worked the way you'd expect. A shared Google Sheet link opens the **whole** sheet — the other person can clear your filter and see everything. Your main sheet has every client's **password, security answers, and the price you charge**. Sending that link would have handed one staff member the lot. So this build makes a **separate sheet per person** instead — the only kind of link that's safe to share.

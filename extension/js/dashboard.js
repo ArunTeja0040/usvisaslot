@@ -844,7 +844,7 @@
       const connected = await SheetsSync.isConnected();
       if (!connected) return;
       const profiles = await new Promise(r => chrome.storage.local.get(["userProfilesList"], d => r(d.userProfilesList || [])));
-      await SheetsSync.fullSync(profiles);
+      await SheetsSync.fullSync(profiles, await buildAssigneeMap());
       console.log("[Dashboard] Auto-synced to Google Sheets");
     } catch (e) {
       console.warn("[Dashboard] Sheets auto-sync failed:", e.message);
@@ -889,7 +889,7 @@
       await SheetsSync.connect(sheetUrl);
       const profiles = await new Promise(r => chrome.storage.local.get(["userProfilesList"], d => r(d.userProfilesList || [])));
       btn.textContent = "Syncing...";
-      const sheetId = await SheetsSync.fullSync(profiles);
+      const sheetId = await SheetsSync.fullSync(profiles, await buildAssigneeMap());
       alert(`Synced ${profiles.length} profiles to Google Sheets!`);
       await updateSheetsUI();
       window.open(SheetsSync.getSheetUrl(sheetId), "_blank");
@@ -2109,6 +2109,24 @@
         startCloudPolling();
       }
     }).catch(() => {});
+  }
+
+  // #57 username -> assigned staff name, for the owner's master sheet. Sourced
+  // from cloud data (the local profile list may not carry the assignment).
+  async function buildAssigneeMap() {
+    const map = {};
+    try {
+      if (!SUPA || !SUPA.isReady() || (SUPA.isStaffMode && SUPA.isStaffMode())) return map;
+      const staff = await SUPA.listStaff();
+      const nameById = {};
+      staff.forEach((st) => { nameById[st.id] = st.name; });
+      cloudProfiles.forEach((cp) => {
+        if (cp.assignedStaffId && nameById[cp.assignedStaffId]) map[cp.username] = nameById[cp.assignedStaffId];
+      });
+    } catch (e) {
+      console.warn("[Dashboard] buildAssigneeMap failed:", e.message);
+    }
+    return map;
   }
 
   // ─── STAFF VIEW (#53) ──────────────────────────────────────────────
