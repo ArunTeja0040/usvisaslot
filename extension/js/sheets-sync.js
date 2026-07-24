@@ -6,6 +6,14 @@ const SheetsSync = (function () {
     "Security Que Ans 1", "Security Que Ans 2", "Security Que Ans 3",
     "No of Applicants", "Price Agreed", "Category"
   ];
+
+  // #57 Per-staff backup — same as HEADERS but WITHOUT "Price Agreed".
+  // Pricing must never leave the owner's side.
+  const STAFF_HEADERS = [
+    "S.No", "Username", "Password", "Dates (From to To)", "Location",
+    "Security Que Ans 1", "Security Que Ans 2", "Security Que Ans 3",
+    "No of Applicants", "Category"
+  ];
   const STORAGE_KEY = "__sheets_spreadsheet_id";
   const STORAGE_SHEET_NAME = "__sheets_sheet_name";
 
@@ -209,5 +217,93 @@ const SheetsSync = (function () {
     await new Promise((r) => chrome.storage.local.remove([STORAGE_KEY, STORAGE_SHEET_NAME], r));
   }
 
-  return { connect, fullSync, isConnected, getSpreadsheetId, getSheetUrl, disconnect, getToken };
+  // ── PER-STAFF BACKUP (#57) ────────────────────────────────────────
+  // A SEPARATE spreadsheet per staff member — the only unit that is safe to
+  // share, since a Sheet link exposes the whole file. Never writes to, and
+  // never reads, the owner's master-sheet config.
+
+  function staffProfileToRow(profile, index) {
+    const qas = Object.entries(profile.securityQuestions || {});
+    const qa1 = qas[0] ? qas[0][0] + ": " + qas[0][1] : "";
+    const qa2 = qas[1] ? qas[1][0] + ": " + qas[1][1] : "";
+    const qa3 = qas[2] ? qas[2][0] + ": " + qas[2][1] : "";
+    const locations = (profile.locations || []).join(", ");
+    const dates = (profile.startDate && profile.endDate)
+      ? profile.startDate + " to " + profile.endDate
+      : (profile.startDate || profile.endDate || "");
+    return [
+      index + 1,
+      profile.username || "",
+      profile.password || "",
+      dates,
+      locations,
+      qa1, qa2, qa3,
+      profile.applicantCount || 1,
+      profile.visaType || "",   // no price
+    ];
+  }
+
+  async function createStaffSpreadsheet(staffName) {
+    const data = await api("https://sheets.googleapis.com/v4/spreadsheets", {
+      method: "POST",
+      body: JSON.stringify({
+        properties: { title: `SlotHunter — ${staffName} clients` },
+        sheets: [{
+          properties: { title: "Clients" },
+          data: [{
+            startRow: 0, startColumn: 0,
+            rowData: [{
+              values: STAFF_HEADERS.map((h) => ({
+                userEnteredValue: { stringValue: h },
+                userEnteredFormat: { textFormat: { bold: true } },
+              })),
+            }],
+          }],
+        }],
+      }),
+    });
+    return data.spreadsheetId;
+  }
+
+  // profiles = ONLY this staff member's assigned clients (owner filters before
+  // calling). Reuses the same spreadsheet on re-export so a shared link stays
+  // valid and just refreshes.
+  async function exportStaffBackup(staffId, staffName, profiles) {
+    await getToken(true);
+    const key = `__sheets_staff_${staffId}`;
+    const stored = await new Promise((r) => chrome.storage.local.get([key], (d) => r(d[key] || null)));
+
+    let spreadsheetId = stored;
+    // Verify a stored sheet still exists; if it was deleted, make a new one.
+    if (spreadsheetId) {
+      try {
+        await api(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=spreadsheetId`);
+      } catch {
+        spreadsheetId = null;
+      }
+    }
+    if (!spreadsheetId) {
+      spreadsheetId = await createStaffSpreadsheet(staffName);
+      await new Promise((r) => chrome.storage.local.set({ [key]: spreadsheetId }, r));
+    }
+
+    const rows = [STAFF_HEADERS];
+    profiles.forEach((p, i) => rows.push(staffProfileToRow(p, i)));
+
+    const range = `'Clients'!A1`;
+    await api(
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(range)}?valueInputOption=RAW`,
+      { method: "PUT", body: JSON.stringify({ range, majorDimension: "ROWS", values: rows }) }
+    );
+    // Clear any leftover rows from a previous, longer export.
+    const clearRange = `'Clients'!A${rows.length + 1}:J1000`;
+    await api(
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(clearRange)}:clear`,
+      { method: "POST", body: JSON.stringify({}) }
+    ).catch(() => {});
+
+    return { spreadsheetId, url: getSheetUrl(spreadsheetId), count: profiles.length };
+  }
+
+  return { connect, fullSync, isConnected, getSpreadsheetId, getSheetUrl, disconnect, getToken, exportStaffBackup };
 })();

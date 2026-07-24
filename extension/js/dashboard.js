@@ -2262,6 +2262,7 @@
         <button class="btn btn-small btn-gray staff-copy-key" data-id="${esc(st.id)}" title="Copy this person's key">Copy key</button>
         <button class="btn btn-small staff-rename" data-id="${esc(st.id)}" style="background:#34495e;color:#fff;">Rename</button>
         <button class="btn btn-small staff-newkey" data-id="${esc(st.id)}" style="background:#d35400;color:#fff;" title="Issue a new key — the old one stops working immediately">New key</button>
+        <button class="btn btn-small staff-backup" data-id="${esc(st.id)}" style="background:#16a085;color:#fff;" title="Google Sheet backup of the clients assigned to this person (no pricing)">Export backup</button>
         <button class="btn btn-small ${st.active ? "btn-red" : "btn-green"} staff-toggle" data-id="${esc(st.id)}" data-active="${st.active}">${st.active ? "Deactivate" : "Reactivate"}</button>
       </div>`).join("");
   }
@@ -2378,6 +2379,23 @@
       const row = await SUPA.regenerateStaffKey(id);
       await refreshStaff();
       window.prompt("New key for " + staff.name + " — copy and send it:", row.staff_key);
+      return;
+    }
+
+    if (btn.classList.contains("staff-backup")) {
+      if (typeof SheetsSync === "undefined") { window.alert("Google Sheets sync is not available."); return; }
+      const clients = cloudProfiles.filter((cp) => cp.assignedStaffId === id);
+      if (clients.length === 0) { window.alert(staff.name + " has no clients assigned yet - nothing to back up."); return; }
+      const orig = btn.textContent;
+      btn.textContent = "Exporting..."; btn.disabled = true;
+      try {
+        const res = await SheetsSync.exportStaffBackup(id, staff.name, clients);
+        btn.textContent = orig; btn.disabled = false;
+        window.prompt("Backup ready - " + res.count + " client(s) for " + staff.name + ".\n\nShare THIS link (it holds only " + staff.name + "'s clients, no pricing):", res.url);
+      } catch (e) {
+        btn.textContent = orig; btn.disabled = false;
+        window.alert("Backup failed: " + e.message);
+      }
       return;
     }
 

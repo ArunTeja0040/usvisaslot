@@ -12,6 +12,19 @@ Format:
 
 ---
 
+## 2026-07-22 — Per-staff backup sheet (safe to share) (Issue #57)
+**What it does:** In the Staff popup, each person now has an **Export backup** button. It makes a Google Sheet containing **only that person's assigned clients**, and gives you a link to send them.
+
+**The danger it avoids — please read this:** if you had just filtered your main sheet and sent the link, it would NOT have worked the way you'd expect. A shared Google Sheet link opens the **whole** sheet — the other person can clear your filter and see everything. Your main sheet has every client's **password, security answers, and the price you charge**. Sending that link would have handed one staff member the lot. So this build makes a **separate sheet per person** instead — the only kind of link that's safe to share.
+
+**What's in it:** their clients' username, password, security answers, dates, cities, applicants and category. **No pricing** — that never leaves your side. (You chose to include passwords so they have a full offline backup of their own clients.)
+
+**What changed for you:** open Staff → **Export backup** next to a person → it builds their sheet and shows the link → copy it and send. Run it again later and the **same** link just refreshes with the latest data, so you can share one link once. Someone with no clients yet → it tells you, instead of making an empty sheet.
+
+**Still treat the link as sensitive** — it does contain their clients' logins. Only send it to that staff member.
+
+---
+
 ## 2026-07-22 — Fix: it was still checking every 10 seconds sometimes (Issue #56 follow-up)
 **What was wrong:** Even after setting 15 seconds, the bot sometimes checked every 10 seconds instead.
 **Why:** There's a "grace period" — when the bot spots a slot but can't grab it in time, it hammers that one location for 5 quick rounds, hoping someone cancels again. That burst used a **hardcoded 10 seconds** and ignored whatever you'd set in the panel. It only kicks in after a near-miss, which is why it looked random.
