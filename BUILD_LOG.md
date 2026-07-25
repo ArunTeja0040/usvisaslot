@@ -12,6 +12,17 @@ Format:
 
 ---
 
+## 2026-07-25 — Staff Google Sheet + Sync Sheet buttons (Issue #57)
+**What it does:** In the Staff popup, each person now has two buttons:
+- **Staff Google Sheet** — makes a Google Sheet with only that person's assigned clients and gives you the link to forward. They open it and see their IDs.
+- **Sync Sheet** — after you assign or edit their clients, click this to push the latest data into that same sheet. The link never changes; the contents refresh.
+**No pricing** goes into the staff sheet — that stays with you.
+**Why Google (not a file):** you wanted a link you send once that stays current. A downloaded file can't update itself; a Google Sheet can. Your production Sheets Sync already works, so these use the same connection.
+**Testing:** this only works where Google Sheets is connected — your production extension. The test build can't reach Google (its extension ID isn't registered), so this is tested directly in production.
+**Booking engine untouched:** this is dashboard-only. It does not change anything about how the bot books, the scan speed, or the rate limits.
+
+---
+
 ## 2026-07-22 — Per-staff backup sheet (safe to share) (Issue #57)
 
 **Your own sheet too:** your master Sheets Sync now has an extra **"Assigned To"** column at the end, showing which staff member each client belongs to (blank = still yours). So you can filter your own sheet by person at a glance. Your sheet keeps everything it had, including pricing — it's yours. Only the separate per-staff backup sheets leave out the price.

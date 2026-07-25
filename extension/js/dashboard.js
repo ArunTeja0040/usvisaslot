@@ -2280,7 +2280,8 @@
         <button class="btn btn-small btn-gray staff-copy-key" data-id="${esc(st.id)}" title="Copy this person's key">Copy key</button>
         <button class="btn btn-small staff-rename" data-id="${esc(st.id)}" style="background:#34495e;color:#fff;">Rename</button>
         <button class="btn btn-small staff-newkey" data-id="${esc(st.id)}" style="background:#d35400;color:#fff;" title="Issue a new key — the old one stops working immediately">New key</button>
-        <button class="btn btn-small staff-backup" data-id="${esc(st.id)}" style="background:#16a085;color:#fff;" title="Google Sheet backup of the clients assigned to this person (no pricing)">Export backup</button>
+        <button class="btn btn-small staff-sheet" data-id="${esc(st.id)}" style="background:#0f9d58;color:#fff;" title="Create a Google Sheet of this person\u0027s clients and get a link to send them">Staff Google Sheet</button>
+        <button class="btn btn-small staff-sheet-sync" data-id="${esc(st.id)}" style="background:#4285f4;color:#fff;" title="Refresh this person\u0027s sheet with the latest assigned clients">Sync Sheet</button>
         <button class="btn btn-small ${st.active ? "btn-red" : "btn-green"} staff-toggle" data-id="${esc(st.id)}" data-active="${st.active}">${st.active ? "Deactivate" : "Reactivate"}</button>
       </div>`).join("");
   }
@@ -2400,19 +2401,37 @@
       return;
     }
 
-    if (btn.classList.contains("staff-backup")) {
-      if (typeof SheetsSync === "undefined") { window.alert("Google Sheets sync is not available."); return; }
+    // #57 Staff Google Sheet — create the sheet + hand back a link to forward.
+    if (btn.classList.contains("staff-sheet")) {
+      if (typeof SheetsSync === "undefined") { window.alert("Google Sheets is not available."); return; }
       const clients = cloudProfiles.filter((cp) => cp.assignedStaffId === id);
-      if (clients.length === 0) { window.alert(staff.name + " has no clients assigned yet - nothing to back up."); return; }
+      if (clients.length === 0) { window.alert(staff.name + " has no clients assigned yet - assign some first."); return; }
       const orig = btn.textContent;
-      btn.textContent = "Exporting..."; btn.disabled = true;
+      btn.textContent = "Creating..."; btn.disabled = true;
       try {
         const res = await SheetsSync.exportStaffBackup(id, staff.name, clients);
         btn.textContent = orig; btn.disabled = false;
-        window.prompt("Backup ready - " + res.count + " client(s) for " + staff.name + ".\n\nShare THIS link (it holds only " + staff.name + "'s clients, no pricing):", res.url);
+        window.prompt("Google Sheet ready - " + res.count + " client(s) for " + staff.name + ".\n\nSend THIS link to " + staff.name + " (only their clients, no pricing):", res.url);
       } catch (e) {
         btn.textContent = orig; btn.disabled = false;
-        window.alert("Backup failed: " + e.message);
+        window.alert("Could not create the sheet: " + e.message);
+      }
+      return;
+    }
+
+    // #57 Sync Sheet — push the latest assigned clients into the same sheet.
+    if (btn.classList.contains("staff-sheet-sync")) {
+      if (typeof SheetsSync === "undefined") { window.alert("Google Sheets is not available."); return; }
+      const clients = cloudProfiles.filter((cp) => cp.assignedStaffId === id);
+      const orig = btn.textContent;
+      btn.textContent = "Syncing..."; btn.disabled = true;
+      try {
+        const res = await SheetsSync.exportStaffBackup(id, staff.name, clients);
+        btn.textContent = orig; btn.disabled = false;
+        window.prompt("Synced - " + res.count + " client(s) now in " + staff.name + "'s sheet (same link):", res.url);
+      } catch (e) {
+        btn.textContent = orig; btn.disabled = false;
+        window.alert("Sync failed: " + e.message);
       }
       return;
     }
