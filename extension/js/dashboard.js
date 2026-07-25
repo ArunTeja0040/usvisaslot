@@ -861,7 +861,11 @@
       if (connected) {
         btn.textContent = "🔄 Sync Sheets";
         btn.style.background = "#0f9d58";
-        urlInput.style.display = "none";
+        // #57b Keep the URL box available for the owner even when connected, so a
+        // different sheet can be linked by pasting its URL. Hiding it here was
+        // why a pasted URL never reached connect(). Staff never see it.
+        urlInput.style.display = staffMode ? "none" : "inline-block";
+        urlInput.placeholder = "Paste a URL here to switch sheets";
         const sheetId = await SheetsSync.getSpreadsheetId();
         if (sheetId) {
           link.href = SheetsSync.getSheetUrl(sheetId);
@@ -871,7 +875,7 @@
         btn.textContent = "📊 Sheets Sync";
         btn.style.background = "#4285f4";
         link.style.display = "none";
-        urlInput.style.display = "inline-block";
+        urlInput.style.display = staffMode ? "none" : "inline-block";
       }
     } catch { /* not connected */ }
   }
