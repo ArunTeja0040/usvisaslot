@@ -2608,6 +2608,7 @@
           __parallelBenchUntil = 0;
           __parallelTimeoutStreak = 0;
           __seqProbeChecks = 0;
+          __coveredSinceRound = 0;   // #56d start the full-pass counter clean
         }
       });
     });
@@ -3959,19 +3960,27 @@
     if (!cycling.active || __abortAll) return;
     if (await checkStopSignal()) return;
 
-    // #56 Only start a new round once every selected city has been covered.
-    // In sequential one pass sweeps them all, so this is every pass. In parallel
-    // a pass covers 2, so a 4-city run takes 2 passes per round.
-    const __selCount = document.querySelectorAll(".ab-loc-cb:checked").length || 1;
-    const __newRound = cycling.round === 0 || __coveredSinceRound >= __selCount;
-    if (__newRound) {
-      cycling.round++;
-      __coveredSinceRound = 0;
-      // Per-user counter tracks rounds, so it moves with them.
-      chrome.storage.local.get(["loginDetails"], (d) => {
-        const u = d.loginDetails?.username || "";
-        if (u) incrementUserCounter(u, "roundCount", 1);
-      });
+    // #55 Re-read scan mode at the very top (survives the keep-alive reload),
+    // so round counting below can branch on it.
+    try {
+      const __sm = await new Promise((r) => chrome.storage.local.get(["__abScanMode"], r));
+      __scanMode = __sm.__abScanMode === "sequential" ? "sequential" : "parallel";
+    } catch { /* keep current value */ }
+
+    // Round counting:
+    //  - Parallel: a round = one full pass over every selected city (unchanged).
+    //  - Sequential: a round = EACH city — incremented in the sweep loop below.
+    if (__scanMode !== "sequential") {
+      const __selCount = document.querySelectorAll(".ab-loc-cb:checked").length || 1;
+      const __newRound = cycling.round === 0 || __coveredSinceRound >= __selCount;
+      if (__newRound) {
+        cycling.round++;
+        __coveredSinceRound = 0;
+        chrome.storage.local.get(["loginDetails"], (d) => {
+          const u = d.loginDetails?.username || "";
+          if (u) incrementUserCounter(u, "roundCount", 1);
+        });
+      }
     }
     cycling.lastRefresh = Date.now();
 
@@ -4019,8 +4028,10 @@
     const startDate = document.getElementById("ab-start-date")?.value || "";
     const endDate = document.getElementById("ab-end-date")?.value || "";
 
-    // On first round, wait for page to be fully ready (no "Loading..." state)
-    if (cycling.round === 1) {
+    // On the first pass, wait for the page to be ready (no "Loading..." state).
+    // Sequential leaves round at 0 until the first city, so use <= 1. Harmless if
+    // it runs again while already loaded (the check breaks immediately).
+    if (cycling.round <= 1) {
       let loadWait = 0;
       while (loadWait < 20) {
         const calText = document.querySelector(".col-sm-8, .atlas_section, #page_form")?.textContent || "";
@@ -4067,15 +4078,7 @@
     // captures the template, so we jump to parallel next round instead of checking all.
     const hadTemplateAtStart = !!scheduleTemplate;
     let didParallel = false;
-
-    // #55: re-read the mode from storage each round. The in-memory value resets
-    // on every page load, and the session keep-alive reloads the page roughly
-    // every 8 minutes — without this, a Sequential choice would silently revert
-    // to Parallel after a refresh. Also picks up a change made from another tab.
-    try {
-      const __sm = await new Promise((r) => chrome.storage.local.get(["__abScanMode"], r));
-      __scanMode = __sm.__abScanMode === "sequential" ? "sequential" : "parallel";
-    } catch { /* keep the current value if storage is unavailable */ }
+    // (#55 scan mode is now re-read at the top of runCycleLoop.)
     // #46 adaptive: after a parallel tarpit, do a short sequential probe (2 checks, escalating)
     // before re-trying parallel; reset the probe size the moment parallel succeeds.
     // #55: in Sequential mode the parallel block is skipped entirely.
@@ -4269,6 +4272,14 @@
       }
 
       const loc = locations[i];
+      // #56d Sequential counts EACH city as a round.
+      if (__scanMode === "sequential") {
+        cycling.round++;
+        chrome.storage.local.get(["loginDetails"], (d) => {
+          const u = d.loginDetails?.username || "";
+          if (u) incrementUserCounter(u, "roundCount", 1);
+        });
+      }
       const rateDisplay = rateTrackerGetRate();
       setStatus(`Checking ${loc.name} (${i + 1}/${locations.length}) — ${rateDisplay} req/min`);
 
@@ -4514,10 +4525,6 @@
         };
       }
     }
-
-    // #56 Record how many cities this pass covered, so the round counter above
-    // ticks over only after a full pass.
-    if (!didParallel) __coveredSinceRound += seqCap;
 
     // All locations checked — wait and repeat
     if (!cycling.active) return;

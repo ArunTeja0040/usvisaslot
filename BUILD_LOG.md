@@ -12,6 +12,13 @@ Format:
 
 ---
 
+## 2026-07-26 — Sequential counts each city as a round; parallel unchanged (Issue #56)
+**What changed:** In **Sequential** mode the **Round** number now goes up by **one for every city** checked. With 4 cities: Mumbai → Round 1, Delhi → Round 2, Chennai → Round 3, Hyderabad → Round 4, then round 5, 6, 7, 8 on the next lap.
+**Parallel is untouched** — it still counts a round once per full pass over all your cities, exactly as it did.
+**Nothing else changed:** same random 10-15s gap, same booking, same auto-submit. Only the sequential round-number meaning changed, as requested.
+
+---
+
 ## 2026-07-25 — Random 10-15s gap between checks, set from the booking panel (Issue #56)
 **What changed:** The single "Seconds between checks" box is now **two boxes — Min and Max** (default **10** and **15**). Before every check, the bot waits a **fresh random amount between them** — e.g. 11s, then 14s, then 10s.
 
