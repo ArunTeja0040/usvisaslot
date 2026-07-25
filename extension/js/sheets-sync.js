@@ -124,8 +124,17 @@ const SheetsSync = (function () {
     return { spreadsheetId: data.spreadsheetId, sheetName };
   }
 
+  // #57b Security questions arrive in two shapes: an ARRAY of {question, answer}
+  // (cloud/pullProfiles) or a {question: answer} OBJECT (local). Normalise both
+  // to [[q, a], ...] so a row never renders "0: [object Object]".
+  function sqPairs(sq) {
+    if (!sq) return [];
+    if (Array.isArray(sq)) return sq.map((o) => [o.question, o.answer]);
+    return Object.entries(sq);
+  }
+
   function profileToRow(profile, index, assignee) {
-    const qas = Object.entries(profile.securityQuestions || {});
+    const qas = sqPairs(profile.securityQuestions);
     const qa1 = qas[0] ? qas[0][0] + ": " + qas[0][1] : "";
     const qa2 = qas[1] ? qas[1][0] + ": " + qas[1][1] : "";
     const qa3 = qas[2] ? qas[2][0] + ": " + qas[2][1] : "";
@@ -225,7 +234,7 @@ const SheetsSync = (function () {
   // never reads, the owner's master-sheet config.
 
   function staffProfileToRow(profile, index) {
-    const qas = Object.entries(profile.securityQuestions || {});
+    const qas = sqPairs(profile.securityQuestions);
     const qa1 = qas[0] ? qas[0][0] + ": " + qas[0][1] : "";
     const qa2 = qas[1] ? qas[1][0] + ": " + qas[1][1] : "";
     const qa3 = qas[2] ? qas[2][0] + ": " + qas[2][1] : "";
