@@ -33,6 +33,21 @@
   // an odd number of cities come out right.
   let __coveredSinceRound = 0;
 
+  // #56c Gap before every check is a fresh random value between the Min and Max
+  // boxes in the booking panel (default 10-15s). Random (not a flat interval)
+  // keeps the cadence from looking like a metronome. Used for both the city-to-
+  // city gap in sequential and the between-batch gap in parallel.
+  function gapBoundsMs() {
+    let lo = parseInt(document.getElementById("ab-gap-min")?.value || "10", 10) || 10;
+    let hi = parseInt(document.getElementById("ab-gap-max")?.value || "15", 10) || 15;
+    if (hi < lo) { const t = lo; lo = hi; hi = t; }   // tolerate swapped entry
+    return { lo: lo * 1000, hi: hi * 1000 };
+  }
+  function randomGapMs() {
+    const { lo, hi } = gapBoundsMs();
+    return lo + Math.random() * (hi - lo);
+  }
+
   const MAX_PARALLEL_STRIKES = 3;          // #46b after this many timeout rounds in a row, bench parallel
   const PARALLEL_BENCH_MS = 5 * 60 * 1000;  // #46b run pure-sequential this long before re-testing parallel
   let __parallelTimeoutStreak = 0;         // #46b consecutive parallel rounds that fully timed out
@@ -2420,9 +2435,11 @@
           <label style="font-weight:600;font-size:13px;">End Date:
             <input type="date" id="ab-end-date" style="margin-left:4px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;">
           </label>
-          <label style="font-weight:600;font-size:13px;" title="Gap between every single check, in both scan modes">Seconds between checks:
-            <input type="number" id="ab-interval" value="15" min="5" max="300"
-                   style="width:65px;margin-left:4px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;">
+          <label style="font-weight:600;font-size:13px;" title="Random gap before every check (both scan modes). A fresh value between Min and Max is picked each time.">Gap between checks (sec):
+            <input type="number" id="ab-gap-min" value="10" min="3" max="300"
+                   style="width:52px;margin-left:4px;padding:4px 6px;border:1px solid #ccc;border-radius:4px;"> to
+            <input type="number" id="ab-gap-max" value="15" min="3" max="300"
+                   style="width:52px;padding:4px 6px;border:1px solid #ccc;border-radius:4px;">
           </label>
         </div>
         <div style="margin-bottom:12px;">
@@ -2926,7 +2943,8 @@
         round: 0,  // fresh start
         startDate: document.getElementById("ab-start-date")?.value || "",
         endDate: document.getElementById("ab-end-date")?.value || "",
-        interval: document.getElementById("ab-interval")?.value || "15",
+        gapMin: document.getElementById("ab-gap-min")?.value || "10",
+        gapMax: document.getElementById("ab-gap-max")?.value || "15",
         locations: Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map(cb => cb.value),
         timestamp: Date.now(),
         reentryCount: reentry,
@@ -3209,7 +3227,8 @@
       round: cycling.round,
       startDate: document.getElementById("ab-start-date")?.value || "",
       endDate: document.getElementById("ab-end-date")?.value || "",
-      interval: document.getElementById("ab-interval")?.value || "15",
+      gapMin: document.getElementById("ab-gap-min")?.value || "10",
+        gapMax: document.getElementById("ab-gap-max")?.value || "15",
       locations: Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map(
         (cb) => cb.value
       ),
@@ -3300,7 +3319,8 @@
       active: true, round: 0,
       startDate: document.getElementById("ab-start-date")?.value || "",
       endDate: document.getElementById("ab-end-date")?.value || "",
-      interval: document.getElementById("ab-interval")?.value || "15",
+      gapMin: document.getElementById("ab-gap-min")?.value || "10",
+        gapMax: document.getElementById("ab-gap-max")?.value || "15",
       locations: Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map((cb) => cb.value),
       timestamp: Date.now(),
     };
@@ -3998,8 +4018,6 @@
 
     const startDate = document.getElementById("ab-start-date")?.value || "";
     const endDate = document.getElementById("ab-end-date")?.value || "";
-    const interval =
-      parseInt(document.getElementById("ab-interval")?.value || "15") * 1000;
 
     // On first round, wait for page to be fully ready (no "Loading..." state)
     if (cycling.round === 1) {
@@ -4171,9 +4189,9 @@
         break;
       }
 
-      // #56 Even cadence: the same gap before every check, no random spread.
+      // #56c Random gap before every check (10-15s by default, from the panel).
       if (i > 0) {
-        const totalSec = Math.max(1, Math.round(interval / 1000));
+        const totalSec = Math.max(1, Math.round(randomGapMs() / 1000));
         const rateInfo = rateTrackerGetRate();
         for (let s = totalSec; s > 0; s--) {
           if (!cycling.active || __abortAll) return;
@@ -4504,14 +4522,10 @@
     // All locations checked — wait and repeat
     if (!cycling.active) return;
 
-    // Use fast interval during grace period, parallel interval after a parallel round, else normal jitter
-    // #56 The gap after the last check equals the gap between checks, so the
-    // cadence stays even across the round boundary instead of stalling there.
-    // Grace period keeps its own faster interval.
-    // #56b The grace period used to force a hardcoded 10s, ignoring the panel
-    // setting — that was the "sometimes 10 seconds" behaviour. It now uses the
-    // configured interval too, so the cadence is what you set, always.
-    const waitMs = interval;
+    // #56c Gap after the last check = a fresh random gap, same as between checks,
+    // so the cadence stays even (and non-metronome) across the round boundary.
+    // Grace period uses the same random gap — no special faster interval.
+    const waitMs = randomGapMs();
     const sec = Math.round(waitMs / 1000);
     for (let s = sec; s > 0; s--) {
       if (!cycling.active || __abortAll) return;
@@ -4759,10 +4773,12 @@
       // Restore form values
       const sd = document.getElementById("ab-start-date");
       const ed = document.getElementById("ab-end-date");
-      const iv = document.getElementById("ab-interval");
+      const gmin = document.getElementById("ab-gap-min");
+      const gmax = document.getElementById("ab-gap-max");
       if (sd) sd.value = savedState.startDate;
       if (ed) ed.value = savedState.endDate;
-      if (iv) iv.value = savedState.interval;
+      if (gmin && savedState.gapMin) gmin.value = savedState.gapMin;
+      if (gmax && savedState.gapMax) gmax.value = savedState.gapMax;
 
       // Restore location checkboxes
       if (savedState.locations?.length > 0) {
@@ -5113,7 +5129,7 @@
             round: 0,
             startDate: "",
             endDate: "",
-            interval: "15",   // #56b keep the re-login bootstrap on the new default
+            gapMin: "10", gapMax: "15",   // #56c re-login bootstrap defaults
             locations: [],
             timestamp: Date.now()
           }));

@@ -12,6 +12,21 @@ Format:
 
 ---
 
+## 2026-07-25 — Random 10-15s gap between checks, set from the booking panel (Issue #56)
+**What changed:** The single "Seconds between checks" box is now **two boxes — Min and Max** (default **10** and **15**). Before every check, the bot waits a **fresh random amount between them** — e.g. 11s, then 14s, then 10s.
+
+**Applies to both modes:**
+- **Sequential:** checks a city, waits a random 10-15s, checks the next city — **no page reload** — and auto-submits the moment an in-range date shows.
+- **Parallel:** each batch runs, then waits a random 10-15s before the next.
+
+**Nothing else touches the timing** — no extra pauses, no self-throttle penalty. Just the one random gap you set.
+
+**Why random instead of a flat 15s:** a perfectly even beat looks like a machine. A random 10-15s gap is both what you asked for and the safer, more human-like pattern.
+
+**Still off (unchanged):** the bot's own preventive brake is still disabled, so the only thing pacing it is this random gap. Its reactive protection (detecting a real "too many requests" block and backing off) is untouched. If accounts start getting blocked, widen the gap (e.g. 15-25) or we turn the brake back on.
+
+---
+
 ## 2026-07-25 — Two sheet-sync fixes: edits now sync, and no more duplicate master sheet (Issue #57)
 **Problem 1 — staff sheet ignored profile edits:** When you changed a client's dates or cities and hit **Sync Sheet**, the staff sheet didn't pick it up (only re-assigning a client did). The sync was writing from a cached copy of your clients that only refreshes every 30 seconds, so a just-made edit wasn't in it yet.
 **Fix:** the sheet now pulls your latest data the instant you click, before writing — so edits show immediately.
