@@ -844,7 +844,7 @@
       const connected = await SheetsSync.isConnected();
       if (!connected) return;
       const profiles = await new Promise(r => chrome.storage.local.get(["userProfilesList"], d => r(d.userProfilesList || [])));
-      await SheetsSync.fullSync(profiles);
+      await SheetsSync.fullSync(profiles, await buildAssigneeMap());
       console.log("[Dashboard] Auto-synced to Google Sheets");
     } catch (e) {
       console.warn("[Dashboard] Sheets auto-sync failed:", e.message);
@@ -889,7 +889,7 @@
       await SheetsSync.connect(sheetUrl);
       const profiles = await new Promise(r => chrome.storage.local.get(["userProfilesList"], d => r(d.userProfilesList || [])));
       btn.textContent = "Syncing...";
-      const sheetId = await SheetsSync.fullSync(profiles);
+      const sheetId = await SheetsSync.fullSync(profiles, await buildAssigneeMap());
       alert(`Synced ${profiles.length} profiles to Google Sheets!`);
       await updateSheetsUI();
       window.open(SheetsSync.getSheetUrl(sheetId), "_blank");
@@ -2111,6 +2111,24 @@
     }).catch(() => {});
   }
 
+  // #57 username -> assigned staff name, for the owner's master sheet. Sourced
+  // from cloud data (the local profile list may not carry the assignment).
+  async function buildAssigneeMap() {
+    const map = {};
+    try {
+      if (!SUPA || !SUPA.isReady() || (SUPA.isStaffMode && SUPA.isStaffMode())) return map;
+      const staff = await SUPA.listStaff();
+      const nameById = {};
+      staff.forEach((st) => { nameById[st.id] = st.name; });
+      cloudProfiles.forEach((cp) => {
+        if (cp.assignedStaffId && nameById[cp.assignedStaffId]) map[cp.username] = nameById[cp.assignedStaffId];
+      });
+    } catch (e) {
+      console.warn("[Dashboard] buildAssigneeMap failed:", e.message);
+    }
+    return map;
+  }
+
   // ─── STAFF VIEW (#53) ──────────────────────────────────────────────
   // What a staff member is allowed to do is decided by the database, not by
   // this file. Hiding controls here is about not showing someone buttons that
@@ -2262,6 +2280,8 @@
         <button class="btn btn-small btn-gray staff-copy-key" data-id="${esc(st.id)}" title="Copy this person's key">Copy key</button>
         <button class="btn btn-small staff-rename" data-id="${esc(st.id)}" style="background:#34495e;color:#fff;">Rename</button>
         <button class="btn btn-small staff-newkey" data-id="${esc(st.id)}" style="background:#d35400;color:#fff;" title="Issue a new key — the old one stops working immediately">New key</button>
+        <button class="btn btn-small staff-sheet" data-id="${esc(st.id)}" style="background:#0f9d58;color:#fff;" title="Create a Google Sheet of this person\u0027s clients and get a link to send them">Staff Google Sheet</button>
+        <button class="btn btn-small staff-sheet-sync" data-id="${esc(st.id)}" style="background:#4285f4;color:#fff;" title="Refresh this person\u0027s sheet with the latest assigned clients">Sync Sheet</button>
         <button class="btn btn-small ${st.active ? "btn-red" : "btn-green"} staff-toggle" data-id="${esc(st.id)}" data-active="${st.active}">${st.active ? "Deactivate" : "Reactivate"}</button>
       </div>`).join("");
   }
@@ -2378,6 +2398,41 @@
       const row = await SUPA.regenerateStaffKey(id);
       await refreshStaff();
       window.prompt("New key for " + staff.name + " — copy and send it:", row.staff_key);
+      return;
+    }
+
+    // #57 Staff Google Sheet — create the sheet + hand back a link to forward.
+    if (btn.classList.contains("staff-sheet")) {
+      if (typeof SheetsSync === "undefined") { window.alert("Google Sheets is not available."); return; }
+      const clients = cloudProfiles.filter((cp) => cp.assignedStaffId === id);
+      if (clients.length === 0) { window.alert(staff.name + " has no clients assigned yet - assign some first."); return; }
+      const orig = btn.textContent;
+      btn.textContent = "Creating..."; btn.disabled = true;
+      try {
+        const res = await SheetsSync.exportStaffBackup(id, staff.name, clients);
+        btn.textContent = orig; btn.disabled = false;
+        window.prompt("Google Sheet ready - " + res.count + " client(s) for " + staff.name + ".\n\nSend THIS link to " + staff.name + " (only their clients, no pricing):", res.url);
+      } catch (e) {
+        btn.textContent = orig; btn.disabled = false;
+        window.alert("Could not create the sheet: " + e.message);
+      }
+      return;
+    }
+
+    // #57 Sync Sheet — push the latest assigned clients into the same sheet.
+    if (btn.classList.contains("staff-sheet-sync")) {
+      if (typeof SheetsSync === "undefined") { window.alert("Google Sheets is not available."); return; }
+      const clients = cloudProfiles.filter((cp) => cp.assignedStaffId === id);
+      const orig = btn.textContent;
+      btn.textContent = "Syncing..."; btn.disabled = true;
+      try {
+        const res = await SheetsSync.exportStaffBackup(id, staff.name, clients);
+        btn.textContent = orig; btn.disabled = false;
+        window.prompt("Synced - " + res.count + " client(s) now in " + staff.name + "'s sheet (same link):", res.url);
+      } catch (e) {
+        btn.textContent = orig; btn.disabled = false;
+        window.alert("Sync failed: " + e.message);
+      }
       return;
     }
 
