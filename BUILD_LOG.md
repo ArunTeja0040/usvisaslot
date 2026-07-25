@@ -12,6 +12,20 @@ Format:
 
 ---
 
+## 2026-07-25 — Two sheet-sync fixes: edits now sync, and no more duplicate master sheet (Issue #57)
+**Problem 1 — staff sheet ignored profile edits:** When you changed a client's dates or cities and hit **Sync Sheet**, the staff sheet didn't pick it up (only re-assigning a client did). The sync was writing from a cached copy of your clients that only refreshes every 30 seconds, so a just-made edit wasn't in it yet.
+**Fix:** the sheet now pulls your latest data the instant you click, before writing — so edits show immediately.
+
+**Problem 2 — the main "Sheets Sync" made a NEW sheet instead of updating the old one:** The link to your master sheet is remembered in the browser, and it's separate for each extension. If that link goes missing (most often because it was set up on one extension and clicked on another), the tool thinks nothing is linked and creates a fresh sheet.
+**Fix (two parts):**
+- **To reuse your old sheet now:** paste its URL into the "Paste Google Sheet URL" box and click Sheets Sync once — that re-links it, and future syncs update it.
+- **So it can't happen again:** before ever creating a new sheet, it now **asks you** ("create new, or paste your existing URL?") instead of silently making a duplicate.
+Also: the master sync now pulls your latest data before writing, same as the staff sheets.
+
+**Booking engine untouched** — dashboard only.
+
+---
+
 ## 2026-07-25 — Staff Google Sheet + Sync Sheet buttons (Issue #57)
 **What it does:** In the Staff popup, each person now has two buttons:
 - **Staff Google Sheet** — makes a Google Sheet with only that person's assigned clients and gives you the link to forward. They open it and see their IDs.

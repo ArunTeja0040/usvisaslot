@@ -886,8 +886,19 @@
     btn.disabled = true;
     try {
       const sheetUrl = urlInput.value.trim() || null;
+      // #57b Guard against silently making a DUPLICATE. If nothing is linked and
+      // no URL was pasted, ask first — the usual cause is a lost link (e.g.
+      // switching extensions), and the fix is to paste the existing sheet URL.
+      if (!sheetUrl) {
+        const existing = await SheetsSync.getSpreadsheetId();
+        if (!existing) {
+          if (!confirm("No Google Sheet is linked yet.\n\nOK = create a NEW sheet.\nCancel = paste your existing sheet's URL in the box to reuse it.")) {
+            btn.textContent = origText; btn.disabled = false; return;
+          }
+        }
+      }
       await SheetsSync.connect(sheetUrl);
-      const profiles = await new Promise(r => chrome.storage.local.get(["userProfilesList"], d => r(d.userProfilesList || [])));
+      const profiles = await freshProfiles();
       btn.textContent = "Syncing...";
       const sheetId = await SheetsSync.fullSync(profiles, await buildAssigneeMap());
       alert(`Synced ${profiles.length} profiles to Google Sheets!`);
@@ -2111,6 +2122,21 @@
     }).catch(() => {});
   }
 
+  // #57b Pull the latest profiles right before a sheet write, so edits made
+  // seconds earlier are included (the cached cloudProfiles only refreshes on the
+  // 30s poll). Also updates the global cache so the dashboard reflects them.
+  async function freshProfiles() {
+    if (SUPA && SUPA.isReady()) {
+      try {
+        const p = await SUPA.pullProfiles();
+        if (Array.isArray(p)) { cloudProfiles = p; return p; }
+      } catch (e) {
+        console.warn("[Dashboard] freshProfiles pull failed:", e.message);
+      }
+    }
+    return cloudProfiles;
+  }
+
   // #57 username -> assigned staff name, for the owner's master sheet. Sourced
   // from cloud data (the local profile list may not carry the assignment).
   async function buildAssigneeMap() {
@@ -2404,11 +2430,12 @@
     // #57 Staff Google Sheet — create the sheet + hand back a link to forward.
     if (btn.classList.contains("staff-sheet")) {
       if (typeof SheetsSync === "undefined") { window.alert("Google Sheets is not available."); return; }
-      const clients = cloudProfiles.filter((cp) => cp.assignedStaffId === id);
-      if (clients.length === 0) { window.alert(staff.name + " has no clients assigned yet - assign some first."); return; }
       const orig = btn.textContent;
       btn.textContent = "Creating..."; btn.disabled = true;
       try {
+        const fresh = await freshProfiles();
+        const clients = fresh.filter((cp) => cp.assignedStaffId === id);
+        if (clients.length === 0) { btn.textContent = orig; btn.disabled = false; window.alert(staff.name + " has no clients assigned yet - assign some first."); return; }
         const res = await SheetsSync.exportStaffBackup(id, staff.name, clients);
         btn.textContent = orig; btn.disabled = false;
         window.prompt("Google Sheet ready - " + res.count + " client(s) for " + staff.name + ".\n\nSend THIS link to " + staff.name + " (only their clients, no pricing):", res.url);
@@ -2422,10 +2449,11 @@
     // #57 Sync Sheet — push the latest assigned clients into the same sheet.
     if (btn.classList.contains("staff-sheet-sync")) {
       if (typeof SheetsSync === "undefined") { window.alert("Google Sheets is not available."); return; }
-      const clients = cloudProfiles.filter((cp) => cp.assignedStaffId === id);
       const orig = btn.textContent;
       btn.textContent = "Syncing..."; btn.disabled = true;
       try {
+        const fresh = await freshProfiles();
+        const clients = fresh.filter((cp) => cp.assignedStaffId === id);
         const res = await SheetsSync.exportStaffBackup(id, staff.name, clients);
         btn.textContent = orig; btn.disabled = false;
         window.prompt("Synced - " + res.count + " client(s) now in " + staff.name + "'s sheet (same link):", res.url);
