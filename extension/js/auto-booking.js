@@ -2286,11 +2286,12 @@
   // the "30 second gap". Parallel at 15s is 8 req/min and blew past the old hard
   // cap entirely. These sit far below the site's real ceiling; 429/1015 detection
   // plus exponential backoff remain the actual safety net.
-  // #56b Local throttle switched OFF for testing. The site's own documented
-  // ceiling is far above anything we produce, and the real protection is the
-  // 429/1015 detection with exponential backoff, which is untouched. Flip this
-  // back to false to re-arm the brake without touching anything else.
-  const DISABLE_RATE_THROTTLE = true;
+  // #56d Local throttle ON (owner chose the safe profile for live clients). At a
+  // 10-15s gap sequential runs ~4/min and parallel ~8-12/min, so the soft limit
+  // is rarely reached; it only bites if a run ever speeds up, protecting the
+  // account. 429/1015 detection + exponential backoff remain on top. Flip to
+  // true to disable the local brake for speed testing.
+  const DISABLE_RATE_THROTTLE = false;
   const RATE_SOFT_LIMIT = 10;  // req/min → add extra delay
   const RATE_HARD_LIMIT = 14;  // req/min → pause 60s
   const RATE_WINDOW_MS = 60000; // 60 second sliding window
