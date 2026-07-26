@@ -12,13 +12,42 @@
   // ─── PARALLEL SCAN config (A3) ──
   const USE_PARALLEL_SCAN = true;     // after template captured, replace sequential per-city loop
   const PARALLEL_STAGGER_MS = 300;    // ms between launching each city's request (gentle burst)
-  const PARALLEL_ROUND_MS = 20000;    // wait between parallel rounds (tunable in A4)
+  // PARALLEL_ROUND_MS removed in #56 — parallel now waits the same configurable
+  // interval as sequential, so the cadence is even across both modes.
   const PARALLEL_BATCH_SIZE = 2;      // cities scanned per round (rotating) — keeps 2 concurrent max (fast, no tarpit/429)
   const PARALLEL_FETCH_TIMEOUT_MS = 12000; // #46 abort a tarpitted request at 12s (don't wait ~60s)
   const SEQ_PROBE_BASE = 2;                // #46 after a tarpit, probe with this many sequential checks
   const SEQ_PROBE_MAX = 10;                // #46 cap the escalating probe size
   let __seqProbeChecks = 0;                // #46 sequential checks to do before re-trying parallel
   let __seqBackoff = 2;                    // #46 current probe size — escalates on repeat tarpits, resets on success
+  // #55 scan mode — operator override for the automatic scan strategy.
+  //   "parallel"   = default, today's behaviour (parallel + auto fallback + bench)
+  //   "sequential" = never parallel; one city at a time, switching the dropdown
+  //                  in-page (no refresh), full sweep of every selected city.
+  // Per machine (chrome.storage.local), switchable mid-cycle, applies next round.
+  let __scanMode = "parallel";
+
+  // #56 a "round" = one full pass over every selected city. Sequential already
+  // worked that way; parallel counted a round per batch of 2. Counting cities
+  // covered (rather than watching the rotating cursor return to 0) is what makes
+  // an odd number of cities come out right.
+  let __coveredSinceRound = 0;
+
+  // #56c Gap before every check is a fresh random value between the Min and Max
+  // boxes in the booking panel (default 10-15s). Random (not a flat interval)
+  // keeps the cadence from looking like a metronome. Used for both the city-to-
+  // city gap in sequential and the between-batch gap in parallel.
+  function gapBoundsMs() {
+    let lo = parseInt(document.getElementById("ab-gap-min")?.value || "10", 10) || 10;
+    let hi = parseInt(document.getElementById("ab-gap-max")?.value || "15", 10) || 15;
+    if (hi < lo) { const t = lo; lo = hi; hi = t; }   // tolerate swapped entry
+    return { lo: lo * 1000, hi: hi * 1000 };
+  }
+  function randomGapMs() {
+    const { lo, hi } = gapBoundsMs();
+    return lo + Math.random() * (hi - lo);
+  }
+
   const MAX_PARALLEL_STRIKES = 3;          // #46b after this many timeout rounds in a row, bench parallel
   const PARALLEL_BENCH_MS = 5 * 60 * 1000;  // #46b run pure-sequential this long before re-testing parallel
   let __parallelTimeoutStreak = 0;         // #46b consecutive parallel rounds that fully timed out
@@ -2252,8 +2281,19 @@
   };
 
   // ─── RATE TRACKER ───────────────────────────────────────────────
-  const RATE_SOFT_LIMIT = 4;   // req/min → add extra delay
-  const RATE_HARD_LIMIT = 6;   // req/min → pause 60s
+  // #56 raised from 4/6. A 15s sequential cadence is exactly 4 req/min, so the
+  // old soft limit fired on every check and added a flat +15s — that penalty WAS
+  // the "30 second gap". Parallel at 15s is 8 req/min and blew past the old hard
+  // cap entirely. These sit far below the site's real ceiling; 429/1015 detection
+  // plus exponential backoff remain the actual safety net.
+  // #56d Local throttle ON (owner chose the safe profile for live clients). At a
+  // 10-15s gap sequential runs ~4/min and parallel ~8-12/min, so the soft limit
+  // is rarely reached; it only bites if a run ever speeds up, protecting the
+  // account. 429/1015 detection + exponential backoff remain on top. Flip to
+  // true to disable the local brake for speed testing.
+  const DISABLE_RATE_THROTTLE = false;
+  const RATE_SOFT_LIMIT = 10;  // req/min → add extra delay
+  const RATE_HARD_LIMIT = 14;  // req/min → pause 60s
   const RATE_WINDOW_MS = 60000; // 60 second sliding window
   const RATE_FLUSH_INTERVAL_MS = 60000; // flush stats every 60s
 
@@ -2396,9 +2436,11 @@
           <label style="font-weight:600;font-size:13px;">End Date:
             <input type="date" id="ab-end-date" style="margin-left:4px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;">
           </label>
-          <label style="font-weight:600;font-size:13px;">Cycle Interval (sec):
-            <input type="number" id="ab-interval" value="30" min="10" max="300"
-                   style="width:65px;margin-left:4px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;">
+          <label style="font-weight:600;font-size:13px;" title="Random gap before every check (both scan modes). A fresh value between Min and Max is picked each time.">Gap between checks (sec):
+            <input type="number" id="ab-gap-min" value="10" min="3" max="300"
+                   style="width:52px;margin-left:4px;padding:4px 6px;border:1px solid #ccc;border-radius:4px;"> to
+            <input type="number" id="ab-gap-max" value="15" min="3" max="300"
+                   style="width:52px;padding:4px 6px;border:1px solid #ccc;border-radius:4px;">
           </label>
         </div>
         <div style="margin-bottom:12px;">
@@ -2433,6 +2475,16 @@
           </label>
           <span id="ab-vpn-label" style="font-size:13px;font-weight:600;color:#7f8c8d;">OFF</span>
           <span id="ab-vpn-info" style="font-size:12px;color:#888;margin-left:auto;"></span>
+        </div>
+        <div id="ab-scan-section" style="margin-top:8px;padding:10px 12px;background:#f0f4f8;border:1px solid #d5dfe8;border-radius:6px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+          <strong style="font-size:13px;color:#1a5276;">Scan mode:</strong>
+          <label style="cursor:pointer;font-size:13px;display:flex;align-items:center;gap:5px;">
+            <input type="radio" name="ab-scan-mode" value="parallel" checked> Parallel
+          </label>
+          <label style="cursor:pointer;font-size:13px;display:flex;align-items:center;gap:5px;">
+            <input type="radio" name="ab-scan-mode" value="sequential"> Sequential
+          </label>
+          <span id="ab-scan-info" style="font-size:12px;color:#888;margin-left:auto;"></span>
         </div>
       </div>`;
 
@@ -2523,6 +2575,44 @@
           }
         });
       });
+
+    // ─── SCAN MODE SELECTOR (#55) ──────────────────────────────────────
+    // Restore the saved choice, then keep __scanMode in step with the radios.
+    // Changing it mid-cycle is fine: the gate is re-read at the top of every
+    // round, so the next round picks it up without a restart.
+    const scanInfo = document.getElementById("ab-scan-info");
+
+    function scanUpdateInfo() {
+      if (!scanInfo) return;
+      scanInfo.textContent = __scanMode === "sequential"
+        ? "One city at a time — no parallel"
+        : "2-at-once, auto-fallback when throttled";
+    }
+
+    chrome.storage.local.get(["__abScanMode"], (d) => {
+      __scanMode = d.__abScanMode === "sequential" ? "sequential" : "parallel";
+      const radio = document.querySelector(`input[name="ab-scan-mode"][value="${__scanMode}"]`);
+      if (radio) radio.checked = true;
+      scanUpdateInfo();
+    });
+
+    document.querySelectorAll('input[name="ab-scan-mode"]').forEach((r) => {
+      r.addEventListener("change", () => {
+        if (!r.checked) return;
+        __scanMode = r.value === "sequential" ? "sequential" : "parallel";
+        chrome.storage.local.set({ __abScanMode: __scanMode });
+        scanUpdateInfo();
+        log(`[scan] mode set to ${__scanMode.toUpperCase()} — applies from next round`);
+        // Leaving sequential: clear the bench/probe state so parallel gets a
+        // clean start rather than inheriting an old episode's penalties.
+        if (__scanMode === "parallel") {
+          __parallelBenchUntil = 0;
+          __parallelTimeoutStreak = 0;
+          __seqProbeChecks = 0;
+          __coveredSinceRound = 0;   // #56d start the full-pass counter clean
+        }
+      });
+    });
 
     // ─── VPN ROTATION TOGGLE ───────────────────────────────────────────
     const vpnToggle = document.getElementById("ab-vpn-toggle");
@@ -2855,7 +2945,8 @@
         round: 0,  // fresh start
         startDate: document.getElementById("ab-start-date")?.value || "",
         endDate: document.getElementById("ab-end-date")?.value || "",
-        interval: document.getElementById("ab-interval")?.value || "30",
+        gapMin: document.getElementById("ab-gap-min")?.value || "10",
+        gapMax: document.getElementById("ab-gap-max")?.value || "15",
         locations: Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map(cb => cb.value),
         timestamp: Date.now(),
         reentryCount: reentry,
@@ -3138,7 +3229,8 @@
       round: cycling.round,
       startDate: document.getElementById("ab-start-date")?.value || "",
       endDate: document.getElementById("ab-end-date")?.value || "",
-      interval: document.getElementById("ab-interval")?.value || "30",
+      gapMin: document.getElementById("ab-gap-min")?.value || "10",
+        gapMax: document.getElementById("ab-gap-max")?.value || "15",
       locations: Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map(
         (cb) => cb.value
       ),
@@ -3229,7 +3321,8 @@
       active: true, round: 0,
       startDate: document.getElementById("ab-start-date")?.value || "",
       endDate: document.getElementById("ab-end-date")?.value || "",
-      interval: document.getElementById("ab-interval")?.value || "30",
+      gapMin: document.getElementById("ab-gap-min")?.value || "10",
+        gapMax: document.getElementById("ab-gap-max")?.value || "15",
       locations: Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map((cb) => cb.value),
       timestamp: Date.now(),
     };
@@ -3854,13 +3947,8 @@
     });
   }
 
-  // Weighted random delay — mimics human attention patterns
-  function humanDelay() {
-    const r = Math.random();
-    if (r < 0.60) return 4 + Math.random() * 4;       // 60%: 4-8s (normal)
-    if (r < 0.85) return 8 + Math.random() * 7;       // 25%: 8-15s (reading)
-    return 15 + Math.random() * 10;                    // 15%: 15-25s (distracted)
-  }
+  // humanDelay() removed in #56 — the gap between checks is now the single
+  // configurable interval, identical before every check in both scan modes.
 
   // Human-activity simulation removed (#45) — synthetic events (isTrusted=false) didn't
   // fool Cloudflare and added log noise + a few seconds delay between checks.
@@ -3873,14 +3961,29 @@
     if (!cycling.active || __abortAll) return;
     if (await checkStopSignal()) return;
 
-    cycling.round++;
-    cycling.lastRefresh = Date.now();
+    // #55 Re-read scan mode at the very top (survives the keep-alive reload),
+    // so round counting below can branch on it.
+    try {
+      const __sm = await new Promise((r) => chrome.storage.local.get(["__abScanMode"], r));
+      __scanMode = __sm.__abScanMode === "sequential" ? "sequential" : "parallel";
+    } catch { /* keep current value */ }
 
-    // Increment per-user round counter
-    chrome.storage.local.get(["loginDetails"], (d) => {
-      const u = d.loginDetails?.username || "";
-      if (u) incrementUserCounter(u, "roundCount", 1);
-    });
+    // Round counting:
+    //  - Parallel: a round = one full pass over every selected city (unchanged).
+    //  - Sequential: a round = EACH city — incremented in the sweep loop below.
+    if (__scanMode !== "sequential") {
+      const __selCount = document.querySelectorAll(".ab-loc-cb:checked").length || 1;
+      const __newRound = cycling.round === 0 || __coveredSinceRound >= __selCount;
+      if (__newRound) {
+        cycling.round++;
+        __coveredSinceRound = 0;
+        chrome.storage.local.get(["loginDetails"], (d) => {
+          const u = d.loginDetails?.username || "";
+          if (u) incrementUserCounter(u, "roundCount", 1);
+        });
+      }
+    }
+    cycling.lastRefresh = Date.now();
 
     // Schedule idle gap and long break thresholds on first round
     if (cycling.nextIdleAt === 0) cycling.nextIdleAt = cycling.round + 4 + Math.floor(Math.random() * 5);   // 4-8 rounds
@@ -3925,11 +4028,11 @@
 
     const startDate = document.getElementById("ab-start-date")?.value || "";
     const endDate = document.getElementById("ab-end-date")?.value || "";
-    const interval =
-      parseInt(document.getElementById("ab-interval")?.value || "30") * 1000;
 
-    // On first round, wait for page to be fully ready (no "Loading..." state)
-    if (cycling.round === 1) {
+    // On the first pass, wait for the page to be ready (no "Loading..." state).
+    // Sequential leaves round at 0 until the first city, so use <= 1. Harmless if
+    // it runs again while already loaded (the check breaks immediately).
+    if (cycling.round <= 1) {
       let loadWait = 0;
       while (loadWait < 20) {
         const calText = document.querySelector(".col-sm-8, .atlas_section, #page_form")?.textContent || "";
@@ -3976,9 +4079,11 @@
     // captures the template, so we jump to parallel next round instead of checking all.
     const hadTemplateAtStart = !!scheduleTemplate;
     let didParallel = false;
+    // (#55 scan mode is now re-read at the top of runCycleLoop.)
     // #46 adaptive: after a parallel tarpit, do a short sequential probe (2 checks, escalating)
     // before re-trying parallel; reset the probe size the moment parallel succeeds.
-    if (USE_PARALLEL_SCAN && scheduleTemplate && !cycling.gracePeriod.active && __seqProbeChecks <= 0 && Date.now() >= __parallelBenchUntil) {
+    // #55: in Sequential mode the parallel block is skipped entirely.
+    if (__scanMode !== "sequential" && USE_PARALLEL_SCAN && scheduleTemplate && !cycling.gracePeriod.active && __seqProbeChecks <= 0 && Date.now() >= __parallelBenchUntil) {
       // Rotating batch: scan only the next PARALLEL_BATCH_SIZE cities from the STABLE selected list.
       // Keeps max 2 concurrent (fast, no tarpit, low rate); covers all selected over successive rounds.
       const stable = Array.from(document.querySelectorAll(".ab-loc-cb:checked")).map((cb) => ({ value: cb.value, name: cb.dataset.name }));
@@ -3986,6 +4091,7 @@
       const n = Math.min(PARALLEL_BATCH_SIZE, stable.length);
       for (let k = 0; k < n; k++) batch.push(stable[(__scanCursor + k) % stable.length]);
       __scanCursor = stable.length ? (__scanCursor + n) % stable.length : 0;
+      __coveredSinceRound += n;   // #56 count toward this round's full pass
       setStatus(`⚡ Parallel scanning ${batch.map((b) => b.name).join(", ")}...`);
       if (!__parallelStartedNotified) {
         __parallelStartedNotified = true;
@@ -4066,7 +4172,11 @@
     }
 
     // #46 probe mode: cap the sweep to __seqProbeChecks checks (else full sweep).
-    const seqCap = __seqProbeChecks > 0 ? Math.min(__seqProbeChecks, locations.length) : locations.length;
+    // #55: Sequential mode always sweeps every selected city (the probe cap is a
+    // parallel-recovery device and has no meaning when parallel is switched off).
+    const seqCap = (__scanMode !== "sequential" && __seqProbeChecks > 0)
+      ? Math.min(__seqProbeChecks, locations.length)
+      : locations.length;
     for (let i = 0; !didParallel && i < seqCap; i++) {
       if (!cycling.active) return;
 
@@ -4075,15 +4185,17 @@
       // Bootstrap fast-start (#38): once the first city has captured the template,
       // stop the slow sequential sweep — next round runs parallel. (Fallback rounds,
       // where a template already existed, still check every city.)
-      if (i > 0 && !hadTemplateAtStart && scheduleTemplate) {
+      // #55: this fast-start break exists only to jump to parallel next round.
+      // In Sequential mode it must not fire, or only the first city would ever
+      // be checked.
+      if (__scanMode !== "sequential" && i > 0 && !hadTemplateAtStart && scheduleTemplate) {
         log("[bootstrap] template captured on first city — switching to parallel next round");
         break;
       }
 
-      // Layer 1: Human-like weighted random delay between locations
+      // #56c Random gap before every check (10-15s by default, from the panel).
       if (i > 0) {
-        const delaySec = humanDelay();
-        const totalSec = Math.ceil(delaySec);
+        const totalSec = Math.max(1, Math.round(randomGapMs() / 1000));
         const rateInfo = rateTrackerGetRate();
         for (let s = totalSec; s > 0; s--) {
           if (!cycling.active || __abortAll) return;
@@ -4138,7 +4250,7 @@
 
       // ── Rate throttle check before request ──
       const currentRate = rateTrackerGetRate();
-      if (currentRate >= RATE_HARD_LIMIT) {
+      if (!DISABLE_RATE_THROTTLE && currentRate >= RATE_HARD_LIMIT) {
         log(`Rate hard cap hit: ${currentRate} req/min — pausing 60s`);
         rateTrackerRecordError("hard_cap");
         chrome.storage.local.get(["loginDetails"], (d) => {
@@ -4150,7 +4262,7 @@
           setStatus(`⚠️ Rate cap (${currentRate}/min) — cooling ${s}s...`);
           await sleep(1000);
         }
-      } else if (currentRate >= RATE_SOFT_LIMIT) {
+      } else if (!DISABLE_RATE_THROTTLE && currentRate >= RATE_SOFT_LIMIT) {
         const extraWait = 15;
         log(`Rate soft throttle: ${currentRate} req/min — adding ${extraWait}s delay`);
         for (let s = extraWait; s > 0; s--) {
@@ -4161,6 +4273,14 @@
       }
 
       const loc = locations[i];
+      // #56d Sequential counts EACH city as a round.
+      if (__scanMode === "sequential") {
+        cycling.round++;
+        chrome.storage.local.get(["loginDetails"], (d) => {
+          const u = d.loginDetails?.username || "";
+          if (u) incrementUserCounter(u, "roundCount", 1);
+        });
+      }
       const rateDisplay = rateTrackerGetRate();
       setStatus(`Checking ${loc.name} (${i + 1}/${locations.length}) — ${rateDisplay} req/min`);
 
@@ -4410,15 +4530,10 @@
     // All locations checked — wait and repeat
     if (!cycling.active) return;
 
-    // Use fast interval during grace period, parallel interval after a parallel round, else normal jitter
-    let waitMs;
-    if (cycling.gracePeriod.active) {
-      waitMs = cycling.gracePeriod.fastIntervalMs;
-    } else if (didParallel) {
-      waitMs = PARALLEL_ROUND_MS * (0.85 + Math.random() * 0.3); // ~38-52s jitter
-    } else {
-      waitMs = interval * (0.8 + Math.random() * 0.4);
-    }
+    // #56c Gap after the last check = a fresh random gap, same as between checks,
+    // so the cadence stays even (and non-metronome) across the round boundary.
+    // Grace period uses the same random gap — no special faster interval.
+    const waitMs = randomGapMs();
     const sec = Math.round(waitMs / 1000);
     for (let s = sec; s > 0; s--) {
       if (!cycling.active || __abortAll) return;
@@ -4666,10 +4781,12 @@
       // Restore form values
       const sd = document.getElementById("ab-start-date");
       const ed = document.getElementById("ab-end-date");
-      const iv = document.getElementById("ab-interval");
+      const gmin = document.getElementById("ab-gap-min");
+      const gmax = document.getElementById("ab-gap-max");
       if (sd) sd.value = savedState.startDate;
       if (ed) ed.value = savedState.endDate;
-      if (iv) iv.value = savedState.interval;
+      if (gmin && savedState.gapMin) gmin.value = savedState.gapMin;
+      if (gmax && savedState.gapMax) gmax.value = savedState.gapMax;
 
       // Restore location checkboxes
       if (savedState.locations?.length > 0) {
@@ -5020,7 +5137,7 @@
             round: 0,
             startDate: "",
             endDate: "",
-            interval: "30",
+            gapMin: "10", gapMax: "15",   // #56c re-login bootstrap defaults
             locations: [],
             timestamp: Date.now()
           }));
