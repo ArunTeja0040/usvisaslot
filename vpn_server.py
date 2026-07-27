@@ -22,7 +22,14 @@ import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = 5124
-ROTATE_INTERVAL = 600  # 10 minutes
+ROTATE_MIN = 900   # 15 minutes
+ROTATE_MAX = 1200  # 20 minutes
+
+
+def next_interval():
+    # Random 15-20 min between rotations so the IP-change cadence is not a
+    # fixed, predictable pattern.
+    return random.randint(ROTATE_MIN, ROTATE_MAX)
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -125,7 +132,7 @@ def rotation_loop():
     except Exception as e:
         print(f"[VPN] Rotation error: {e}")
     if auto_rotating:
-        rotation_timer = threading.Timer(ROTATE_INTERVAL, rotation_loop)
+        rotation_timer = threading.Timer(next_interval(), rotation_loop)
         rotation_timer.daemon = True
         rotation_timer.start()
 
@@ -135,10 +142,10 @@ def start_rotation():
     if auto_rotating:
         return
     auto_rotating = True
-    rotation_timer = threading.Timer(ROTATE_INTERVAL, rotation_loop)
+    rotation_timer = threading.Timer(next_interval(), rotation_loop)
     rotation_timer.daemon = True
     rotation_timer.start()
-    print(f"[VPN] Auto-rotation started (every {ROTATE_INTERVAL}s)")
+    print(f"[VPN] Auto-rotation started (random {ROTATE_MIN // 60}-{ROTATE_MAX // 60} min)")
 
 
 def stop_rotation():
