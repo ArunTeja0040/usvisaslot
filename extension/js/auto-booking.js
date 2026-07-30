@@ -51,6 +51,11 @@
   // #58 Bounded submit retries on a throttle. Small on purpose: the site meters
   // daily actions and a long burst triggers a 24-72h lockout.
   const SUBMIT_RETRIES = 3;
+  // #58b Hard ceiling on one grab. "Keep retrying while the slot is still
+  // listed" is right for a stampede (slots stay unclaimed ~20-30s), but each
+  // calendar reload spends one of the client's metered daily actions — running
+  // away would trigger a 24-72h lockout and cost us the NEXT release too.
+  const GRAB_MAX_MS = 90 * 1000;
 
   const MAX_PARALLEL_STRIKES = 3;          // #46b after this many timeout rounds in a row, bench parallel
   const PARALLEL_BENCH_MS = 5 * 60 * 1000;  // #46b run pure-sequential this long before re-testing parallel
@@ -3516,8 +3521,15 @@
     let lastTriedDate = dateStr;
 
     try {
+      const grabStartedAt = Date.now();
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         if (__abortAll) break;
+        if (Date.now() - grabStartedAt > GRAB_MAX_MS) {
+          log(`[fastgrab] ${Math.round(GRAB_MAX_MS / 1000)}s budget spent on ${cityName} — back to scanning`);
+          sendTelegramNotification("error",
+            `⏱️ <b>GRAB TIMED OUT</b>\n\n👤 ${u}\n📍 ${cityName} ${lastTriedDate || ""}\nKept trying ${Math.round(GRAB_MAX_MS / 1000)}s — back to scanning`);
+          resumeScan = true; break;
+        }
         log(`[fastgrab] attempt ${attempt}/${MAX_ATTEMPTS} — ${cityName}`);
 
         // (Re)select the city to (re)load its calendar — except attempt 1 of the
@@ -3610,10 +3622,19 @@
             sendTelegramNotification("error", `❌ <b>SLOT TAKEN</b>\n\n👤 ${u}\n📍 ${cityName} ${targetDate}\nSomeone booked it first`);
             resumeScan = true; break;
           }
-          // still throttled, or ambiguous — do NOT re-submit blindly
-          sendTelegramNotification("error",
-            `⏳ <b>SUBMIT THROTTLED</b>\n\n👤 ${u}\n📍 ${cityName} ${targetDate}\n⚠️ "${__lastThrottleText}"\n❌ Still refused after ${SUBMIT_RETRIES} retries — back to scanning`);
-          resumeScan = true; break;
+          // Still throttled (or ambiguous). Do NOT blindly re-submit — but do
+          // NOT give up on the city either. Fall through to the next attempt,
+          // which reloads this city's calendar and re-reads its in-range dates.
+          // If the slot is still there we go again; if it's gone, the loop's own
+          // "no in-range date left" check exits us back to scanning.
+          if (outcome2 !== "throttled") {
+            // ambiguous/timeout after a retry — genuinely unsafe to continue
+            sendTelegramNotification("error",
+              `❓ <b>BOOKING UNCERTAIN</b>\n\n👤 ${u}\n📍 ${cityName} ${targetDate}\nNo clear answer after retry — check manually`);
+            break;
+          }
+          log(`[fastgrab] still throttled after ${SUBMIT_RETRIES} retries — reloading ${cityName} calendar and trying again`);
+          continue;
         }
 
         if (outcome === "failed") {

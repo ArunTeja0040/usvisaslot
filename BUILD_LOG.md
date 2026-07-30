@@ -13,6 +13,10 @@ Format:
 ---
 
 ## 2026-07-26 — Stop losing slots to "too many requests" (Issue #58)
+
+**Update — it now keeps fighting for the same city.** Originally, after 3 quick re-clicks of the Book button it went back to normal scanning. Now, if the site is still saying "busy", it **reloads that city's calendar, checks whether your date is still there, and if it is, goes again** — repeating until either it books, the slot genuinely disappears, or a 90-second ceiling is reached. That matches how these releases actually behave: slots often sit unclaimed for 20-30 seconds while everyone is being turned away, so the winner is whoever is still trying.
+
+**Why there's a 90-second ceiling:** every calendar reload spends one of the client's limited daily page-views. Letting it retry forever would burn the day's allowance and get the client locked out for 24-72 hours — which would also cost you the *next* slot release. So it fights hard, briefly, then lets go.
 **The bug we found:** when the site said *"too many requests processing at the same time"* at the moment of booking, the bot read that message, spotted the words **"try again"** in it, and concluded **"someone else grabbed the slot"** — then gave up and blacklisted that slot. **The slot was never taken.** The site had just said "not right now". So a good share of those *"Someone grabbed it first"* alerts you've been getting were never lost races at all.
 
 **What changed:**
