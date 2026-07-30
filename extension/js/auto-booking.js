@@ -48,6 +48,10 @@
     return lo + Math.random() * (hi - lo);
   }
 
+  // #58 Bounded submit retries on a throttle. Small on purpose: the site meters
+  // daily actions and a long burst triggers a 24-72h lockout.
+  const SUBMIT_RETRIES = 3;
+
   const MAX_PARALLEL_STRIKES = 3;          // #46b after this many timeout rounds in a row, bench parallel
   const PARALLEL_BENCH_MS = 5 * 60 * 1000;  // #46b run pure-sequential this long before re-testing parallel
   let __parallelTimeoutStreak = 0;         // #46b consecutive parallel rounds that fully timed out
@@ -2829,6 +2833,10 @@
   // page.js (MAIN world) fires vSCP events — we also listen for a custom 401 signal
   let __session401Detected = false;
   let __rateLimited429 = false;
+  // #58 submit-race diagnostics
+  let __submit429At = 0;          // when a 429 was last seen on the wire
+  let __lastThrottleText = "";    // what the throttle actually said
+  let __lastSubmitDiag = null;    // {status, retryAfter, cfRay, msRateLimit, snippet}
 
   // ─── CLOUDFLARE CHALLENGE / "UNABLE TO LOAD" DETECTION ─────────────
   let __cfChallengeActive = false;    // Turnstile widget detected on page
@@ -3026,7 +3034,26 @@
           XMLHttpRequest.prototype.send = function() {
             this.addEventListener("load", function() {
               if (this.status === 401) marker.setAttribute("data-401", Date.now());
-              else if (this.status === 429) marker.setAttribute("data-429", Date.now());
+              else if (this.status === 429) {
+                marker.setAttribute("data-429", Date.now());
+                // #58 capture WHICH system refused us — Cloudflare edge, the
+                // platform throttle, or the site's own limiter all return 429
+                // and need opposite responses.
+                try {
+                  var d = {
+                    at: Date.now(),
+                    url: String(this._url || "").substring(0, 200),
+                    status: this.status,
+                    retryAfter: this.getResponseHeader("Retry-After"),
+                    cfRay: this.getResponseHeader("CF-Ray"),
+                    msBurst: this.getResponseHeader("x-ms-ratelimit-burst-remaining-xrm-requests"),
+                    msTime: this.getResponseHeader("x-ms-ratelimit-time-remaining-xrm-requests"),
+                    ctype: this.getResponseHeader("Content-Type"),
+                    body: String(this.responseText || "").substring(0, 500)
+                  };
+                  marker.setAttribute("data-429-diag", JSON.stringify(d));
+                } catch (e) {}
+              }
             });
             return currentSend.apply(this, arguments);
           };
@@ -3039,7 +3066,27 @@
           window.fetch = function() {
             return origFetch.apply(this, arguments).then(function(resp) {
               if (resp.status === 401) marker.setAttribute("data-401", Date.now());
-              else if (resp.status === 429) marker.setAttribute("data-429", Date.now());
+              else if (resp.status === 429) {
+                marker.setAttribute("data-429", Date.now());
+                try {
+                  var d = {
+                    at: Date.now(),
+                    url: String(resp.url || "").substring(0, 200),
+                    status: resp.status,
+                    retryAfter: resp.headers.get("Retry-After"),
+                    cfRay: resp.headers.get("CF-Ray"),
+                    msBurst: resp.headers.get("x-ms-ratelimit-burst-remaining-xrm-requests"),
+                    msTime: resp.headers.get("x-ms-ratelimit-time-remaining-xrm-requests"),
+                    ctype: resp.headers.get("Content-Type")
+                  };
+                  resp.clone().text().then(function(t) {
+                    d.body = String(t || "").substring(0, 500);
+                    marker.setAttribute("data-429-diag", JSON.stringify(d));
+                  }).catch(function() {
+                    marker.setAttribute("data-429-diag", JSON.stringify(d));
+                  });
+                } catch (e) {}
+              }
               return resp;
             });
           };
@@ -3061,9 +3108,32 @@
             sendTelegramNotification("error", `⚠️ <b>401 SESSION EXPIRED</b>\n\n👤 <b>User:</b> ${u}\n🔄 Will attempt auto re-login`);
           });
         }
+        if (m.attributeName === "data-429-diag") {
+          // #58 record WHICH system refused us, for tuning the retry later
+          try {
+            const raw = document.getElementById("__ab401marker")?.getAttribute("data-429-diag");
+            if (raw) {
+              const d = JSON.parse(raw);
+              __lastSubmitDiag = d;
+              const src = d.cfRay ? "CLOUDFLARE edge"
+                        : (d.msBurst || d.msTime) ? "platform throttle"
+                        : "site/app limiter";
+              log(`[429 diag] source=${src} retryAfter=${d.retryAfter || "none"} ctype=${d.ctype || "?"} url=${d.url}`);
+              log(`[429 diag] body: ${(d.body || "").substring(0, 200)}`);
+              chrome.storage.local.get(["loginDetails"], (dd) => {
+                const u = dd.loginDetails?.username || "";
+                trackEvent(EVENT_TYPES.ERROR,
+                  `429 diag — source=${src}, retryAfter=${d.retryAfter || "none"}, body=${(d.body || "").substring(0, 120)}`, u);
+              });
+            }
+          } catch (e) { log("[429 diag] parse failed: " + e.message); }
+          continue;
+        }
+
         if (m.attributeName === "data-429") {
           log("429 rate limit detected via DOM bridge");
           __rateLimited429 = true;
+          __submit429At = Date.now();   // #58 lets waitForBookingOutcome see a wire-level 429
           chrome.storage.local.get(["loginDetails"], (d) => {
             const u = d.loginDetails?.username || "";
             trackEvent(EVENT_TYPES.ERROR, "429 rate limited", u);
@@ -3466,7 +3536,7 @@
           if (!inRange.length) { resumeScan = true; log(`[fastgrab] no in-range date left at ${cityName} — back to scanning`); break; }
           targetDate = inRange[0];
         } else {
-          await sleep(500); // already on city — small settle
+          await sleep(150); // #58 was 500 — trimmed; the calendar wait below is event-driven anyway
         }
         lastTriedDate = targetDate;
 
@@ -3503,6 +3573,49 @@
             `🎉 <b>VAC BOOKED!</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n🕐 <b>${pickedTime || "first slot"}</b>\n✅ ${outcome === "ofc_submitted" ? "OFC submitted → consular next" : "Confirmed"}\n⏱️ Booked in ${ms}ms`);
           booked = true; break;
         }
+        // #58 A throttle is NOT a lost race — the server refused us before doing
+        // anything, so the slot was not booked by anyone on this attempt.
+        // Phase 1: classify + report correctly and let the attempt loop try
+        // again (instead of declaring "slot taken" and abandoning it).
+        if (outcome === "throttled") {
+          log(`[fastgrab] THROTTLED on submit — "${__lastThrottleText}"`);
+          trackEvent(EVENT_TYPES.ERROR, `Submit throttled: ${__lastThrottleText}`, u);
+
+          // Retry the SUBMIT ONLY — never re-run city/calendar/time. The form is
+          // still filled and the page has not navigated, so re-clicking submit
+          // costs one request instead of four. Bounded and jittered: the site
+          // meters daily actions, and a long burst gets the client locked out.
+          let outcome2 = "throttled";
+          for (let r = 1; r <= SUBMIT_RETRIES && outcome2 === "throttled"; r++) {
+            const waitMs = 700 + Math.random() * 1300;
+            log(`[fastgrab] submit retry ${r}/${SUBMIT_RETRIES} in ${Math.round(waitMs)}ms`);
+            await sleep(waitMs);
+            if (__abortAll || await checkStopSignal()) { log("[fastgrab] stop requested — aborting submit retries"); break; }
+            const btn2 = document.getElementById("submitbtn");
+            if (!btn2 || btn2.disabled) { log("[fastgrab] submit no longer clickable — stopping retries"); break; }
+            btn2.click();
+            outcome2 = await waitForBookingOutcome(8000);
+          }
+
+          if (outcome2 === "confirmed" || outcome2 === "ofc_submitted") {
+            updateUserStatus(u, "confirmed", { confirmedAt: new Date().toISOString() });
+            updateSlotHistoryAction(u, cityName, targetDate, outcome2 === "confirmed" ? "confirmed" : "submitted");
+            sendTelegramNotification("confirmed",
+              `🎉 <b>VAC BOOKED (after retry)!</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n🕐 <b>${pickedTime || "slot"}</b>\n✅ ${outcome2 === "ofc_submitted" ? "OFC submitted → consular next" : "Confirmed"}`);
+            booked = true; break;
+          }
+          if (outcome2 === "failed") {
+            log("[fastgrab] slot genuinely taken during retries");
+            markDeadSlot(cityValue, targetDate);
+            sendTelegramNotification("error", `❌ <b>SLOT TAKEN</b>\n\n👤 ${u}\n📍 ${cityName} ${targetDate}\nSomeone booked it first`);
+            resumeScan = true; break;
+          }
+          // still throttled, or ambiguous — do NOT re-submit blindly
+          sendTelegramNotification("error",
+            `⏳ <b>SUBMIT THROTTLED</b>\n\n👤 ${u}\n📍 ${cityName} ${targetDate}\n⚠️ "${__lastThrottleText}"\n❌ Still refused after ${SUBMIT_RETRIES} retries — back to scanning`);
+          resumeScan = true; break;
+        }
+
         if (outcome === "failed") {
           sendTelegramNotification("error", `⚠️ <b>BOOKING FAILED (slot taken)</b>\n\n👤 ${u}\n${cityName} ${targetDate}\n❌ Someone grabbed it first`);
           resumeScan = true; break;
@@ -3833,6 +3946,21 @@
     const wasOnOfc = originPath.includes("/ofc-schedule");
     const wasOnInterview = !wasOnOfc && originPath.includes("/schedule");
 
+    // #58 A transient throttle is NOT a lost race. The site's throttle wording
+    // ("too many requests processing at the same time... please try again")
+    // contains "try again", which matches failPatterns below — so it used to be
+    // reported as "slot taken" and the slot was abandoned without a retry.
+    // These are checked FIRST so the generic /try again/ never sees them.
+    const throttlePatterns = [
+      /too\s+many\s+requests/i,
+      /processing\s+at\s+the\s+same\s+time/i,
+      /too\s+many\s+concurrent/i,
+      /server\s+is\s+busy/i,
+      /\b429\b/,
+      /request\s+limit\s+exceeded/i,
+      /please\s+wait\s+and\s+try/i,
+    ];
+
     const failPatterns = [
       /no\s+longer\s+available/i,
       /slot\s+(is\s+)?(no\s+longer\s+|not\s+)?available/i,
@@ -3866,6 +3994,10 @@
       for (const el of errorEls) {
         const txt = (el.textContent || "").trim();
         if (!txt) continue;
+        // #58 throttle first — it must not fall through into failPatterns
+        for (const re of throttlePatterns) {
+          if (re.test(txt)) { __lastThrottleText = txt.substring(0, 300); return "throttled"; }
+        }
         for (const re of failPatterns) {
           if (re.test(txt)) return "failed";
         }
@@ -3873,8 +4005,18 @@
 
       // Generic page-wide pattern check (last resort)
       const bodyTxt = (document.body?.textContent || "").substring(0, 5000);
-      for (const re of failPatterns) {
-        if (re.test(bodyTxt)) return "failed";
+      for (const re of throttlePatterns) {
+        if (re.test(bodyTxt)) {
+          const m = bodyTxt.match(/[^.]*(?:too many requests|processing at the same time|server is busy)[^.]*\./i);
+          __lastThrottleText = (m ? m[0] : "throttle detected").trim().substring(0, 300);
+          return "throttled";
+        }
+      }
+      // #58 a 429 seen on the wire counts as a throttle even if the page shows nothing
+      if (__submit429At && Date.now() - __submit429At < 20000) {
+        __submit429At = 0;
+        __lastThrottleText = "HTTP 429 observed on submit (no page message)";
+        return "throttled";
       }
 
       await sleep(500);
@@ -3882,22 +4024,57 @@
     return "timeout";
   }
 
+  // #58 Resolve as soon as the submit button becomes enabled, instead of
+  // sleeping a fixed 800ms and hoping. Falls back to the timeout.
+  function waitForSubmitEnabled(timeout = 4000) {
+    return new Promise((resolve) => {
+      const btn = document.getElementById("submitbtn");
+      if (btn && !btn.disabled) return resolve(true);
+      let done = false;
+      const finish = (v) => {
+        if (done) return;
+        done = true;
+        try { obs.disconnect(); } catch (e) {}
+        clearInterval(poll);
+        clearTimeout(timer);
+        resolve(v);
+      };
+      const check = () => {
+        const b = document.getElementById("submitbtn");
+        if (b && !b.disabled) finish(true);
+      };
+      const obs = new MutationObserver(check);
+      try {
+        obs.observe(document.body, {
+          attributes: true, subtree: true, attributeFilter: ["disabled", "class"],
+        });
+      } catch (e) {}
+      // Safety net: the site may swap the button rather than flip the attribute.
+      const poll = setInterval(check, 120);
+      const timer = setTimeout(() => finish(false), timeout);
+    });
+  }
+
   async function waitForTimeSlotAndSelect(timeout = 12000) {
     const start = Date.now();
     while (Date.now() - start < timeout) {
-      const radio = document.querySelector(
-        '#time_select input[type="radio"]'
+      // #58 Pick a RANDOM time slot rather than always the first. Every
+      // competing bot takes the first radio, so contention concentrates there.
+      // The DATE is still the earliest in range — this only varies the time
+      // within that date, so the client is not given a worse appointment.
+      const radios = Array.from(
+        document.querySelectorAll('#time_select input[type="radio"]:not([disabled])')
       );
-      if (radio) {
+      if (radios.length) {
+        const radio = radios[Math.floor(Math.random() * radios.length)];
         if (!radio.checked) radio.click();
-        await sleep(800);
+        if (radios.length > 1) log(`[fastgrab] picked time slot ${radios.indexOf(radio) + 1}/${radios.length} (random)`);
 
-        const submitBtn = document.getElementById("submitbtn");
-        if (submitBtn && !submitBtn.disabled) {
-          return true;
-        }
+        // #58 was: await sleep(800)
+        const ready = await waitForSubmitEnabled(4000);
+        if (ready) return true;
       }
-      await sleep(500);
+      await sleep(200);
     }
     return false;
   }

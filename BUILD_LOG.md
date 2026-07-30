@@ -12,6 +12,22 @@ Format:
 
 ---
 
+## 2026-07-26 — Stop losing slots to "too many requests" (Issue #58)
+**The bug we found:** when the site said *"too many requests processing at the same time"* at the moment of booking, the bot read that message, spotted the words **"try again"** in it, and concluded **"someone else grabbed the slot"** — then gave up and blacklisted that slot. **The slot was never taken.** The site had just said "not right now". So a good share of those *"Someone grabbed it first"* alerts you've been getting were never lost races at all.
+
+**What changed:**
+1. **The bot now understands the difference** between "someone beat you" and "the site is momentarily busy". They look similar in words but mean opposite things.
+2. **When the site says busy, it now tries again** — up to 3 more times, a second or two apart. Crucially it re-clicks only the final Book button; it does **not** redo the city, calendar and time steps. That makes each retry cheap.
+3. **It picks a random time slot** instead of always the first one on the day. Every bot in the world grabs the first time, so they all collide there. **The date is still the earliest available** — your client gets the same appointment day, we just stop queueing behind everyone for the same hour.
+4. **Removed about 1.3 seconds of dead waiting.** The bot used to pause on a timer and hope the page was ready. Now it reacts the instant the Book button lights up.
+5. **It now records what the error actually said** — including which system refused us. Three different systems can produce that same message and they need opposite responses; until now we couldn't tell them apart.
+
+**Deliberately kept small:** the site limits how many times you may load the appointment page per day, and going over locks the client out for 24-72 hours — which would cost you the *next* slot release too. So retries are capped at 3, not an endless loop.
+
+**Unchanged and important:** if the site goes completely silent after you click Book (no answer at all), the bot still refuses to re-submit. That silence might mean the booking actually went through, and re-clicking could double-book the client. That caution stays exactly as it was.
+
+---
+
 ## 2026-07-26 — Sequential counts each city as a round; parallel unchanged (Issue #56)
 **What changed:** In **Sequential** mode the **Round** number now goes up by **one for every city** checked. With 4 cities: Mumbai → Round 1, Delhi → Round 2, Chennai → Round 3, Hyderabad → Round 4, then round 5, 6, 7, 8 on the next lap.
 **Parallel is untouched** — it still counts a round once per full pass over all your cities, exactly as it did.
