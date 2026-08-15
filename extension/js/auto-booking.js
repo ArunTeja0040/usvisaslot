@@ -3170,50 +3170,83 @@
     return !!findContinueControl();
   }
 
+  let __termsFailReason = "";   // #60b surfaced in the Telegram alert
+
   function findContinueControl() {
     const candidates = Array.from(document.querySelectorAll(
-      'input[type="submit"], button, input[type="button"], a.btn'
+      'input[type="submit"], input[type="button"], button, a.btn, a[role="button"], [onclick]'
     ));
+    const wanted = /(continue|submit|accept|proceed|agree|next)/i;
+    // Prefer an exact-ish label, then fall back to any control containing the word.
     return candidates.find((el) => {
-      const label = ((el.value || "") + " " + (el.textContent || "")).trim().toLowerCase();
-      return /^(continue|submit|accept|proceed|i agree|agree)\b/.test(label) || label === "continue";
+      const label = ((el.value || "") + " " + (el.textContent || "") + " " + (el.id || "") + " " + (el.name || "")).trim();
+      return wanted.test(label);
     }) || null;
   }
 
-  // Ticks the acceptance boxes and clicks Continue. Returns true if it submitted.
-  // Only ever touches checkboxes on a page already confirmed to be the consent
-  // page, and only clicks a control labelled Continue/Accept/Agree.
+  // #60b Ticks the acceptance boxes and clicks Continue.
+  // Portals commonly hide the real <input type=checkbox> and style a <label> or
+  // sibling span, so a plain .click() on an invisible input does nothing. This
+  // tries the input, then its label, then the parent, and verifies .checked
+  // actually flipped before moving on.
   async function acceptTermsPage() {
     try {
-      const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]'))
-        .filter((cb) => !cb.disabled && cb.offsetParent !== null);
-      if (!boxes.length) { log("[terms] no checkboxes found"); return false; }
+      const all = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+      // Only skip boxes that are genuinely removed from the page.
+      const boxes = all.filter((cb) => {
+        if (cb.disabled) return false;
+        const st = window.getComputedStyle(cb);
+        const hiddenBySelf = st.display === "none" && !cb.closest("label");
+        return !hiddenBySelf;
+      });
+      log(`[terms] checkboxes: ${all.length} found, ${boxes.length} usable`);
+      if (!boxes.length) { __termsFailReason = `no usable checkboxes (${all.length} on page)`; log("[terms] FAIL: " + __termsFailReason); return false; }
 
       for (const cb of boxes) {
-        if (!cb.checked) {
-          cb.click();
-          // Some portals bind to change rather than click.
-          cb.dispatchEvent(new Event("change", { bubbles: true }));
-          await sleep(120);
-        }
-      }
-      log(`[terms] ticked ${boxes.length} checkbox(es)`);
+        if (cb.checked) continue;
 
-      // Give the page a moment to enable Continue.
+        // 1) direct
+        try { cb.click(); } catch (e) {}
+        // 2) its label (handles visually-hidden inputs)
+        if (!cb.checked) {
+          const lbl = (cb.id && document.querySelector(`label[for="${CSS.escape(cb.id)}"]`)) || cb.closest("label");
+          if (lbl) { try { lbl.click(); } catch (e) {} }
+        }
+        // 3) set the property directly and announce it
+        if (!cb.checked) {
+          cb.checked = true;
+          cb.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        cb.dispatchEvent(new Event("change", { bubbles: true }));
+        cb.dispatchEvent(new Event("blur", { bubbles: true }));
+        await sleep(150);
+        log(`[terms] checkbox ${cb.id || cb.name || "(unnamed)"} -> ${cb.checked ? "CHECKED" : "STILL UNCHECKED"}`);
+      }
+
+      const unchecked = boxes.filter((cb) => !cb.checked);
+      if (unchecked.length) { __termsFailReason = `${unchecked.length} checkbox(es) would not tick`; log("[terms] FAIL: " + __termsFailReason); return false; }
+
+      // Wait for Continue to become enabled.
       let btn = null;
-      for (let i = 0; i < 20; i++) {
+      for (let i = 0; i < 30; i++) {
         btn = findContinueControl();
         if (btn && !btn.disabled) break;
         await sleep(150);
       }
-      if (!btn) { log("[terms] Continue control not found"); return false; }
-      if (btn.disabled) { log("[terms] Continue still disabled after ticking — not forcing"); return false; }
+      if (!btn) {
+        const seen = Array.from(document.querySelectorAll('input[type="submit"], button, a.btn'))
+          .map((e) => (e.value || e.textContent || "").trim().substring(0, 30)).filter(Boolean).slice(0, 8);
+        __termsFailReason = `Continue button not found. Buttons seen: ${seen.join(" | ") || "none"}`;
+        log("[terms] FAIL: " + __termsFailReason);
+        return false;
+      }
+      if (btn.disabled) { __termsFailReason = "Continue button stayed greyed out after ticking"; log("[terms] FAIL: " + __termsFailReason); return false; }
 
-      log("[terms] clicking Continue");
+      log(`[terms] clicking Continue (${(btn.value || btn.textContent || "").trim().substring(0, 30)})`);
       clickSafe(btn);
       return true;
     } catch (e) {
-      log("[terms] error: " + e.message);
+      __termsFailReason = "error: " + e.message; log("[terms] FAIL: " + __termsFailReason);
       return false;
     }
   }
@@ -5239,6 +5272,7 @@
       sendTelegramNotification("error",
         `📋 <b>TERMS PAGE NEEDS ATTENTION</b>\n\n👤 <b>User:</b> ${tUser}\n` +
         `The Privacy Act / terms page appeared but couldn't be completed automatically.\n` +
+        `🔎 <b>Reason:</b> ${__termsFailReason || "unknown"}\n` +
         `Please tick the boxes and click Continue on that device.`);
       return;
     }
