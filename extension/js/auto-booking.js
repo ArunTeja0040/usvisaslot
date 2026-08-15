@@ -3151,13 +3151,93 @@
     observer.observe(marker, { attributes: true });
   }
 
+  // #59 Terms / Privacy Act consent page shown after login + security questions.
+  // Identified by URL first (most reliable), then by the page's own content.
+  // Deliberately narrow so it can never match a real block page.
+  function isTermsConsentPage() {
+    const url = (window.location.href || "").toLowerCase();
+    if (/\/account\/login\/termsandconditions/.test(url)) return true;
+
+    // Content fallback: the acceptance checkboxes plus a Continue control.
+    const boxes = document.querySelectorAll('input[type="checkbox"]');
+    if (!boxes.length) return false;
+    const txt = (document.body?.textContent || "").toLowerCase();
+    const looksLikeConsent =
+      txt.includes("privacy act") ||
+      txt.includes("confidentiality statement") ||
+      txt.includes("i have read the terms");
+    if (!looksLikeConsent) return false;
+    return !!findContinueControl();
+  }
+
+  function findContinueControl() {
+    const candidates = Array.from(document.querySelectorAll(
+      'input[type="submit"], button, input[type="button"], a.btn'
+    ));
+    return candidates.find((el) => {
+      const label = ((el.value || "") + " " + (el.textContent || "")).trim().toLowerCase();
+      return /^(continue|submit|accept|proceed|i agree|agree)\b/.test(label) || label === "continue";
+    }) || null;
+  }
+
+  // Ticks the acceptance boxes and clicks Continue. Returns true if it submitted.
+  // Only ever touches checkboxes on a page already confirmed to be the consent
+  // page, and only clicks a control labelled Continue/Accept/Agree.
+  async function acceptTermsPage() {
+    try {
+      const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]'))
+        .filter((cb) => !cb.disabled && cb.offsetParent !== null);
+      if (!boxes.length) { log("[terms] no checkboxes found"); return false; }
+
+      for (const cb of boxes) {
+        if (!cb.checked) {
+          cb.click();
+          // Some portals bind to change rather than click.
+          cb.dispatchEvent(new Event("change", { bubbles: true }));
+          await sleep(120);
+        }
+      }
+      log(`[terms] ticked ${boxes.length} checkbox(es)`);
+
+      // Give the page a moment to enable Continue.
+      let btn = null;
+      for (let i = 0; i < 20; i++) {
+        btn = findContinueControl();
+        if (btn && !btn.disabled) break;
+        await sleep(150);
+      }
+      if (!btn) { log("[terms] Continue control not found"); return false; }
+      if (btn.disabled) { log("[terms] Continue still disabled after ticking — not forcing"); return false; }
+
+      log("[terms] clicking Continue");
+      clickSafe(btn);
+      return true;
+    } catch (e) {
+      log("[terms] error: " + e.message);
+      return false;
+    }
+  }
+
   function isCloudflareBlocked() {
     // Only detect actual Cloudflare block pages — not normal pages with stray keyword matches
     // Real CF block pages have specific elements and title patterns
     const title = (document.title || "").toLowerCase();
-    if (title.includes("attention required") || title.includes("access denied") || title.includes("error 1015")) {
+    // #59 "access denied" alone is NOT proof of a Cloudflare block — the site's
+    // own Terms/Privacy Act consent page carries that exact title. Require a
+    // real Cloudflare fingerprint alongside it. "attention required" and
+    // "error 1015" remain conclusive on their own.
+    if (title.includes("attention required") || title.includes("error 1015")) {
       log("Cloudflare block detected via page title: " + document.title);
       return true;
+    }
+    if (title.includes("access denied")) {
+      const cfProof = document.querySelector("#cf-error-details, .cf-error-overview, .cf-wrapper, #challenge-running, #challenge-form")
+        || /cloudflare|cf-ray|error 1015/i.test((document.body?.textContent || "").substring(0, 3000));
+      if (cfProof) {
+        log("Cloudflare block detected: 'access denied' title + Cloudflare marker");
+        return true;
+      }
+      log("Title says 'access denied' but no Cloudflare marker — NOT treating as a block");
     }
     // Cloudflare block pages have specific class/id markers
     const cfMarker = document.querySelector("#cf-error-details, .cf-error-overview, .cf-wrapper, #challenge-running, #challenge-form");
@@ -5139,6 +5219,27 @@
       sessionStorage.removeItem("__ab401RetryCount");
       log("On b2clogin.com — detecting page type...");
       await handleLoginPage();
+      return;
+    }
+
+    // #59 Terms / Privacy Act consent page. MUST run before the Cloudflare check:
+    // this page's title is "Access Denied · Customer Self-Service" (a Dynamics
+    // quirk — you are not authorised until you accept), which the CF detector
+    // was reading as a block and logging the client out.
+    if (host.includes("usvisascheduling.com") && isTermsConsentPage()) {
+      const tUser = settings.loginDetails?.username || activeAutoUser || "";
+      log("Terms/Privacy Act consent page detected — accepting to continue");
+      const done = await acceptTermsPage();
+      if (done) {
+        trackEvent(EVENT_TYPES.SESSION, "Terms/Privacy Act page accepted", tUser);
+        return; // page navigates; the router re-runs on the next page
+      }
+      log("Terms page detected but could not complete — leaving it for manual action");
+      trackEvent(EVENT_TYPES.ERROR, "Terms page could not be completed automatically", tUser);
+      sendTelegramNotification("error",
+        `📋 <b>TERMS PAGE NEEDS ATTENTION</b>\n\n👤 <b>User:</b> ${tUser}\n` +
+        `The Privacy Act / terms page appeared but couldn't be completed automatically.\n` +
+        `Please tick the boxes and click Continue on that device.`);
       return;
     }
 

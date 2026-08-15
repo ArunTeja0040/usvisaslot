@@ -12,6 +12,57 @@ Format:
 
 ---
 
+## 2026-08-15 — Fix: bot logged itself out on the Privacy Act / terms page (Issue #60)
+**What was wrong:** After Start Now, the bot logged in, answered the security questions, reached the Privacy Act consent page — and immediately **logged the client straight back out**.
+
+**Why:** That page's browser-tab title is **"Access Denied"**. It's a quirk of the site's software — you count as "not authorised" until you tick the boxes, so it reuses the access-denied page title. Our bot had a rule saying *"if the page title says access denied, Cloudflare has blocked us"* — so it panicked and logged out. **Nothing was actually blocked.** It was a normal page in the login flow, misread.
+
+**What it does now:**
+1. **Recognises the page properly** — by its web address first, and as a backup by what's on it (the acknowledgement boxes plus a Continue button).
+2. **Ticks both boxes and clicks Continue**, then carries on with the normal booking work.
+3. **Stopped panicking about the title.** "Access denied" in a page title is no longer treated as a block on its own — there now has to be a genuine Cloudflare fingerprint on the page too.
+4. **If it can't complete it** (Continue stays greyed out, or the button isn't found), it does **not** force anything — it sends you a Telegram message asking someone to tick it manually on that machine.
+
+**What the page actually says, for the record:** it's the US government's **Privacy Act Statement** and **Confidentiality Statement** — how the applicant's personal information is handled and shared. It's a data-privacy notice, not the site's rules-of-use document.
+
+**Kept safe:** the bot only touches checkboxes on a page it has already confirmed is this consent page, only clicks a button labelled Continue/Accept/Agree, and never forces a disabled button.
+
+---
+
+## 2026-08-11 — Dashboard redesign (Issue #59)
+
+**What it does:** Rebuilds the dashboard — header, numbers row, a new alert strip, the client cards and the activity log — and fixes the two-second flicker underneath all of it.
+
+**The alert strip ("NEEDS YOU"):** Anyone with a slot found, or anyone blocked by a rate limit, now floats to the top of the page in its own strip, above the client grid. Before, a found slot was one card among forty-seven and you had to hunt for it. Each entry has a **Show** button that jumps to that client's card and flashes it. The strip disappears entirely when nothing needs you.
+
+**The browser tab tells you now:** When a slot is found while you're on another tab, the tab title becomes **"(1) Slot found — SlotHunter"**. Return to the tab and it goes back to normal. This is the big one — the dashboard sits in a background tab for hours, and until now nothing reached you there unless Telegram was set up.
+
+**A pop-up when a slot lands:** A small card slides up bottom-right when a client goes to "slot found", with a Show button. Flick it sideways to dismiss. Its timer **pauses while the tab is hidden** — so a slot found at 2pm while you were elsewhere is still waiting at 2:30 instead of having quietly expired.
+
+**Search everything with Cmd-K (Ctrl-K on Windows):** Press it anywhere and a search box opens. Type a client name to jump to them, or type a command — Add client, Export CSV, Open Cloud Sync. It opens instantly with no animation on purpose: you use it constantly, and animation there just reads as lag.
+
+**Clearing the log now needs a press-and-hold.** This was a real hazard — the **Clear** button under the activity log wiped every event on a single click and asked nothing. It is now **Hold to clear**: hold about a second while a red fill sweeps across. Let go early and nothing happens.
+
+**The header got quieter.** Eight buttons in eight colours, all shouting equally. Cloud, Telegram and Sheets are now one group with a small dot each — green connected, grey not — so connection state is visible without clicking. Export, Export CSV, Import and the sheet link moved into a "..." menu. Logs and Staff stayed out in the open because you use them often.
+
+**The numbers row got a lead.** "Cycling now" is large with the client total beside it; slots found, confirmed, errors and CAPTCHA rate sit in a smaller row alongside. Digits use a fixed-width font so numbers stop twitching sideways every two seconds as they update.
+
+**Why:** The dashboard was built for a handful of clients and is now watched for hours with dozens. Nothing on screen said "this is what needs you", and nothing reached you at all when the tab was in the background.
+
+**What changed for you:** Every client card shows exactly the same information and the same buttons as before — nothing was removed. Your data, logins, cloud sync, staff view and the booking engine are untouched. If any of this misbehaves there is a single switch that turns the whole new layer off and restores the old behaviour, including the one-click Clear.
+
+**The client cards were rebuilt too.** Every label now lines up in a column, so you can read down forty cards without your eye hunting. The emoji are gone — 🎯 ✅ ⚪ 🎉 📜 🔁 ⚠️ 🔴 📍 all replaced with plain text or a drawn icon, because emoji render differently on every machine. **Edit** and **History** now stay hidden until you hover a card, so a screen of forty clients isn't a wall of buttons. Each card has a coloured stripe down its left edge — teal cycling, amber slot found, green confirmed, red blocked — readable from across the room without reading a word.
+
+**The activity log became a timeline** with a coloured dot per line joined by a thread, so errors and found slots stand out while routine chatter recedes.
+
+**The two-second flicker is fixed.** The whole client grid used to be thrown away and rebuilt every two seconds. That is why hovering a card sometimes felt like it slipped, why text you highlighted vanished, and why an open "Assigned to" dropdown had to be protected with a special rule that froze the entire screen while it was open. Now each card is compared against what is already on screen and only the ones that actually changed are redrawn. **Measured: 38 of 39 cards now survive untouched across three refreshes — only the one client actually cycling gets redrawn.** The dropdown fix is better too: instead of freezing the whole dashboard while it is open, only that one card is left alone and everything else keeps updating.
+
+**A bug found and fixed during your testing:** at normal zoom every card was cut down to just the name row — no dates, no Start button. Cause: the new left stripe needed the card to clip its own edges, and in a CSS grid an element that clips itself is allowed to shrink to nothing when space runs short. With six test clients there was room to spare so it never appeared; with your thirty-nine there wasn't. Fixed by rounding the stripe instead of clipping the card, and by pinning row heights to their content.
+
+**Two off switches, not one:** one turns off the new alert strip, pop-ups, palette and hold-to-clear; the other returns to the old rebuild-everything-every-two-seconds behaviour. Either can be flipped on its own.
+
+---
+
 ## 2026-07-26 — Stop losing slots to "too many requests" (Issue #58)
 
 **Update — it now keeps fighting for the same city.** Originally, after 3 quick re-clicks of the Book button it went back to normal scanning. Now, if the site is still saying "busy", it **reloads that city's calendar, checks whether your date is still there, and if it is, goes again** — repeating until either it books, the slot genuinely disappears, or a 90-second ceiling is reached. That matches how these releases actually behave: slots often sit unclaimed for 20-30 seconds while everyone is being turned away, so the winner is whoever is still trying.
