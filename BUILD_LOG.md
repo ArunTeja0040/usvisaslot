@@ -12,6 +12,21 @@ Format:
 
 ---
 
+## 2026-08-15 — Fix: dates stopped loading after a Cloudflare check (VPN changes) (Issue #61)
+**What was wrong:** When the VPN switched IP, Cloudflare would show the "verify you are human" box. You'd solve it, the bot would say it resumed — but **the dates never loaded again**. The only way out was to log out and start the client over. This kept happening around VPN rotations.
+
+**Why:** After Cloudflare interrupts a page, the page's own scripts are left half-alive — the city dropdown and the calendar never rebuild themselves. The bot had two different ways of dealing with a Cloudflare check, and only one of them was right:
+- During its **fast scanning**, it saved its place, reloaded the page, and carried on properly.
+- During its **one-city-at-a-time scanning**, it just waited, then carried on **without reloading** — talking to a page that was effectively dead. Hence blank dates.
+
+**The fix:** both now do the same thing — save the settings (dates, gap, cities), reload the page so you can solve the Cloudflare box, and once solved the bot picks up automatically where it left off. No manual logout.
+
+**Why VPN changes triggered it so often:** the "you're verified" pass Cloudflare gives you is tied to your IP address. Every time the VPN moves you to a new IP, that pass stops counting and Cloudflare can ask again — right in the middle of a scan.
+
+**If it still happens:** the next step would be for the bot to notice the IP changed and do the clean reload *before* Cloudflare interrupts it, rather than reacting afterwards. Only worth building if this doesn't settle it.
+
+---
+
 ## 2026-08-15 — Fix: bot logged itself out on the Privacy Act / terms page (Issue #60)
 **What was wrong:** After Start Now, the bot logged in, answered the security questions, reached the Privacy Act consent page — and immediately **logged the client straight back out**.
 

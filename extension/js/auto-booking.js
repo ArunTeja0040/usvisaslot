@@ -4518,38 +4518,16 @@
 
       // ── Layer 2: Cloudflare Turnstile challenge detection ──
       if (detectTurnstileChallenge()) {
-        __cfChallengeActive = true;
-        setStatus("🛡️ Cloudflare challenge detected — waiting for manual solve...");
-        log("Turnstile challenge detected — pausing cycling");
-        chrome.storage.local.get(["loginDetails"], (d) => {
-          const u = d.loginDetails?.username || "";
-          trackEvent(EVENT_TYPES.ERROR, `Cloudflare Turnstile challenge detected at round ${cycling.round}`, u);
-          sendTelegramNotification("rate",
-            `🛡️ <b>CLOUDFLARE CHALLENGE</b>\n\n` +
-            `👤 <b>User:</b> ${u}\n` +
-            `⚠️ "Verify you are human" detected\n` +
-            `⏸️ Cycling PAUSED — solve manually\n` +
-            `🔁 Round ${cycling.round}`
-          );
-        });
-        const solved = await waitForChallengeSolved();
-        if (!cycling.active) return;
-        if (!solved) {
-          stopCycling("Cloudflare challenge not solved within timeout");
-          return;
-        }
-        // Challenge solved — add cooldown before resuming
-        setStatus("✅ Challenge solved — resuming in 10s...");
-        await sleep(10000);
-        if (!cycling.active) return;
-        // Reset re-entry count since user just solved challenge
-        __reentryCount = 0;
-        sessionStorage.removeItem("__abUnableCount"); // #49
-        chrome.storage.local.get(["loginDetails"], (d) => {
-          const u = d.loginDetails?.username || "";
-          trackEvent(EVENT_TYPES.SESSION, "Cloudflare challenge solved — cycling resumed", u);
-          sendTelegramNotification("rate", `✅ <b>CHALLENGE SOLVED</b>\n\n👤 <b>User:</b> ${u}\n▶️ Cycling resumed\n🔁 Round ${cycling.round}`);
-        });
+        // #61 Use the SAME recovery the parallel path uses: save cycling state
+        // and reload. Resuming in place after a Cloudflare interstitial left the
+        // page's own JS half-dead — the location dropdown and calendar never
+        // re-initialised, so dates stopped loading and the operator had to log
+        // out and start over. A reload rebuilds the page cleanly and cycling
+        // auto-resumes from the saved state.
+        const cfUser2 = (await getSettings()).loginDetails?.username || "";
+        log("Turnstile challenge detected mid-cycle — saving state and reloading for a clean recovery");
+        await handleCloudflareChallenge(cfUser2);
+        return;
       }
 
       // Check for 429 rate limit — severe error, auto-logout
