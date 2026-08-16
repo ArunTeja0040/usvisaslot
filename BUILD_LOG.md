@@ -12,6 +12,21 @@ Format:
 
 ---
 
+## 2026-08-16 — URGENT: dates went blank after an IP change, arming the bot to book any date (Issue #62)
+**What could have gone wrong:** after the VPN changed IP, the booking panel came back with **Start Date and End Date empty** — while the bot kept running. An empty date range means the bot treats **every** date as one you want. So the next slot to appear, at any date in any year, would have been booked and submitted for that client. With only one free reschedule allowed, that is expensive to undo.
+
+**Why it happened:** changing IP breaks the website session, so the bot re-logs in. The re-login step was saving a blank placeholder — no dates, no cities — and after logging back in it wrote those blanks straight over the panel. The bot then carried on with no range at all.
+
+**Three fixes:**
+1. **The re-login step now takes the dates and cities from that client's own profile**, instead of saving blanks.
+2. **Restoring can no longer wipe good values.** A blank saved value is ignored rather than written over a date that was already filled in.
+3. **A hard safety stop:** if there is no date range for any reason, the bot **refuses to book**. It sends "BOOKING BLOCKED — NO DATE RANGE", stops that client, and waits for you. Looking for slots still works — only automatic booking is blocked.
+
+Fix 3 is the one that matters most: it makes this kind of failure safe no matter what causes it in future.
+
+**What you should check:** open the dashboard and make sure every client actually has a start and end date saved. Any client without one will now be stopped safely rather than booked wrongly — but it is better to have the dates in place.
+---
+
 ## 2026-08-15 — Fix: dates stopped loading after a Cloudflare check (VPN changes) (Issue #61)
 **What was wrong:** When the VPN switched IP, Cloudflare would show the "verify you are human" box. You'd solve it, the bot would say it resumed — but **the dates never loaded again**. The only way out was to log out and start the client over. This kept happening around VPN rotations.
 

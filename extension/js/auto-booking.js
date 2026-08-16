@@ -3613,7 +3613,29 @@
   // Fast-grab with retry loop (#41): re-poke the same city to reload a slow calendar,
   // up to MAX_ATTEMPTS. Exit to normal scanning when no in-range date is left, slot taken,
   // or attempts exhausted (mark dead). Resume cycling on any non-booked exit.
+  // #62 A missing date range must NEVER mean "book anything". isDateInRange
+  // returns true for every date when both bounds are empty (fine for showing
+  // what's available), so without this guard a blank panel would auto-submit the
+  // first slot it saw, at any date, for a real client.
+  function hasDateRange() {
+    const sd = document.getElementById("ab-start-date")?.value || "";
+    const ed = document.getElementById("ab-end-date")?.value || "";
+    return !!(sd || ed);
+  }
+
   async function fastGrabBooking(cityValue, cityName, dateStr, alreadyOnCity = false) {
+    if (!hasDateRange()) {
+      const who = await new Promise((r) => chrome.storage.local.get(["loginDetails"], (d) => r(d.loginDetails?.username || "")));
+      log("[fastgrab] BLOCKED — no date range set; refusing to auto-book");
+      trackEvent(EVENT_TYPES.ERROR, "Auto-book blocked: no date range set for this client", who);
+      sendTelegramNotification("error",
+        `🛑 <b>BOOKING BLOCKED — NO DATE RANGE</b>\n\n👤 <b>User:</b> ${who}\n` +
+        `📍 ${cityName} ${dateStr}\n` +
+        `⚠️ Start/End date are empty, so ANY date would count as wanted.\n` +
+        `✋ Not booking. Set the date range for this client, then restart.`);
+      stopCycling("No date range set — auto-book blocked");
+      return;
+    }
     if (__fastGrabbing) return;
     __fastGrabbing = true;
     const u = await new Promise((r) => chrome.storage.local.get(["loginDetails"], (d) => r(d.loginDetails?.username || "")));
@@ -5072,8 +5094,10 @@
       const ed = document.getElementById("ab-end-date");
       const gmin = document.getElementById("ab-gap-min");
       const gmax = document.getElementById("ab-gap-max");
-      if (sd) sd.value = savedState.startDate;
-      if (ed) ed.value = savedState.endDate;
+      // #62 Only overwrite when the saved value is real — a blank saved value
+      // must not wipe a range the panel already filled in from the profile.
+      if (sd && savedState.startDate) sd.value = savedState.startDate;
+      if (ed && savedState.endDate) ed.value = savedState.endDate;
       if (gmin && savedState.gapMin) gmin.value = savedState.gapMin;
       if (gmax && savedState.gapMax) gmax.value = savedState.gapMax;
 
@@ -5443,15 +5467,29 @@
         sessionStorage.setItem(RELOGIN_FLAG, "true");
         const existingState = sessionStorage.getItem("ab-cycling-state");
         if (!existingState) {
+          // #62 Seed from the CLIENT'S PROFILE, never blank. Writing empty dates
+          // here meant that after an IP change (VPN) -> 401 -> re-login, the panel
+          // restored with no date range — and an empty range makes EVERY date
+          // count as in-range, so the bot would auto-book any slot at any date.
+          const bootProfile = await new Promise((r) => {
+            chrome.storage.local.get(["loginDetails", "userProfilesList"], (d) => {
+              const un = d.loginDetails?.username;
+              const list = d.userProfilesList || [];
+              r(un ? list.find((pr) => pr.username === un) : null);
+            });
+          }).catch(() => null);
           sessionStorage.setItem("ab-cycling-state", JSON.stringify({
             active: true,
             round: 0,
-            startDate: "",
-            endDate: "",
-            gapMin: "10", gapMax: "15",   // #56c re-login bootstrap defaults
-            locations: [],
+            startDate: bootProfile?.startDate || "",
+            endDate: bootProfile?.endDate || "",
+            gapMin: "10", gapMax: "15",
+            locations: bootProfile?.locations || [],
             timestamp: Date.now()
           }));
+          if (!bootProfile?.startDate && !bootProfile?.endDate) {
+            log("[re-login] WARNING: no date range on this client's profile — auto-book will be blocked until one is set");
+          }
         }
 
         window.location.href = window.location.origin + "/en-US/";
