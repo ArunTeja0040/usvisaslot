@@ -2196,13 +2196,17 @@
         updateUserStatus(settings.loginDetails.username, "logging_in");
         runLogin(settings);
       } else {
-        log("No credentials found for active user — falling back to settings panel");
-        trackEvent(EVENT_TYPES.ERROR, "No credentials found for active user — showing settings panel", targetUser || "");
-        sendTelegramNotification("error", `⚠️ <b>NO CREDENTIALS</b>\n\n👤 <b>User:</b> ${targetUser || "unknown"}\n❌ No saved credentials found\n💡 Enter credentials in settings panel`);
-        injectSettingsPanel();
+        // #64 On-page settings panel removed — the dashboard is the control
+        // surface now, and the panel showed credentials in plain text on a page
+        // anyone walking past could see.
+        log("No credentials found for active user — cannot auto-login");
+        trackEvent(EVENT_TYPES.ERROR, "No credentials found for active user", targetUser || "");
+        sendTelegramNotification("error", `⚠️ <b>NO CREDENTIALS</b>\n\n👤 <b>User:</b> ${targetUser || "unknown"}\n❌ No saved credentials found\n💡 Add them on the dashboard, then Start Now`);
       }
     } else {
-      injectSettingsPanel();
+      // #64 No client started from the dashboard — do nothing and leave the
+      // site usable by hand. (Was: inject the on-page settings panel.)
+      log("Login page open with no active client — idle. Start a client from the dashboard.");
     }
   }
 

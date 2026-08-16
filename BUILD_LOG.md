@@ -12,6 +12,21 @@ Format:
 
 ---
 
+## 2026-08-16 — Removed the settings panel from the login page (Issue #64)
+**What changed:** the big blue "Auto-Booking Settings" box that covered the left side of the login page is gone.
+
+**Why it's safe:** that panel only ever appeared when you opened the login page *without* starting a client. The moment you press **Start Now** on the dashboard, the bot fills the login form and signs in on its own — it never used that panel. It was left over from before the dashboard existed.
+
+**Why it was worth removing:** besides taking up a third of the screen, it displayed your **operator key, master password box, the client's password and their security answers in plain text** on a page sitting open on staff machines. Anyone walking past could read them.
+
+**What happens now instead:**
+- Open the login page with no client running → nothing appears, and you can use the site normally by hand.
+- A client is started but has no saved password → you get a Telegram message saying to add it on the dashboard, rather than a panel appearing.
+
+**Nothing else changes:** Start Now → login → security questions → dashboard → booking works exactly as before.
+
+---
+
 ## 2026-08-16 — URGENT: dates went blank after an IP change, arming the bot to book any date (Issue #62)
 **What could have gone wrong:** after the VPN changed IP, the booking panel came back with **Start Date and End Date empty** — while the bot kept running. An empty date range means the bot treats **every** date as one you want. So the next slot to appear, at any date in any year, would have been booked and submitted for that client. With only one free reschedule allowed, that is expensive to undo.
 
