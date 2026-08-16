@@ -25,7 +25,7 @@
   //   "sequential" = never parallel; one city at a time, switching the dropdown
   //                  in-page (no refresh), full sweep of every selected city.
   // Per machine (chrome.storage.local), switchable mid-cycle, applies next round.
-  let __scanMode = "parallel";
+  let __scanMode = "sequential";   // #63 sequential is the default
 
   // #56 a "round" = one full pass over every selected city. Sequential already
   // worked that way; parallel counted a round per batch of 2. Counting cities
@@ -136,6 +136,80 @@
     }
   });
 
+  // ─── FLOATING NOTIFICATIONS (#63) ──────────────────────────────────
+  // Replaces the on-page Activity Log. Small corner toasts so problems are
+  // visible without a wall of text. Fed from trackEvent, so nothing else
+  // needs to know about them.
+  const TOAST_MAX = 4;                 // never cover the page
+  let __toastWrap = null;
+
+  function toastWrap() {
+    if (__toastWrap && document.body.contains(__toastWrap)) return __toastWrap;
+    __toastWrap = document.createElement("div");
+    __toastWrap.id = "ab-toasts";
+    __toastWrap.style.cssText = [
+      "position:fixed", "top:14px", "right:14px", "z-index:2147483647",
+      "display:flex", "flex-direction:column", "gap:8px",
+      "max-width:340px", "pointer-events:none", "font-family:system-ui,-apple-system,sans-serif",
+    ].join(";");
+    document.body.appendChild(__toastWrap);
+    return __toastWrap;
+  }
+
+  // Map an event type to look + lifetime.
+  function toastStyleFor(type) {
+    const t = String(type || "").toLowerCase();
+    if (/error|rate|severe|cloudflare|429|401/.test(t)) {
+      return { bg: "#c0392b", icon: "⚠️", ms: 15000 };
+    }
+    if (/book|confirm|slot/.test(t)) {
+      return { bg: "#1e8449", icon: "🎯", ms: 12000 };
+    }
+    if (/captcha|security|login|session|dashboard/.test(t)) {
+      return { bg: "#2c3e50", icon: "🔑", ms: 6000 };
+    }
+    return { bg: "#5d6d7e", icon: "•", ms: 5000 };
+  }
+
+  function abToast(type, message) {
+    try {
+      if (!document.body) return;
+      const wrap = toastWrap();
+      const st = toastStyleFor(type);
+
+      const el = document.createElement("div");
+      el.style.cssText = [
+        `background:${st.bg}`, "color:#fff", "padding:9px 12px", "border-radius:6px",
+        "box-shadow:0 3px 12px rgba(0,0,0,.28)", "font-size:12.5px", "line-height:1.4",
+        "cursor:pointer", "pointer-events:auto", "opacity:0",
+        "transform:translateX(12px)", "transition:opacity .18s ease, transform .18s ease",
+        "word-break:break-word",
+      ].join(";");
+      const time = new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: false });
+      el.innerHTML =
+        `<div style="display:flex;gap:7px;align-items:flex-start;">
+           <span>${st.icon}</span>
+           <span style="flex:1;">${String(message || "").substring(0, 220).replace(/[<>]/g, "")}</span>
+           <span style="opacity:.65;font-size:10.5px;white-space:nowrap;">${time}</span>
+         </div>`;
+
+      const kill = () => {
+        el.style.opacity = "0";
+        el.style.transform = "translateX(12px)";
+        setTimeout(() => el.remove(), 200);
+      };
+      el.addEventListener("click", kill);
+
+      wrap.appendChild(el);
+      requestAnimationFrame(() => { el.style.opacity = "1"; el.style.transform = "translateX(0)"; });
+
+      // Cap the stack — drop the oldest rather than let a burst cover the page.
+      while (wrap.children.length > TOAST_MAX) wrap.firstChild.remove();
+
+      setTimeout(kill, st.ms);
+    } catch (e) { /* a toast must never break the bot */ }
+  }
+
   function trackEvent(type, message, username, extra) {
     const event = {
       id: Date.now() + "_" + Math.random().toString(36).substring(2, 6),
@@ -151,6 +225,7 @@
       }, 2000);
     }
     log(`[${type}] ${message}`);
+    abToast(type, message);   // #63 floating notification
 
     // Push to Supabase
     if (SUPABASE_ENABLED && SupabaseSync.isReady()) {
@@ -2488,10 +2563,10 @@
         <div id="ab-scan-section" style="margin-top:8px;padding:10px 12px;background:#f0f4f8;border:1px solid #d5dfe8;border-radius:6px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
           <strong style="font-size:13px;color:#1a5276;">Scan mode:</strong>
           <label style="cursor:pointer;font-size:13px;display:flex;align-items:center;gap:5px;">
-            <input type="radio" name="ab-scan-mode" value="parallel" checked> Parallel
+            <input type="radio" name="ab-scan-mode" value="parallel"> Parallel
           </label>
           <label style="cursor:pointer;font-size:13px;display:flex;align-items:center;gap:5px;">
-            <input type="radio" name="ab-scan-mode" value="sequential"> Sequential
+            <input type="radio" name="ab-scan-mode" value="sequential" checked> Sequential
           </label>
           <span id="ab-scan-info" style="font-size:12px;color:#888;margin-left:auto;"></span>
         </div>
@@ -2500,7 +2575,9 @@
     mainContainer.parentNode.insertBefore(panel, mainContainer);
 
     // Inject activity log panel below booking panel
-    injectActivityLogPanel(panel);
+    // #63 On-page Activity Log removed — it pushed the calendar down and
+    // duplicated the dashboard. Floating toasts (abToast) replace it.
+    // injectActivityLogPanel(panel);
 
     // Auto-populate from active user's profile
     chrome.storage.local.get(
@@ -2599,7 +2676,7 @@
     }
 
     chrome.storage.local.get(["__abScanMode"], (d) => {
-      __scanMode = d.__abScanMode === "sequential" ? "sequential" : "parallel";
+      __scanMode = d.__abScanMode === "parallel" ? "parallel" : "sequential";   // #63 default sequential
       const radio = document.querySelector(`input[name="ab-scan-mode"][value="${__scanMode}"]`);
       if (radio) radio.checked = true;
       scanUpdateInfo();
@@ -4298,7 +4375,7 @@
     // so round counting below can branch on it.
     try {
       const __sm = await new Promise((r) => chrome.storage.local.get(["__abScanMode"], r));
-      __scanMode = __sm.__abScanMode === "sequential" ? "sequential" : "parallel";
+      __scanMode = __sm.__abScanMode === "parallel" ? "parallel" : "sequential";   // #63 default sequential
     } catch { /* keep current value */ }
 
     // Round counting:
