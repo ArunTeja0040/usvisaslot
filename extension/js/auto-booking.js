@@ -25,7 +25,7 @@
   //   "sequential" = never parallel; one city at a time, switching the dropdown
   //                  in-page (no refresh), full sweep of every selected city.
   // Per machine (chrome.storage.local), switchable mid-cycle, applies next round.
-  let __scanMode = "parallel";
+  let __scanMode = "sequential";   // #63 sequential is the default
 
   // #56 a "round" = one full pass over every selected city. Sequential already
   // worked that way; parallel counted a round per batch of 2. Counting cities
@@ -47,6 +47,15 @@
     const { lo, hi } = gapBoundsMs();
     return lo + Math.random() * (hi - lo);
   }
+
+  // #58 Bounded submit retries on a throttle. Small on purpose: the site meters
+  // daily actions and a long burst triggers a 24-72h lockout.
+  const SUBMIT_RETRIES = 3;
+  // #58b Hard ceiling on one grab. "Keep retrying while the slot is still
+  // listed" is right for a stampede (slots stay unclaimed ~20-30s), but each
+  // calendar reload spends one of the client's metered daily actions — running
+  // away would trigger a 24-72h lockout and cost us the NEXT release too.
+  const GRAB_MAX_MS = 90 * 1000;
 
   const MAX_PARALLEL_STRIKES = 3;          // #46b after this many timeout rounds in a row, bench parallel
   const PARALLEL_BENCH_MS = 5 * 60 * 1000;  // #46b run pure-sequential this long before re-testing parallel
@@ -127,6 +136,80 @@
     }
   });
 
+  // ─── FLOATING NOTIFICATIONS (#63) ──────────────────────────────────
+  // Replaces the on-page Activity Log. Small corner toasts so problems are
+  // visible without a wall of text. Fed from trackEvent, so nothing else
+  // needs to know about them.
+  const TOAST_MAX = 4;                 // never cover the page
+  let __toastWrap = null;
+
+  function toastWrap() {
+    if (__toastWrap && document.body.contains(__toastWrap)) return __toastWrap;
+    __toastWrap = document.createElement("div");
+    __toastWrap.id = "ab-toasts";
+    __toastWrap.style.cssText = [
+      "position:fixed", "top:14px", "right:14px", "z-index:2147483647",
+      "display:flex", "flex-direction:column", "gap:8px",
+      "max-width:340px", "pointer-events:none", "font-family:system-ui,-apple-system,sans-serif",
+    ].join(";");
+    document.body.appendChild(__toastWrap);
+    return __toastWrap;
+  }
+
+  // Map an event type to look + lifetime.
+  function toastStyleFor(type) {
+    const t = String(type || "").toLowerCase();
+    if (/error|rate|severe|cloudflare|429|401/.test(t)) {
+      return { bg: "#c0392b", icon: "⚠️", ms: 15000 };
+    }
+    if (/book|confirm|slot/.test(t)) {
+      return { bg: "#1e8449", icon: "🎯", ms: 12000 };
+    }
+    if (/captcha|security|login|session|dashboard/.test(t)) {
+      return { bg: "#2c3e50", icon: "🔑", ms: 6000 };
+    }
+    return { bg: "#5d6d7e", icon: "•", ms: 5000 };
+  }
+
+  function abToast(type, message) {
+    try {
+      if (!document.body) return;
+      const wrap = toastWrap();
+      const st = toastStyleFor(type);
+
+      const el = document.createElement("div");
+      el.style.cssText = [
+        `background:${st.bg}`, "color:#fff", "padding:9px 12px", "border-radius:6px",
+        "box-shadow:0 3px 12px rgba(0,0,0,.28)", "font-size:12.5px", "line-height:1.4",
+        "cursor:pointer", "pointer-events:auto", "opacity:0",
+        "transform:translateX(12px)", "transition:opacity .18s ease, transform .18s ease",
+        "word-break:break-word",
+      ].join(";");
+      const time = new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: false });
+      el.innerHTML =
+        `<div style="display:flex;gap:7px;align-items:flex-start;">
+           <span>${st.icon}</span>
+           <span style="flex:1;">${String(message || "").substring(0, 220).replace(/[<>]/g, "")}</span>
+           <span style="opacity:.65;font-size:10.5px;white-space:nowrap;">${time}</span>
+         </div>`;
+
+      const kill = () => {
+        el.style.opacity = "0";
+        el.style.transform = "translateX(12px)";
+        setTimeout(() => el.remove(), 200);
+      };
+      el.addEventListener("click", kill);
+
+      wrap.appendChild(el);
+      requestAnimationFrame(() => { el.style.opacity = "1"; el.style.transform = "translateX(0)"; });
+
+      // Cap the stack — drop the oldest rather than let a burst cover the page.
+      while (wrap.children.length > TOAST_MAX) wrap.firstChild.remove();
+
+      setTimeout(kill, st.ms);
+    } catch (e) { /* a toast must never break the bot */ }
+  }
+
   function trackEvent(type, message, username, extra) {
     const event = {
       id: Date.now() + "_" + Math.random().toString(36).substring(2, 6),
@@ -142,6 +225,7 @@
       }, 2000);
     }
     log(`[${type}] ${message}`);
+    abToast(type, message);   // #63 floating notification
 
     // Push to Supabase
     if (SUPABASE_ENABLED && SupabaseSync.isReady()) {
@@ -2479,10 +2563,10 @@
         <div id="ab-scan-section" style="margin-top:8px;padding:10px 12px;background:#f0f4f8;border:1px solid #d5dfe8;border-radius:6px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
           <strong style="font-size:13px;color:#1a5276;">Scan mode:</strong>
           <label style="cursor:pointer;font-size:13px;display:flex;align-items:center;gap:5px;">
-            <input type="radio" name="ab-scan-mode" value="parallel" checked> Parallel
+            <input type="radio" name="ab-scan-mode" value="parallel"> Parallel
           </label>
           <label style="cursor:pointer;font-size:13px;display:flex;align-items:center;gap:5px;">
-            <input type="radio" name="ab-scan-mode" value="sequential"> Sequential
+            <input type="radio" name="ab-scan-mode" value="sequential" checked> Sequential
           </label>
           <span id="ab-scan-info" style="font-size:12px;color:#888;margin-left:auto;"></span>
         </div>
@@ -2491,7 +2575,9 @@
     mainContainer.parentNode.insertBefore(panel, mainContainer);
 
     // Inject activity log panel below booking panel
-    injectActivityLogPanel(panel);
+    // #63 On-page Activity Log removed — it pushed the calendar down and
+    // duplicated the dashboard. Floating toasts (abToast) replace it.
+    // injectActivityLogPanel(panel);
 
     // Auto-populate from active user's profile
     chrome.storage.local.get(
@@ -2590,7 +2676,7 @@
     }
 
     chrome.storage.local.get(["__abScanMode"], (d) => {
-      __scanMode = d.__abScanMode === "sequential" ? "sequential" : "parallel";
+      __scanMode = d.__abScanMode === "parallel" ? "parallel" : "sequential";   // #63 default sequential
       const radio = document.querySelector(`input[name="ab-scan-mode"][value="${__scanMode}"]`);
       if (radio) radio.checked = true;
       scanUpdateInfo();
@@ -2829,6 +2915,10 @@
   // page.js (MAIN world) fires vSCP events — we also listen for a custom 401 signal
   let __session401Detected = false;
   let __rateLimited429 = false;
+  // #58 submit-race diagnostics
+  let __submit429At = 0;          // when a 429 was last seen on the wire
+  let __lastThrottleText = "";    // what the throttle actually said
+  let __lastSubmitDiag = null;    // {status, retryAfter, cfRay, msRateLimit, snippet}
 
   // ─── CLOUDFLARE CHALLENGE / "UNABLE TO LOAD" DETECTION ─────────────
   let __cfChallengeActive = false;    // Turnstile widget detected on page
@@ -3026,7 +3116,26 @@
           XMLHttpRequest.prototype.send = function() {
             this.addEventListener("load", function() {
               if (this.status === 401) marker.setAttribute("data-401", Date.now());
-              else if (this.status === 429) marker.setAttribute("data-429", Date.now());
+              else if (this.status === 429) {
+                marker.setAttribute("data-429", Date.now());
+                // #58 capture WHICH system refused us — Cloudflare edge, the
+                // platform throttle, or the site's own limiter all return 429
+                // and need opposite responses.
+                try {
+                  var d = {
+                    at: Date.now(),
+                    url: String(this._url || "").substring(0, 200),
+                    status: this.status,
+                    retryAfter: this.getResponseHeader("Retry-After"),
+                    cfRay: this.getResponseHeader("CF-Ray"),
+                    msBurst: this.getResponseHeader("x-ms-ratelimit-burst-remaining-xrm-requests"),
+                    msTime: this.getResponseHeader("x-ms-ratelimit-time-remaining-xrm-requests"),
+                    ctype: this.getResponseHeader("Content-Type"),
+                    body: String(this.responseText || "").substring(0, 500)
+                  };
+                  marker.setAttribute("data-429-diag", JSON.stringify(d));
+                } catch (e) {}
+              }
             });
             return currentSend.apply(this, arguments);
           };
@@ -3039,7 +3148,27 @@
           window.fetch = function() {
             return origFetch.apply(this, arguments).then(function(resp) {
               if (resp.status === 401) marker.setAttribute("data-401", Date.now());
-              else if (resp.status === 429) marker.setAttribute("data-429", Date.now());
+              else if (resp.status === 429) {
+                marker.setAttribute("data-429", Date.now());
+                try {
+                  var d = {
+                    at: Date.now(),
+                    url: String(resp.url || "").substring(0, 200),
+                    status: resp.status,
+                    retryAfter: resp.headers.get("Retry-After"),
+                    cfRay: resp.headers.get("CF-Ray"),
+                    msBurst: resp.headers.get("x-ms-ratelimit-burst-remaining-xrm-requests"),
+                    msTime: resp.headers.get("x-ms-ratelimit-time-remaining-xrm-requests"),
+                    ctype: resp.headers.get("Content-Type")
+                  };
+                  resp.clone().text().then(function(t) {
+                    d.body = String(t || "").substring(0, 500);
+                    marker.setAttribute("data-429-diag", JSON.stringify(d));
+                  }).catch(function() {
+                    marker.setAttribute("data-429-diag", JSON.stringify(d));
+                  });
+                } catch (e) {}
+              }
               return resp;
             });
           };
@@ -3061,9 +3190,32 @@
             sendTelegramNotification("error", `⚠️ <b>401 SESSION EXPIRED</b>\n\n👤 <b>User:</b> ${u}\n🔄 Will attempt auto re-login`);
           });
         }
+        if (m.attributeName === "data-429-diag") {
+          // #58 record WHICH system refused us, for tuning the retry later
+          try {
+            const raw = document.getElementById("__ab401marker")?.getAttribute("data-429-diag");
+            if (raw) {
+              const d = JSON.parse(raw);
+              __lastSubmitDiag = d;
+              const src = d.cfRay ? "CLOUDFLARE edge"
+                        : (d.msBurst || d.msTime) ? "platform throttle"
+                        : "site/app limiter";
+              log(`[429 diag] source=${src} retryAfter=${d.retryAfter || "none"} ctype=${d.ctype || "?"} url=${d.url}`);
+              log(`[429 diag] body: ${(d.body || "").substring(0, 200)}`);
+              chrome.storage.local.get(["loginDetails"], (dd) => {
+                const u = dd.loginDetails?.username || "";
+                trackEvent(EVENT_TYPES.ERROR,
+                  `429 diag — source=${src}, retryAfter=${d.retryAfter || "none"}, body=${(d.body || "").substring(0, 120)}`, u);
+              });
+            }
+          } catch (e) { log("[429 diag] parse failed: " + e.message); }
+          continue;
+        }
+
         if (m.attributeName === "data-429") {
           log("429 rate limit detected via DOM bridge");
           __rateLimited429 = true;
+          __submit429At = Date.now();   // #58 lets waitForBookingOutcome see a wire-level 429
           chrome.storage.local.get(["loginDetails"], (d) => {
             const u = d.loginDetails?.username || "";
             trackEvent(EVENT_TYPES.ERROR, "429 rate limited", u);
@@ -3076,13 +3228,126 @@
     observer.observe(marker, { attributes: true });
   }
 
+  // #59 Terms / Privacy Act consent page shown after login + security questions.
+  // Identified by URL first (most reliable), then by the page's own content.
+  // Deliberately narrow so it can never match a real block page.
+  function isTermsConsentPage() {
+    const url = (window.location.href || "").toLowerCase();
+    if (/\/account\/login\/termsandconditions/.test(url)) return true;
+
+    // Content fallback: the acceptance checkboxes plus a Continue control.
+    const boxes = document.querySelectorAll('input[type="checkbox"]');
+    if (!boxes.length) return false;
+    const txt = (document.body?.textContent || "").toLowerCase();
+    const looksLikeConsent =
+      txt.includes("privacy act") ||
+      txt.includes("confidentiality statement") ||
+      txt.includes("i have read the terms");
+    if (!looksLikeConsent) return false;
+    return !!findContinueControl();
+  }
+
+  let __termsFailReason = "";   // #60b surfaced in the Telegram alert
+
+  function findContinueControl() {
+    const candidates = Array.from(document.querySelectorAll(
+      'input[type="submit"], input[type="button"], button, a.btn, a[role="button"], [onclick]'
+    ));
+    const wanted = /(continue|submit|accept|proceed|agree|next)/i;
+    // Prefer an exact-ish label, then fall back to any control containing the word.
+    return candidates.find((el) => {
+      const label = ((el.value || "") + " " + (el.textContent || "") + " " + (el.id || "") + " " + (el.name || "")).trim();
+      return wanted.test(label);
+    }) || null;
+  }
+
+  // #60b Ticks the acceptance boxes and clicks Continue.
+  // Portals commonly hide the real <input type=checkbox> and style a <label> or
+  // sibling span, so a plain .click() on an invisible input does nothing. This
+  // tries the input, then its label, then the parent, and verifies .checked
+  // actually flipped before moving on.
+  async function acceptTermsPage() {
+    try {
+      const all = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+      // Only skip boxes that are genuinely removed from the page.
+      const boxes = all.filter((cb) => {
+        if (cb.disabled) return false;
+        const st = window.getComputedStyle(cb);
+        const hiddenBySelf = st.display === "none" && !cb.closest("label");
+        return !hiddenBySelf;
+      });
+      log(`[terms] checkboxes: ${all.length} found, ${boxes.length} usable`);
+      if (!boxes.length) { __termsFailReason = `no usable checkboxes (${all.length} on page)`; log("[terms] FAIL: " + __termsFailReason); return false; }
+
+      for (const cb of boxes) {
+        if (cb.checked) continue;
+
+        // 1) direct
+        try { cb.click(); } catch (e) {}
+        // 2) its label (handles visually-hidden inputs)
+        if (!cb.checked) {
+          const lbl = (cb.id && document.querySelector(`label[for="${CSS.escape(cb.id)}"]`)) || cb.closest("label");
+          if (lbl) { try { lbl.click(); } catch (e) {} }
+        }
+        // 3) set the property directly and announce it
+        if (!cb.checked) {
+          cb.checked = true;
+          cb.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        cb.dispatchEvent(new Event("change", { bubbles: true }));
+        cb.dispatchEvent(new Event("blur", { bubbles: true }));
+        await sleep(150);
+        log(`[terms] checkbox ${cb.id || cb.name || "(unnamed)"} -> ${cb.checked ? "CHECKED" : "STILL UNCHECKED"}`);
+      }
+
+      const unchecked = boxes.filter((cb) => !cb.checked);
+      if (unchecked.length) { __termsFailReason = `${unchecked.length} checkbox(es) would not tick`; log("[terms] FAIL: " + __termsFailReason); return false; }
+
+      // Wait for Continue to become enabled.
+      let btn = null;
+      for (let i = 0; i < 30; i++) {
+        btn = findContinueControl();
+        if (btn && !btn.disabled) break;
+        await sleep(150);
+      }
+      if (!btn) {
+        const seen = Array.from(document.querySelectorAll('input[type="submit"], button, a.btn'))
+          .map((e) => (e.value || e.textContent || "").trim().substring(0, 30)).filter(Boolean).slice(0, 8);
+        __termsFailReason = `Continue button not found. Buttons seen: ${seen.join(" | ") || "none"}`;
+        log("[terms] FAIL: " + __termsFailReason);
+        return false;
+      }
+      if (btn.disabled) { __termsFailReason = "Continue button stayed greyed out after ticking"; log("[terms] FAIL: " + __termsFailReason); return false; }
+
+      log(`[terms] clicking Continue (${(btn.value || btn.textContent || "").trim().substring(0, 30)})`);
+      clickSafe(btn);
+      return true;
+    } catch (e) {
+      __termsFailReason = "error: " + e.message; log("[terms] FAIL: " + __termsFailReason);
+      return false;
+    }
+  }
+
   function isCloudflareBlocked() {
     // Only detect actual Cloudflare block pages — not normal pages with stray keyword matches
     // Real CF block pages have specific elements and title patterns
     const title = (document.title || "").toLowerCase();
-    if (title.includes("attention required") || title.includes("access denied") || title.includes("error 1015")) {
+    // #59 "access denied" alone is NOT proof of a Cloudflare block — the site's
+    // own Terms/Privacy Act consent page carries that exact title. Require a
+    // real Cloudflare fingerprint alongside it. "attention required" and
+    // "error 1015" remain conclusive on their own.
+    if (title.includes("attention required") || title.includes("error 1015")) {
       log("Cloudflare block detected via page title: " + document.title);
       return true;
+    }
+    if (title.includes("access denied")) {
+      const cfProof = document.querySelector("#cf-error-details, .cf-error-overview, .cf-wrapper, #challenge-running, #challenge-form")
+        || /cloudflare|cf-ray|error 1015/i.test((document.body?.textContent || "").substring(0, 3000));
+      if (cfProof) {
+        log("Cloudflare block detected: 'access denied' title + Cloudflare marker");
+        return true;
+      }
+      log("Title says 'access denied' but no Cloudflare marker — NOT treating as a block");
     }
     // Cloudflare block pages have specific class/id markers
     const cfMarker = document.querySelector("#cf-error-details, .cf-error-overview, .cf-wrapper, #challenge-running, #challenge-form");
@@ -3425,7 +3690,29 @@
   // Fast-grab with retry loop (#41): re-poke the same city to reload a slow calendar,
   // up to MAX_ATTEMPTS. Exit to normal scanning when no in-range date is left, slot taken,
   // or attempts exhausted (mark dead). Resume cycling on any non-booked exit.
+  // #62 A missing date range must NEVER mean "book anything". isDateInRange
+  // returns true for every date when both bounds are empty (fine for showing
+  // what's available), so without this guard a blank panel would auto-submit the
+  // first slot it saw, at any date, for a real client.
+  function hasDateRange() {
+    const sd = document.getElementById("ab-start-date")?.value || "";
+    const ed = document.getElementById("ab-end-date")?.value || "";
+    return !!(sd || ed);
+  }
+
   async function fastGrabBooking(cityValue, cityName, dateStr, alreadyOnCity = false) {
+    if (!hasDateRange()) {
+      const who = await new Promise((r) => chrome.storage.local.get(["loginDetails"], (d) => r(d.loginDetails?.username || "")));
+      log("[fastgrab] BLOCKED — no date range set; refusing to auto-book");
+      trackEvent(EVENT_TYPES.ERROR, "Auto-book blocked: no date range set for this client", who);
+      sendTelegramNotification("error",
+        `🛑 <b>BOOKING BLOCKED — NO DATE RANGE</b>\n\n👤 <b>User:</b> ${who}\n` +
+        `📍 ${cityName} ${dateStr}\n` +
+        `⚠️ Start/End date are empty, so ANY date would count as wanted.\n` +
+        `✋ Not booking. Set the date range for this client, then restart.`);
+      stopCycling("No date range set — auto-book blocked");
+      return;
+    }
     if (__fastGrabbing) return;
     __fastGrabbing = true;
     const u = await new Promise((r) => chrome.storage.local.get(["loginDetails"], (d) => r(d.loginDetails?.username || "")));
@@ -3446,8 +3733,15 @@
     let lastTriedDate = dateStr;
 
     try {
+      const grabStartedAt = Date.now();
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         if (__abortAll) break;
+        if (Date.now() - grabStartedAt > GRAB_MAX_MS) {
+          log(`[fastgrab] ${Math.round(GRAB_MAX_MS / 1000)}s budget spent on ${cityName} — back to scanning`);
+          sendTelegramNotification("error",
+            `⏱️ <b>GRAB TIMED OUT</b>\n\n👤 ${u}\n📍 ${cityName} ${lastTriedDate || ""}\nKept trying ${Math.round(GRAB_MAX_MS / 1000)}s — back to scanning`);
+          resumeScan = true; break;
+        }
         log(`[fastgrab] attempt ${attempt}/${MAX_ATTEMPTS} — ${cityName}`);
 
         // (Re)select the city to (re)load its calendar — except attempt 1 of the
@@ -3466,7 +3760,7 @@
           if (!inRange.length) { resumeScan = true; log(`[fastgrab] no in-range date left at ${cityName} — back to scanning`); break; }
           targetDate = inRange[0];
         } else {
-          await sleep(500); // already on city — small settle
+          await sleep(150); // #58 was 500 — trimmed; the calendar wait below is event-driven anyway
         }
         lastTriedDate = targetDate;
 
@@ -3503,6 +3797,58 @@
             `🎉 <b>VAC BOOKED!</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n🕐 <b>${pickedTime || "first slot"}</b>\n✅ ${outcome === "ofc_submitted" ? "OFC submitted → consular next" : "Confirmed"}\n⏱️ Booked in ${ms}ms`);
           booked = true; break;
         }
+        // #58 A throttle is NOT a lost race — the server refused us before doing
+        // anything, so the slot was not booked by anyone on this attempt.
+        // Phase 1: classify + report correctly and let the attempt loop try
+        // again (instead of declaring "slot taken" and abandoning it).
+        if (outcome === "throttled") {
+          log(`[fastgrab] THROTTLED on submit — "${__lastThrottleText}"`);
+          trackEvent(EVENT_TYPES.ERROR, `Submit throttled: ${__lastThrottleText}`, u);
+
+          // Retry the SUBMIT ONLY — never re-run city/calendar/time. The form is
+          // still filled and the page has not navigated, so re-clicking submit
+          // costs one request instead of four. Bounded and jittered: the site
+          // meters daily actions, and a long burst gets the client locked out.
+          let outcome2 = "throttled";
+          for (let r = 1; r <= SUBMIT_RETRIES && outcome2 === "throttled"; r++) {
+            const waitMs = 700 + Math.random() * 1300;
+            log(`[fastgrab] submit retry ${r}/${SUBMIT_RETRIES} in ${Math.round(waitMs)}ms`);
+            await sleep(waitMs);
+            if (__abortAll || await checkStopSignal()) { log("[fastgrab] stop requested — aborting submit retries"); break; }
+            const btn2 = document.getElementById("submitbtn");
+            if (!btn2 || btn2.disabled) { log("[fastgrab] submit no longer clickable — stopping retries"); break; }
+            btn2.click();
+            outcome2 = await waitForBookingOutcome(8000);
+          }
+
+          if (outcome2 === "confirmed" || outcome2 === "ofc_submitted") {
+            updateUserStatus(u, "confirmed", { confirmedAt: new Date().toISOString() });
+            updateSlotHistoryAction(u, cityName, targetDate, outcome2 === "confirmed" ? "confirmed" : "submitted");
+            sendTelegramNotification("confirmed",
+              `🎉 <b>VAC BOOKED (after retry)!</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n🕐 <b>${pickedTime || "slot"}</b>\n✅ ${outcome2 === "ofc_submitted" ? "OFC submitted → consular next" : "Confirmed"}`);
+            booked = true; break;
+          }
+          if (outcome2 === "failed") {
+            log("[fastgrab] slot genuinely taken during retries");
+            markDeadSlot(cityValue, targetDate);
+            sendTelegramNotification("error", `❌ <b>SLOT TAKEN</b>\n\n👤 ${u}\n📍 ${cityName} ${targetDate}\nSomeone booked it first`);
+            resumeScan = true; break;
+          }
+          // Still throttled (or ambiguous). Do NOT blindly re-submit — but do
+          // NOT give up on the city either. Fall through to the next attempt,
+          // which reloads this city's calendar and re-reads its in-range dates.
+          // If the slot is still there we go again; if it's gone, the loop's own
+          // "no in-range date left" check exits us back to scanning.
+          if (outcome2 !== "throttled") {
+            // ambiguous/timeout after a retry — genuinely unsafe to continue
+            sendTelegramNotification("error",
+              `❓ <b>BOOKING UNCERTAIN</b>\n\n👤 ${u}\n📍 ${cityName} ${targetDate}\nNo clear answer after retry — check manually`);
+            break;
+          }
+          log(`[fastgrab] still throttled after ${SUBMIT_RETRIES} retries — reloading ${cityName} calendar and trying again`);
+          continue;
+        }
+
         if (outcome === "failed") {
           sendTelegramNotification("error", `⚠️ <b>BOOKING FAILED (slot taken)</b>\n\n👤 ${u}\n${cityName} ${targetDate}\n❌ Someone grabbed it first`);
           resumeScan = true; break;
@@ -3833,6 +4179,21 @@
     const wasOnOfc = originPath.includes("/ofc-schedule");
     const wasOnInterview = !wasOnOfc && originPath.includes("/schedule");
 
+    // #58 A transient throttle is NOT a lost race. The site's throttle wording
+    // ("too many requests processing at the same time... please try again")
+    // contains "try again", which matches failPatterns below — so it used to be
+    // reported as "slot taken" and the slot was abandoned without a retry.
+    // These are checked FIRST so the generic /try again/ never sees them.
+    const throttlePatterns = [
+      /too\s+many\s+requests/i,
+      /processing\s+at\s+the\s+same\s+time/i,
+      /too\s+many\s+concurrent/i,
+      /server\s+is\s+busy/i,
+      /\b429\b/,
+      /request\s+limit\s+exceeded/i,
+      /please\s+wait\s+and\s+try/i,
+    ];
+
     const failPatterns = [
       /no\s+longer\s+available/i,
       /slot\s+(is\s+)?(no\s+longer\s+|not\s+)?available/i,
@@ -3866,6 +4227,10 @@
       for (const el of errorEls) {
         const txt = (el.textContent || "").trim();
         if (!txt) continue;
+        // #58 throttle first — it must not fall through into failPatterns
+        for (const re of throttlePatterns) {
+          if (re.test(txt)) { __lastThrottleText = txt.substring(0, 300); return "throttled"; }
+        }
         for (const re of failPatterns) {
           if (re.test(txt)) return "failed";
         }
@@ -3873,8 +4238,18 @@
 
       // Generic page-wide pattern check (last resort)
       const bodyTxt = (document.body?.textContent || "").substring(0, 5000);
-      for (const re of failPatterns) {
-        if (re.test(bodyTxt)) return "failed";
+      for (const re of throttlePatterns) {
+        if (re.test(bodyTxt)) {
+          const m = bodyTxt.match(/[^.]*(?:too many requests|processing at the same time|server is busy)[^.]*\./i);
+          __lastThrottleText = (m ? m[0] : "throttle detected").trim().substring(0, 300);
+          return "throttled";
+        }
+      }
+      // #58 a 429 seen on the wire counts as a throttle even if the page shows nothing
+      if (__submit429At && Date.now() - __submit429At < 20000) {
+        __submit429At = 0;
+        __lastThrottleText = "HTTP 429 observed on submit (no page message)";
+        return "throttled";
       }
 
       await sleep(500);
@@ -3882,22 +4257,57 @@
     return "timeout";
   }
 
+  // #58 Resolve as soon as the submit button becomes enabled, instead of
+  // sleeping a fixed 800ms and hoping. Falls back to the timeout.
+  function waitForSubmitEnabled(timeout = 4000) {
+    return new Promise((resolve) => {
+      const btn = document.getElementById("submitbtn");
+      if (btn && !btn.disabled) return resolve(true);
+      let done = false;
+      const finish = (v) => {
+        if (done) return;
+        done = true;
+        try { obs.disconnect(); } catch (e) {}
+        clearInterval(poll);
+        clearTimeout(timer);
+        resolve(v);
+      };
+      const check = () => {
+        const b = document.getElementById("submitbtn");
+        if (b && !b.disabled) finish(true);
+      };
+      const obs = new MutationObserver(check);
+      try {
+        obs.observe(document.body, {
+          attributes: true, subtree: true, attributeFilter: ["disabled", "class"],
+        });
+      } catch (e) {}
+      // Safety net: the site may swap the button rather than flip the attribute.
+      const poll = setInterval(check, 120);
+      const timer = setTimeout(() => finish(false), timeout);
+    });
+  }
+
   async function waitForTimeSlotAndSelect(timeout = 12000) {
     const start = Date.now();
     while (Date.now() - start < timeout) {
-      const radio = document.querySelector(
-        '#time_select input[type="radio"]'
+      // #58 Pick a RANDOM time slot rather than always the first. Every
+      // competing bot takes the first radio, so contention concentrates there.
+      // The DATE is still the earliest in range — this only varies the time
+      // within that date, so the client is not given a worse appointment.
+      const radios = Array.from(
+        document.querySelectorAll('#time_select input[type="radio"]:not([disabled])')
       );
-      if (radio) {
+      if (radios.length) {
+        const radio = radios[Math.floor(Math.random() * radios.length)];
         if (!radio.checked) radio.click();
-        await sleep(800);
+        if (radios.length > 1) log(`[fastgrab] picked time slot ${radios.indexOf(radio) + 1}/${radios.length} (random)`);
 
-        const submitBtn = document.getElementById("submitbtn");
-        if (submitBtn && !submitBtn.disabled) {
-          return true;
-        }
+        // #58 was: await sleep(800)
+        const ready = await waitForSubmitEnabled(4000);
+        if (ready) return true;
       }
-      await sleep(500);
+      await sleep(200);
     }
     return false;
   }
@@ -3965,7 +4375,7 @@
     // so round counting below can branch on it.
     try {
       const __sm = await new Promise((r) => chrome.storage.local.get(["__abScanMode"], r));
-      __scanMode = __sm.__abScanMode === "sequential" ? "sequential" : "parallel";
+      __scanMode = __sm.__abScanMode === "parallel" ? "parallel" : "sequential";   // #63 default sequential
     } catch { /* keep current value */ }
 
     // Round counting:
@@ -4207,38 +4617,16 @@
 
       // ── Layer 2: Cloudflare Turnstile challenge detection ──
       if (detectTurnstileChallenge()) {
-        __cfChallengeActive = true;
-        setStatus("🛡️ Cloudflare challenge detected — waiting for manual solve...");
-        log("Turnstile challenge detected — pausing cycling");
-        chrome.storage.local.get(["loginDetails"], (d) => {
-          const u = d.loginDetails?.username || "";
-          trackEvent(EVENT_TYPES.ERROR, `Cloudflare Turnstile challenge detected at round ${cycling.round}`, u);
-          sendTelegramNotification("rate",
-            `🛡️ <b>CLOUDFLARE CHALLENGE</b>\n\n` +
-            `👤 <b>User:</b> ${u}\n` +
-            `⚠️ "Verify you are human" detected\n` +
-            `⏸️ Cycling PAUSED — solve manually\n` +
-            `🔁 Round ${cycling.round}`
-          );
-        });
-        const solved = await waitForChallengeSolved();
-        if (!cycling.active) return;
-        if (!solved) {
-          stopCycling("Cloudflare challenge not solved within timeout");
-          return;
-        }
-        // Challenge solved — add cooldown before resuming
-        setStatus("✅ Challenge solved — resuming in 10s...");
-        await sleep(10000);
-        if (!cycling.active) return;
-        // Reset re-entry count since user just solved challenge
-        __reentryCount = 0;
-        sessionStorage.removeItem("__abUnableCount"); // #49
-        chrome.storage.local.get(["loginDetails"], (d) => {
-          const u = d.loginDetails?.username || "";
-          trackEvent(EVENT_TYPES.SESSION, "Cloudflare challenge solved — cycling resumed", u);
-          sendTelegramNotification("rate", `✅ <b>CHALLENGE SOLVED</b>\n\n👤 <b>User:</b> ${u}\n▶️ Cycling resumed\n🔁 Round ${cycling.round}`);
-        });
+        // #61 Use the SAME recovery the parallel path uses: save cycling state
+        // and reload. Resuming in place after a Cloudflare interstitial left the
+        // page's own JS half-dead — the location dropdown and calendar never
+        // re-initialised, so dates stopped loading and the operator had to log
+        // out and start over. A reload rebuilds the page cleanly and cycling
+        // auto-resumes from the saved state.
+        const cfUser2 = (await getSettings()).loginDetails?.username || "";
+        log("Turnstile challenge detected mid-cycle — saving state and reloading for a clean recovery");
+        await handleCloudflareChallenge(cfUser2);
+        return;
       }
 
       // Check for 429 rate limit — severe error, auto-logout
@@ -4783,8 +5171,10 @@
       const ed = document.getElementById("ab-end-date");
       const gmin = document.getElementById("ab-gap-min");
       const gmax = document.getElementById("ab-gap-max");
-      if (sd) sd.value = savedState.startDate;
-      if (ed) ed.value = savedState.endDate;
+      // #62 Only overwrite when the saved value is real — a blank saved value
+      // must not wipe a range the panel already filled in from the profile.
+      if (sd && savedState.startDate) sd.value = savedState.startDate;
+      if (ed && savedState.endDate) ed.value = savedState.endDate;
       if (gmin && savedState.gapMin) gmin.value = savedState.gapMin;
       if (gmax && savedState.gapMax) gmax.value = savedState.gapMax;
 
@@ -4941,6 +5331,28 @@
       sessionStorage.removeItem("__ab401RetryCount");
       log("On b2clogin.com — detecting page type...");
       await handleLoginPage();
+      return;
+    }
+
+    // #59 Terms / Privacy Act consent page. MUST run before the Cloudflare check:
+    // this page's title is "Access Denied · Customer Self-Service" (a Dynamics
+    // quirk — you are not authorised until you accept), which the CF detector
+    // was reading as a block and logging the client out.
+    if (host.includes("usvisascheduling.com") && isTermsConsentPage()) {
+      const tUser = settings.loginDetails?.username || activeAutoUser || "";
+      log("Terms/Privacy Act consent page detected — accepting to continue");
+      const done = await acceptTermsPage();
+      if (done) {
+        trackEvent(EVENT_TYPES.SESSION, "Terms/Privacy Act page accepted", tUser);
+        return; // page navigates; the router re-runs on the next page
+      }
+      log("Terms page detected but could not complete — leaving it for manual action");
+      trackEvent(EVENT_TYPES.ERROR, "Terms page could not be completed automatically", tUser);
+      sendTelegramNotification("error",
+        `📋 <b>TERMS PAGE NEEDS ATTENTION</b>\n\n👤 <b>User:</b> ${tUser}\n` +
+        `The Privacy Act / terms page appeared but couldn't be completed automatically.\n` +
+        `🔎 <b>Reason:</b> ${__termsFailReason || "unknown"}\n` +
+        `Please tick the boxes and click Continue on that device.`);
       return;
     }
 
@@ -5132,15 +5544,29 @@
         sessionStorage.setItem(RELOGIN_FLAG, "true");
         const existingState = sessionStorage.getItem("ab-cycling-state");
         if (!existingState) {
+          // #62 Seed from the CLIENT'S PROFILE, never blank. Writing empty dates
+          // here meant that after an IP change (VPN) -> 401 -> re-login, the panel
+          // restored with no date range — and an empty range makes EVERY date
+          // count as in-range, so the bot would auto-book any slot at any date.
+          const bootProfile = await new Promise((r) => {
+            chrome.storage.local.get(["loginDetails", "userProfilesList"], (d) => {
+              const un = d.loginDetails?.username;
+              const list = d.userProfilesList || [];
+              r(un ? list.find((pr) => pr.username === un) : null);
+            });
+          }).catch(() => null);
           sessionStorage.setItem("ab-cycling-state", JSON.stringify({
             active: true,
             round: 0,
-            startDate: "",
-            endDate: "",
-            gapMin: "10", gapMax: "15",   // #56c re-login bootstrap defaults
-            locations: [],
+            startDate: bootProfile?.startDate || "",
+            endDate: bootProfile?.endDate || "",
+            gapMin: "10", gapMax: "15",
+            locations: bootProfile?.locations || [],
             timestamp: Date.now()
           }));
+          if (!bootProfile?.startDate && !bootProfile?.endDate) {
+            log("[re-login] WARNING: no date range on this client's profile — auto-book will be blocked until one is set");
+          }
         }
 
         window.location.href = window.location.origin + "/en-US/";
