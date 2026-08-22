@@ -3101,6 +3101,15 @@
   // by using a PerformanceObserver for failed network requests instead.
   function inject401Detector() {
     if (document.getElementById("__ab401marker")) return;
+    // #65 Skip on Cloudflare interstitials — their CSP blocks inline scripts.
+    // Detect cheaply, without depending on functions defined later.
+    const cfPage = /[?&]__cf_chl/.test(window.location.search)
+      || document.querySelector("#challenge-running, #challenge-form, #challenge-stage, .cf-turnstile, iframe[src*='challenges.cloudflare.com']")
+      || /just a moment/i.test(document.title || "");
+    if (cfPage) {
+      log("[401det] Cloudflare interstitial — skipping detector injection (CSP blocks inline scripts)");
+      return;
+    }
     const marker = document.createElement("div");
     marker.id = "__ab401marker";
     marker.style.display = "none";
@@ -3179,7 +3188,11 @@
         }
       })();
     `;
-    document.documentElement.appendChild(script);
+    try {
+      document.documentElement.appendChild(script);
+    } catch (e) {
+      log("[401det] injection blocked: " + e.message);
+    }
     script.remove();
 
     const observer = new MutationObserver((mutations) => {
@@ -5233,6 +5246,10 @@
 
     // Inject 401 detector on scheduling pages (MAIN world XHR intercept)
     if (host.includes("usvisascheduling.com")) {
+      // #65 Cloudflare challenge/waiting-room pages ship a strict CSP that
+      // forbids injected inline scripts, so this only produced console errors.
+      // The detector is pointless there anyway — the site's own API calls are
+      // not running yet. Skip it; the next real page load installs it.
       inject401Detector();
 
       // Parallel-scan A1: capture the real schedule-days request template from page.js (MAIN world)

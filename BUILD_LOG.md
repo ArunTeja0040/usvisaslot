@@ -12,6 +12,22 @@ Format:
 
 ---
 
+## 2026-08-16 — Fix: console errors on Cloudflare "verify you are human" pages (Issue #65)
+**What you saw:** a stream of red "Content Security Policy" errors in the console whenever the bot landed on a Cloudflare verification page.
+
+**Why:** the bot installs a small watcher on each page to spot session errors. Cloudflare's verification pages have very strict security rules that forbid adding anything to the page — so every attempt was rejected and logged an error. The watcher wasn't needed there anyway: on a verification page the website isn't doing any work to watch.
+
+**Fixed:** the bot now recognises a Cloudflare verification page and skips the watcher entirely, installing it on the next real page instead. No error, no lost function.
+
+**Other messages in that same report are not faults and need no action:**
+- **"Cannot read properties of null (outerText)"** — comes from the older bundled extension code, which expects page elements that don't exist on a verification page.
+- **"Supabase Failed to fetch"** — Cloudflare's verification page blocks outside connections, so cloud updates can't send from there. They're queued and sent on the next normal page.
+- **"Running the JavaScript URL violates..."** — links on the site that run scripts; already handled for the bot's own clicks.
+
+All three are just symptoms of sitting on a verification page.
+
+---
+
 ## 2026-08-16 — Removed the settings panel from the login page (Issue #64)
 **What changed:** the big blue "Auto-Booking Settings" box that covered the left side of the login page is gone.
 
@@ -103,6 +119,22 @@ Fix 3 is the one that matters most: it makes this kind of failure safe no matter
 **The two-second flicker is fixed.** The whole client grid used to be thrown away and rebuilt every two seconds. That is why hovering a card sometimes felt like it slipped, why text you highlighted vanished, and why an open "Assigned to" dropdown had to be protected with a special rule that froze the entire screen while it was open. Now each card is compared against what is already on screen and only the ones that actually changed are redrawn. **Measured: 38 of 39 cards now survive untouched across three refreshes — only the one client actually cycling gets redrawn.** The dropdown fix is better too: instead of freezing the whole dashboard while it is open, only that one card is left alone and everything else keeps updating.
 
 **A bug found and fixed during your testing:** at normal zoom every card was cut down to just the name row — no dates, no Start button. Cause: the new left stripe needed the card to clip its own edges, and in a CSS grid an element that clips itself is allowed to shrink to nothing when space runs short. With six test clients there was room to spare so it never appeared; with your thirty-nine there wasn't. Fixed by rounding the stripe instead of clipping the card, and by pinning row heights to their content.
+
+**Five new things on top of the redesign.**
+
+**A consulate strip.** Five tiles under the numbers — Mumbai, New Delhi, Chennai, Kolkata, Hyderabad — each showing how many in-range slots that city has released today, how many were seen in total, and how long ago the last one appeared. A city glows amber when it has produced something in range today and greys out when it has gone quiet. Click one and the client list filters to everyone hunting that city. It tells you where to point people before you start them.
+
+**A release heatmap** (Stats tab). Every slot the extension has ever recorded carries a timestamp. Those get bucketed by consulate and by hour of the day, IST, and drawn as a grid — dark where nothing happens, bright amber where slots land. Underneath it works out the densest three-hour window across all consulates and says so in a sentence. On the test data that reads "07:00–10:00 IST". That is the answer to "when should I have clients running", and just as importantly when it is worth spending one of a client's limited daily page-views. Nothing else you have shows this, and it needed no new data collection — the timestamps were already there.
+
+**Pipeline value** (Stats tab, owner only). You store an agreed price and an applicant count against every client, and who each is assigned to. That is now added up: confirmed this month, in flight, and blocked-or-at-risk, plus a per-staff board of who has confirmed what. Hidden entirely in staff view, same rule as the price on the card.
+
+**Client health rings** (Stats tab). Your dashboard was showing clients at 93 errors in 464 rounds and 88 in 460 — about one request in five failing — in plain grey text that nothing drew your eye to. Each client now gets a ring that fills green, amber or red by error rate, worst first. A client degrading toward a rate-limit becomes obvious before it gets blocked. Clients with under ten rounds are left out, since there is not enough there to judge.
+
+**Wall mode.** A **Wall** button in the header, Esc to leave. Fills the screen with four big numbers — cycling, slots today, confirmed, blocked — the consulate line, and the last six events, for leaving on a second monitor. It reads; it never starts or stops anything.
+
+**Cards got shorter, not taller.** The first cut of the redesign put one label per row and boxed both the slot summary and the round counters, which made every card about 420px tall — worse than before. Now dates and visa sit side by side, two pairs to a row, and the two boxes are quiet single lines. Cards came down to roughly 290px, so you see about twice as many clients per screen.
+
+**A bug this caught:** the Slot History tab shared its row layout with the activity log, and the log had gained a colour dot column. Slot History was still emitting the old four columns, so every row would have shifted one place to the left. Fixed by giving it the same five, with in-range now shown by the dot and a small "in range" tag instead of a tick emoji.
 
 **Two off switches, not one:** one turns off the new alert strip, pop-ups, palette and hold-to-clear; the other returns to the old rebuild-everything-every-two-seconds behaviour. Either can be flipped on its own.
 
