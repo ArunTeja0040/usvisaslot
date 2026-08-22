@@ -12,6 +12,20 @@ Format:
 
 ---
 
+## 2026-08-23 — Blocked IP now changes itself (Issue #70)
+**What it does:** when Cloudflare refuses a client's IP, the bot no longer just stops and waits for you. It asks the VPN to move to a different city, checks the IP actually changed, and restarts that client on the fresh connection — all by itself.
+
+**What you'll see instead of "change the IP":**
+> 🔄 **IP CHANGED AUTOMATICALLY** — New IP: 1.2.3.4 — Restarting this client...
+
+**Limited to 3 changes an hour, on purpose.** Sometimes a block follows the *account*, not the IP — in that case rotating would just burn through every Mullvad server for nothing. After 3 tries in an hour it stops and asks you, and tells you why it stopped.
+
+**If the VPN server isn't running** (`python vpn_server.py`), nothing changes — it stops and alerts exactly as before.
+
+**Why this is better than the old rotation:** rotation currently happens every 15-20 minutes whether or not anything is wrong — so it moves off perfectly good connections and can sit on bad ones. Reacting to a real block means fewer changes and faster recovery.
+
+---
+
 ## 2026-08-23 — Removed bundled code that was reporting your bookings to a competitor (Issue #69)
 **What we found:** buried in the extension was the original **CheckVisaSlots** extension code. It was still calling home to their servers — including an endpoint literally named **`/push/appointment-confirmation`**, i.e. reporting your clients' confirmed bookings.
 

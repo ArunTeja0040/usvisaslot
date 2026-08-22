@@ -3068,6 +3068,52 @@
   // it because every navigation created a fresh page.
   const SEVERE_ALERT_COOLDOWN_MS = 15 * 60 * 1000;
 
+  // #70 Auto-rotate the VPN when an IP is refused, instead of waiting for a
+  // human to change it. Bounded: a client whose block follows it across exits
+  // must not chew through every server.
+  const VPN_AUTOROTATE_MAX = 3;                   // rotations per window
+  const VPN_AUTOROTATE_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+
+  function vpnCommand(command) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ action: "vpnControl", command }, (resp) => {
+          if (chrome.runtime.lastError) return resolve({ ok: false, error: chrome.runtime.lastError.message });
+          resolve(resp || { ok: false, error: "no response" });
+        });
+      } catch (e) { resolve({ ok: false, error: e.message }); }
+    });
+  }
+
+  // Returns the new IP on success, null if it could not (or should not) rotate.
+  async function autoRotateVpn(reason) {
+    const store = await new Promise((r) => chrome.storage.local.get(["__abVpnRotates"], r));
+    const hist = (store.__abVpnRotates || []).filter((t) => Date.now() - t < VPN_AUTOROTATE_WINDOW_MS);
+    if (hist.length >= VPN_AUTOROTATE_MAX) {
+      log(`[vpn] auto-rotate budget spent (${hist.length}/${VPN_AUTOROTATE_MAX} this hour) — not rotating`);
+      return null;
+    }
+
+    const status = await vpnCommand("status");
+    if (status.error || !status.connected) {
+      log("[vpn] server offline or not connected — cannot auto-rotate");
+      return null;
+    }
+    const before = status.public_ip || "";
+
+    log(`[vpn] ${reason} — rotating exit (attempt ${hist.length + 1}/${VPN_AUTOROTATE_MAX})`);
+    const res = await vpnCommand("rotate");
+    if (res.error) { log("[vpn] rotate failed: " + res.error); return null; }
+
+    const after = res.public_ip || "";
+    if (after && after === before) { log("[vpn] rotate returned the same IP — treating as failed"); return null; }
+
+    hist.push(Date.now());
+    await new Promise((r) => chrome.storage.local.set({ __abVpnRotates: hist }, r));
+    log(`[vpn] rotated ${before || "?"} -> ${after || "?"}${res.city ? " (" + res.city + ")" : ""}`);
+    return after || "changed";
+  }
+
   function handleSevereError(reason) {
     // Re-entry guard — prevent flood within the same page
     if (window.__severeErrorHandling) return;
@@ -3096,9 +3142,31 @@
       return;
     }
 
-    chrome.storage.local.get(["loginDetails"], (d) => {
+    chrome.storage.local.get(["loginDetails"], async (d) => {
       const u = d.loginDetails?.username || "";
       const isFirewall = /1020|firewall|have been blocked/i.test(reason);
+
+      // #70 Try to change the IP ourselves before asking a human to.
+      const newIp = await autoRotateVpn(reason);
+      if (newIp) {
+        trackEvent(EVENT_TYPES.SESSION, `Auto-rotated VPN after ${reason} — new IP ${newIp}`, u);
+        sendTelegramNotification("rate",
+          `🔄 <b>IP CHANGED AUTOMATICALLY</b>\n\n` +
+          `👤 <b>User:</b> ${u}\n` +
+          `⚠️ ${reason}\n` +
+          `🌐 New IP: <b>${newIp}</b>\n` +
+          `▶️ Restarting this client on the new IP...`);
+        updateUserStatus(u, "idle");
+        // Clear the pause so the restarted client is not held back, then let the
+        // saved state bring cycling back on the fresh IP.
+        sessionStorage.removeItem("__abPausedRateLimit");
+        sessionStorage.removeItem("__abSevereAt");
+        chrome.storage.local.set({ activeAutomationUser: u }, () => {
+          setTimeout(() => { window.location.href = window.location.origin + "/en-US/"; }, 4000);
+        });
+        return;
+      }
+
       log(`Severe: ${reason} — stopped, alerting once. No navigation (every page on this IP is blocked).`);
       trackEvent(EVENT_TYPES.ERROR, `Severe: ${reason} — stopped, change IP`, u);
       sendTelegramNotification("error",
@@ -3110,6 +3178,7 @@
           ? `🌐 Cloudflare is refusing this IP outright (firewall rule, not a speed limit). Waiting will not clear it.\n`
           : `🌐 This IP is rate-limited. It may clear on its own, but changing IP is faster.\n`) +
         `🔧 <b>Change the IP</b> (different network / VPN exit), then restart this client.\n` +
+        `🔄 <i>Auto-rotate did not run — VPN server offline, or the hourly rotation budget is spent.</i>\n` +
         `⏸️ Stopped — still logged in, no logout.`
       );
       updateUserStatus(u, "rate_limited");
