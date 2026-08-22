@@ -12,6 +12,22 @@ Format:
 
 ---
 
+## 2026-08-22 — Fix: the bot's session/rate-limit watcher never worked on the booking page (Issue #67)
+**What was wrong:** the bot installs a small watcher to notice when the website says *"session expired"* (401) or *"too many requests"* (429). On the booking page that watcher was **being rejected every single time** — so those two things went unnoticed there.
+
+**Why:** the website only allows scripts that come from a proper file, not code typed straight into the page. The bot was doing the second kind. And because it left a marker behind saying "installed", it never tried again — so it looked fine while doing nothing.
+
+**Why you didn't notice:** the bot has other ways of spotting trouble (the "unable to load" pop-up, the Cloudflare block page, and the fast scan reading replies directly), so it still recovered in most cases. But it was working with one eye closed.
+
+**Fixed:** the watching moved into a file the browser itself installs (`page.js`), which the website cannot reject. It now also reports **which** system refused us — Cloudflare, the site's own limiter, or the platform — because those need opposite responses.
+
+**Also in your log, worth knowing:**
+- **"Extension context invalidated"** — that's just the page still running the old copy after you reloaded the extension. Refresh the tab.
+- **"message channel closed"** — background worker went to sleep mid-message. Harmless.
+- The bot itself was running well: sequential mode, 10-15s random gaps, cloud sync flushing, and it recovered from a re-entry on its own.
+
+---
+
 ## 2026-08-22 — Fix: bot waited 5 minutes on a Cloudflare BLOCK, thinking it could be solved (Issue #66)
 **What happened:** a client hit Cloudflare's **"Sorry, you have been blocked"** page. The bot told you *"remote solve needed"* and sat waiting five minutes for you to click a checkbox — **but that page has no checkbox.** It's a hard block, not a puzzle. Nothing could ever be solved, so it just timed out.
 

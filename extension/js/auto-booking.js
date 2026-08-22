@@ -3105,6 +3105,49 @@
   // Uses a minimal MAIN-world script that signals via DOM attribute (no XHR/fetch re-wrapping).
   // page.js already wraps XHR — this hooks into the existing wrappers' load events
   // by using a PerformanceObserver for failed network requests instead.
+  // #67 Primary 401/429 path: page.js (MAIN world, injected by the service
+  // worker via chrome.scripting, so page CSP cannot block it) dispatches
+  // "abHttpStatus". The inline-script injection below is kept as a fallback for
+  // pages page.js does not cover, but on the booking page it was always blocked
+  // by the site's CSP — which is why 401/429 detection appeared dead there.
+  function listenForHttpStatus() {
+    if (window.__abHttpStatusWired) return;
+    window.__abHttpStatusWired = true;
+
+    window.addEventListener("abHttpStatus", (e) => {
+      const d = (e && e.detail) || {};
+      if (d.status === 401) {
+        log("401 detected (page.js)");
+        __session401Detected = true;
+        chrome.storage.local.get(["loginDetails"], (dd) => {
+          const u = dd.loginDetails?.username || "";
+          trackEvent(EVENT_TYPES.ERROR, "401 session expired", u);
+          updateUserStatus(u, "session_expired");
+          sendTelegramNotification("error", `⚠️ <b>401 SESSION EXPIRED</b>\n\n👤 <b>User:</b> ${u}\n🔄 Will attempt auto re-login`);
+        });
+        return;
+      }
+
+      if (d.status === 429) {
+        __rateLimited429 = true;
+        __submit429At = Date.now();
+        __lastSubmitDiag = d;
+        const src = d.cfRay ? "CLOUDFLARE edge"
+                  : (d.msBurst || d.msTime) ? "platform throttle"
+                  : "site/app limiter";
+        log(`429 detected (page.js) — source=${src} retryAfter=${d.retryAfter || "none"} url=${d.url}`);
+        if (d.body) log(`[429 diag] body: ${String(d.body).substring(0, 200)}`);
+        chrome.storage.local.get(["loginDetails"], (dd) => {
+          const u = dd.loginDetails?.username || "";
+          trackEvent(EVENT_TYPES.ERROR, `429 rate limited — source=${src}, retryAfter=${d.retryAfter || "none"}`, u);
+          updateUserStatus(u, "rate_limited");
+          sendTelegramNotification("rate", `🟠 <b>429 RATE LIMITED</b>\n\n👤 <b>User:</b> ${u}\n🔎 ${src}\n⏳ Backoff activated`);
+        });
+      }
+    });
+    log("[401det] listening for page.js HTTP status events");
+  }
+
   function inject401Detector() {
     if (document.getElementById("__ab401marker")) return;
     // #65 Skip on Cloudflare interstitials — their CSP blocks inline scripts.
@@ -5259,7 +5302,8 @@
       // forbids injected inline scripts, so this only produced console errors.
       // The detector is pointless there anyway — the site's own API calls are
       // not running yet. Skip it; the next real page load installs it.
-      inject401Detector();
+      listenForHttpStatus();   // #67 CSP-proof primary path
+      inject401Detector();     // fallback for pages page.js does not cover
 
       // Parallel-scan A1: capture the real schedule-days request template from page.js (MAIN world)
       window.addEventListener("vSCPTemplate", (e) => {
