@@ -121,13 +121,95 @@
 
   // ─── USER CARDS ────────────────────────────────────────────────────
 
+  // ─── CARD RECONCILIATION (issue #59) ───────────────────────────────
+  // The grid used to be rebuilt wholesale every 2s, which threw away hover,
+  // focus, text selection and any running transition on all 40-odd cards.
+  // Now each card's markup is hashed and only cards whose content actually
+  // changed touch the DOM. Idle clients stop being redrawn entirely.
+  //
+  // Kill switch: RECONCILE_CARDS = false restores the old innerHTML rebuild.
+
+  const RECONCILE_CARDS = !window.__SH_NO_RECONCILE;
+
+  const CARD_ICON = {
+    warn: '<svg class="ci" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><path d="M12 4.5L21 20H3z"/><path d="M12 10v4M12 17v.1"/></svg>',
+    block: '<svg class="ci" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M6 6l12 12"/></svg>',
+    device: '<svg class="ci" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="12" rx="1.6"/><path d="M8 20h8"/></svg>',
+  };
+
+  // Event type → severity, so the log reads as one ramp instead of ten hues.
+  const LOG_SEVERITY = {
+    slot_found: "found",
+    booking: "ok", confirmed: "ok", captcha: "ok", security: "ok",
+    error: "err",
+    login: "live", dashboard: "live", cycling: "live",
+    queue: "info", session: "info",
+  };
+
+  // djb2 — fast, ample for change detection. Not a security hash.
+  function hashString(s) {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return (h >>> 0).toString(36);
+  }
+
+  // True while the user is mid-interaction inside this card. Replacing it
+  // now would close an open dropdown or drop a half-typed value.
+  function cardIsBusy(el) {
+    const a = document.activeElement;
+    if (!a || a === document.body || !el.contains(a)) return false;
+    return a.tagName === "SELECT" || a.tagName === "INPUT" || a.tagName === "TEXTAREA";
+  }
+
+  function reconcileCards(container, items) {
+    if (!RECONCILE_CARDS) {
+      container.innerHTML = items.map((i) => i.html).join("");
+      return;
+    }
+
+    // Anything without a data-username (the "no users match" placeholder,
+    // or leftovers from the fallback path) is not ours to keep.
+    const existing = new Map();
+    for (const el of Array.from(container.children)) {
+      const u = el.dataset ? el.dataset.username : null;
+      if (u && !existing.has(u)) existing.set(u, el);
+      else el.remove();
+    }
+
+    let prev = null;
+    for (const item of items) {
+      const hash = hashString(item.html);
+      let el = existing.get(item.user);
+
+      if (el) existing.delete(item.user);
+
+      if (!el || (el.dataset.hash !== hash && !cardIsBusy(el))) {
+        const holder = document.createElement("div");
+        holder.innerHTML = item.html.trim();
+        const fresh = holder.firstElementChild;
+        if (fresh) {
+          fresh.dataset.hash = hash;
+          if (el) el.replaceWith(fresh);
+          el = fresh;
+        }
+      }
+      if (!el) continue;
+
+      // Put it in the right slot only when it is not already there, so a
+      // stable list performs zero DOM moves.
+      const expected = prev ? prev.nextElementSibling : container.firstElementChild;
+      if (expected !== el) {
+        if (prev) prev.after(el);
+        else container.prepend(el);
+      }
+      prev = el;
+    }
+
+    existing.forEach((el) => el.remove());
+  }
+
   function renderUserCards(profiles, statuses, slotHistory) {
     const container = document.getElementById("user-cards");
-
-    // Cards redraw every 2s. If the owner has an "Assigned to" dropdown open,
-    // redrawing would destroy it mid-choice — so skip this tick.
-    const focused = document.activeElement;
-    if (focused && focused.tagName === "SELECT" && container.contains(focused)) return;
 
     const filterStatus = document.getElementById("filter-status").value;
     const filterVisa = document.getElementById("filter-visa")?.value || "all";
@@ -159,7 +241,14 @@
     const filtered = profiles.filter((p) => {
       // Search by name / username
       if (searchTerm) {
-        const hay = (deriveProfileName(p.username) + " " + p.username).toLowerCase();
+        // #59 Locations included so a consulate name finds every client
+        // hunting there — this is what the consulate rail clicks through to.
+        const hay = (
+          deriveProfileName(p.username) + " " +
+          p.username + " " +
+          (p.name || "") + " " +
+          (p.locations || []).join(" ")
+        ).toLowerCase();
         if (!hay.includes(searchTerm)) return false;
       }
       // Status filter
@@ -239,7 +328,7 @@
       return 0; // active groups: keep stable order
     });
 
-    container.innerHTML = filtered.map((profile) => {
+    const cards = filtered.map((profile) => {
       const status = statuses[profile.username] || {};
       const cloud = cloudStatusMap[profile.username] || {};
       // Use local status if active, otherwise prefer cloud
@@ -277,46 +366,46 @@
       const locs = (profile.locations || []).map((l) => `<span class="loc-tag">${esc(l)}</span>`).join("");
       const safeUser = esc(profile.username);
 
-      return `
+      const html = `
         <div class="${cardClass}" data-username="${safeUser}">
           <div class="card-header">
-            <div style="display:flex;align-items:flex-start;gap:6px;">
-              ${teamMode ? `<input type="checkbox" class="bulk-tick" data-user="${safeUser}" ${bulkSelected.has(profile.username) ? "checked" : ""} title="Select for bulk assign" style="margin-top:3px;">` : ""}
-              <div>
+            <div class="card-ident">
+              ${teamMode ? `<input type="checkbox" class="bulk-tick" data-user="${safeUser}" ${bulkSelected.has(profile.username) ? "checked" : ""} title="Select for bulk assign">` : ""}
+              <div class="card-ident-text">
                 <div class="card-name">${name}</div>
                 <div class="card-username">${safeUser}</div>
               </div>
             </div>
             <span class="status-badge status-${userStatus}">${statusLabel(userStatus)}</span>
           </div>
-          ${teamMode ? `<div style="display:flex;align-items:center;gap:6px;margin:4px 0;font-size:11px;color:#90a4ae;">
+          ${teamMode ? `<div class="card-assign">
             <span>Assigned to</span>
-            <select class="assign-select" data-user="${safeUser}" style="flex:1;padding:3px 5px;background:#0f1923;color:#e0e0e0;border:1px solid #2d3e50;border-radius:3px;font-size:11px;">
+            <select class="assign-select" data-user="${safeUser}">
               ${staffOptionsHtml(cloud.assignedStaffId)}
             </select>
           </div>` : ""}
-          ${activeOnOtherDevice ? `<div style="background:#e74c3c22;border:1px solid #e74c3c55;border-radius:4px;padding:4px 8px;margin:4px 0;font-size:11px;color:#ef5350;">⚠️ Active on <b>${esc(activeDeviceName || "another device")}</b> ${deviceLastSeen ? `(${deviceLastSeen})` : ""} ${isStaleDevice ? '<span style="color:#f39c12;"> — stale</span>' : ""}</div>` : ""}
-          ${isActive && activeDeviceName && !activeOnOtherDevice ? `<div style="font-size:11px;color:#3ecf8e;margin:2px 0;">📍 Running on <b>${esc(activeDeviceName)}</b> ${deviceLastSeen ? `(${deviceLastSeen})` : ""}</div>` : ""}
-          ${isRateLimited ? `<div style="background:#e74c3c33;border:1px solid #e74c3c88;border-radius:4px;padding:6px 8px;margin:4px 0;font-size:11px;color:#ef5350;font-weight:bold;">🔴 RATE LIMITED — blocked for ~${rateLimitHoursLeft}h. Do NOT login this user from any profile.</div>` : ""}
+          ${activeOnOtherDevice ? `<div class="card-note note-warn">${CARD_ICON.warn}<span>Active on <b>${esc(activeDeviceName || "another device")}</b>${deviceLastSeen ? ` (${deviceLastSeen})` : ""}${isStaleDevice ? ` <span class="note-stale">— stale</span>` : ""}</span></div>` : ""}
+          ${isActive && activeDeviceName && !activeOnOtherDevice ? `<div class="card-note note-live">${CARD_ICON.device}<span>Running on <b>${esc(activeDeviceName)}</b>${deviceLastSeen ? ` (${deviceLastSeen})` : ""}</span></div>` : ""}
+          ${isRateLimited ? `<div class="card-note note-block">${CARD_ICON.block}<span><b>Rate limited</b> — blocked ~${rateLimitHoursLeft}h. Do not log in from any profile.</span></div>` : ""}
           <div class="card-details">
             <div class="card-detail">
-              <span class="detail-label">Dates:</span>
+              <span class="detail-label">DATES</span>
               <span class="detail-value">${formatDate(profile.startDate)} — ${formatDate(profile.endDate)}</span>
             </div>
             <div class="card-detail">
-              <span class="detail-label">Visa:</span>
+              <span class="detail-label">VISA</span>
               <span class="detail-value">${esc(profile.visaType) || "—"}</span>
             </div>
             <div class="card-detail">
-              <span class="detail-label">Applicants:</span>
+              <span class="detail-label">APPL</span>
               <span class="detail-value">${profile.applicantCount || 1}</span>
             </div>
             ${staffMode ? "" : `<div class="card-detail">
-              <span class="detail-label">Price:</span>
+              <span class="detail-label">PRICE</span>
               <span class="detail-value">${profile.agreedPrice ? "₹" + Number(profile.agreedPrice).toLocaleString() + (profile.applicantCount > 1 ? " (" + (profile.pricePerPerson || profile.agreedPrice) + "/pp)" : "") : "—"}</span>
             </div>`}
             <div class="card-detail">
-              <span class="detail-label">CAPTCHA:</span>
+              <span class="detail-label">CAPTCHA</span>
               <span class="detail-value">${esc(profile.captchaMode) || "manual"}</span>
             </div>
           </div>
@@ -324,53 +413,57 @@
 
           ${(() => {
             const st = slotStats[profile.username];
-            if (!st) return `<div class="card-slots-summary" style="margin-top:8px;padding:6px 8px;background:#0f1923;border-radius:4px;font-size:11px;color:#78909c;">📜 No slot history yet</div>`;
+            if (!st) return `<div class="card-slots-summary is-empty">No slot history yet</div>`;
             const lastInfo = st.lastFoundAt
-              ? `· Last: <b>${esc(st.lastLocation)}</b> ${esc(st.lastDate)} (${timeAgo(st.lastFoundAt)})`
+              ? `Last: <b>${esc(st.lastLocation)}</b> ${esc(st.lastDate)} · ${timeAgo(st.lastFoundAt)}`
               : "";
             return `
-              <div class="card-slots-summary" style="margin-top:8px;padding:6px 8px;background:#0f1923;border-radius:4px;font-size:11px;color:#cfd8dc;">
-                🎯 <b>${st.total}</b> slots seen
-                · ✅ <b style="color:#27ae60;">${st.inRange}</b> in range
-                · ⚪ ${st.outRange} out
-                ${st.confirmed > 0 ? `· 🎉 <b style="color:#27ae60;">${st.confirmed} confirmed</b>` : ""}
-                ${st.submitted > 0 && st.confirmed === 0 ? `· ⏳ ${st.submitted} submitted` : ""}
-                <div style="margin-top:3px;color:#78909c;">${lastInfo}</div>
+              <div class="card-slots-summary">
+                <span class="ss"><b>${st.total}</b> seen</span>
+                <span class="ss ss-in"><b>${st.inRange}</b> in range</span>
+                <span class="ss ss-out"><b>${st.outRange}</b> out</span>
+                ${st.confirmed > 0 ? `<span class="ss ss-ok"><b>${st.confirmed}</b> confirmed</span>` : ""}
+                ${st.submitted > 0 && st.confirmed === 0 ? `<span class="ss ss-pending"><b>${st.submitted}</b> submitted</span>` : ""}
+                ${lastInfo ? `<div class="ss-last">${lastInfo}</div>` : ""}
               </div>`;
           })()}
 
-          <div class="card-actions">
-            ${activeOnOtherDevice
-              ? `<span style="font-size:11px;color:#ef5350;font-weight:bold;">Running on ${esc(activeDeviceName || "other device")}</span>
-                 <button class="btn btn-small btn-force-start" data-user="${safeUser}" data-device="${esc(activeDeviceName || "other device")}" style="background:#7f8c8d;color:white;font-size:10px;" title="Hold Shift+Click to force start">Force Start</button>`
-              : isActive
-                ? `<button class="btn btn-small btn-red btn-stop" data-user="${safeUser}">Stop</button>
-                   <button class="btn btn-small btn-orange btn-logout" data-user="${safeUser}">Logout</button>`
-                : isRateLimited
-                  ? `<button class="btn btn-small btn-force-rate-limit" data-user="${safeUser}" style="background:#7f8c8d;color:white;" title="Shift+Click to force login despite rate limit">🔴 Blocked (~${rateLimitHoursLeft}h)</button>`
-                  : `<button class="btn btn-small btn-green btn-start" data-user="${safeUser}">Start Now</button>`}
-            <button class="btn btn-small btn-gray btn-edit" data-user="${safeUser}">Edit</button>
-            <button class="btn btn-small btn-blue btn-history" data-user="${safeUser}" style="background:#3498db;color:white;">📜 History</button>
-          </div>
           ${(() => {
             const r = status.roundCount || 0;
             const e = status.errorCount || 0;
             const inR = status.slotsInRangeFound || 0;
             const outR = status.slotsOutOfRangeFound || 0;
-            const last429 = status.last429At ? `· 🟠 429 ${timeAgo(status.last429At)} ` : "";
-            const last401 = status.last401At ? `· 🔴 401 ${timeAgo(status.last401At)} ` : "";
+            const last429 = status.last429At ? `<span class="ct ct-warn">429 ${timeAgo(status.last429At)}</span>` : "";
+            const last401 = status.last401At ? `<span class="ct ct-err">401 ${timeAgo(status.last401At)}</span>` : "";
             // Hide only if user never started cycling AND no errors AND no slots
             const hasAnyData = r > 0 || e > 0 || inR > 0 || outR > 0 || status.cycleStartedAt || isActive;
             if (!hasAnyData) return "";
             return `
-              <div class="card-counters" style="margin-top:6px;padding:5px 8px;background:#0a1119;border-radius:4px;font-size:11px;color:#b0bec5;display:flex;flex-wrap:wrap;gap:8px;">
-                <span>🔁 Round <b>${r}</b></span>
-                <span style="color:${e > 0 ? '#e74c3c' : '#78909c'};">⚠️ <b>${e}</b> errors</span>
-                <span style="color:#27ae60;">✅ <b>${inR}</b> in</span>
-                <span style="color:#90a4ae;">⚪ ${outR} out</span>
+              <div class="card-counters">
+                <span class="ct">Round <b>${r}</b></span>
+                <span class="ct${e > 0 ? " ct-err" : ""}"><b>${e}</b> errors</span>
+                <span class="ct ct-ok"><b>${inR}</b> in</span>
+                <span class="ct"><b>${outR}</b> out</span>
                 ${last429}${last401}
               </div>`;
           })()}
+
+          <div class="card-actions">
+            ${activeOnOtherDevice
+              ? `<span class="card-elsewhere">Running on ${esc(activeDeviceName || "other device")}</span>
+                 <button class="btn btn-small btn-force-start" data-user="${safeUser}" data-device="${esc(activeDeviceName || "other device")}" title="Hold Shift+Click to force start">Force start</button>`
+              : isActive
+                ? `<button class="btn btn-small btn-red btn-stop" data-user="${safeUser}">Stop</button>
+                   <button class="btn btn-small btn-orange btn-logout" data-user="${safeUser}">Logout</button>`
+                : isRateLimited
+                  ? `<button class="btn btn-small btn-red btn-force-rate-limit" data-user="${safeUser}" title="Shift+Click to force login despite rate limit">Blocked ~${rateLimitHoursLeft}h</button>`
+                  : `<button class="btn btn-small btn-green btn-start" data-user="${safeUser}">Start now</button>`}
+            <span class="card-actions-rest">
+              <button class="btn btn-small btn-edit" data-user="${safeUser}">Edit</button>
+              <button class="btn btn-small btn-history" data-user="${safeUser}">History</button>
+            </span>
+          </div>
+
           <div class="card-footer">
             ${status.updatedAt ? "Updated " + timeAgo(status.updatedAt) : "No activity yet"}
             ${status.cycleStartedAt ? " · Started " + timeAgo(status.cycleStartedAt) : ""}
@@ -379,7 +472,10 @@
           </div>
         </div>
       `;
-    }).join("");
+      return { user: profile.username, html };
+    });
+
+    reconcileCards(container, cards);
   }
 
   // ─── ACTIVITY LOG ──────────────────────────────────────────────────
@@ -396,20 +492,34 @@
     const displayEvents = filtered.slice(0, 200);
 
     if (displayEvents.length === 0) {
-      container.innerHTML = '<div class="log-empty">No events to display</div>';
+      if (container.dataset.hash !== "empty") {
+        container.dataset.hash = "empty";
+        container.innerHTML = '<div class="log-empty">No events to display</div>';
+      }
       return;
     }
 
-    container.innerHTML = displayEvents.map((e) => {
-      const esc = (s) => (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-      return `
-      <div class="log-entry">
+    const esc2 = (s) => (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+    const html = displayEvents.map((e) => `
+      <div class="log-entry sev-${LOG_SEVERITY[e.type] || "info"}">
         <span class="log-time">${formatTime(e.timestamp)}</span>
-        <span class="log-type log-type-${esc(e.type)}">${esc(e.type)}</span>
-        <span class="log-user">${esc(deriveProfileName(e.username))}</span>
-        <span class="log-message">${esc(e.message)}</span>
-      </div>`;
-    }).join("");
+        <span class="log-spine"><i></i></span>
+        <span class="log-type log-type-${esc2(e.type)}">${esc2(e.type)}</span>
+        <span class="log-user">${esc2(deriveProfileName(e.username))}</span>
+        <span class="log-message">${esc2(e.message)}</span>
+      </div>`).join("");
+
+    // Same reason as the cards: this list is rebuilt on the same 2s tick and
+    // wholesale replacement was killing hover and the scroll position. A
+    // single hash comparison skips the write when nothing changed.
+    const hash = hashString(html);
+    if (container.dataset.hash === hash) return;
+    container.dataset.hash = hash;
+
+    const keepScroll = container.scrollTop;
+    container.innerHTML = html;
+    container.scrollTop = keepScroll;
   }
 
   function updateLogUserFilter(profiles) {
@@ -443,9 +553,15 @@
     return ist.toISOString().substring(0, 10);
   }
 
-  function renderStats(dailyStats, storageStats) {
+  let statsSignature = "";
+
+  function renderStats(dailyStats, storageStats, slotHistory, profiles, statuses) {
     const container = document.getElementById("stats-pane");
     if (!container) return;
+
+    // This pane sits behind a tab and is rebuilt on the same 2s loop as
+    // everything else. Skip the work entirely while it is hidden.
+    if (container.style.display === "none") return;
 
     const days = [];
     for (let i = 0; i < 14; i++) {
@@ -456,130 +572,201 @@
       days.push({ key, label: i === 0 ? "Today" : i === 1 ? "Yesterday" : key, stats: s });
     }
 
-    const last7 = days.slice(0, 7).map(d => d.stats).filter(Boolean);
-    const weekTotal = {
-      slotsFound: 0, slotsInRange: 0, booked: 0, missed: 0, errors: 0,
-      byLocation: {}, byHour: {},
-    };
-    last7.forEach(s => {
+    const last7 = days.slice(0, 7).map((d) => d.stats).filter(Boolean);
+    const weekTotal = { slotsFound: 0, slotsInRange: 0, booked: 0, missed: 0, errors: 0 };
+    last7.forEach((s) => {
       weekTotal.slotsFound += s.slotsFound || 0;
       weekTotal.slotsInRange += s.slotsInRange || 0;
       weekTotal.booked += s.booked || 0;
       weekTotal.missed += s.missed || 0;
       weekTotal.errors += s.errors || 0;
-      for (const [k, v] of Object.entries(s.byLocation || {})) {
-        weekTotal.byLocation[k] = (weekTotal.byLocation[k] || 0) + v;
-      }
-      for (const [k, v] of Object.entries(s.byHour || {})) {
-        weekTotal.byHour[k] = (weekTotal.byHour[k] || 0) + v;
-      }
     });
 
-    const topLocs = Object.entries(weekTotal.byLocation).sort((a, b) => b[1] - a[1]);
-    const topHours = Object.entries(weekTotal.byHour).sort((a, b) => b[1] - a[1]);
+    const insights = buildSlotInsights(slotHistory);
+    const health = buildHealth(profiles || [], statuses || {});
+    const pipeline = staffMode ? null : buildPipeline(profiles || [], statuses || {});
 
-    // Hour heatmap (24 hours)
-    const maxHour = Math.max(...Object.values(weekTotal.byHour), 1);
-    const hourBars = Array.from({ length: 24 }, (_, h) => {
-      const key = String(h).padStart(2, "0");
-      const v = weekTotal.byHour[key] || 0;
-      const pct = (v / maxHour) * 100;
-      const color = pct > 60 ? "#27ae60" : pct > 30 ? "#f39c12" : pct > 0 ? "#3498db" : "#2d3e50";
-      return `<div style="display:inline-block;width:20px;height:${Math.max(pct * 0.6, 2)}px;background:${color};margin:0 1px;vertical-align:bottom;" title="${key}:00 → ${v}"></div>`;
+    // ── 02 release heatmap: consulate x hour of day, IST ──────────────
+    const heatCells = CONSULATES.map((c) => {
+      const row = insights.grid[c];
+      const cells = row.map((v, h) => {
+        const t = insights.gridMax ? v / insights.gridMax : 0;
+        const bg = v === 0 ? "var(--surface-3)" : `rgba(229,169,78,${(0.16 + t * 0.84).toFixed(2)})`;
+        return `<div class="heat-cell" style="background:${bg}" title="${esc(c)} · ${String(h).padStart(2, "0")}:00 IST — ${v} slot${v === 1 ? "" : "s"} seen"></div>`;
+      }).join("");
+      return `<div class="heat-row-label">${esc(c)}</div>${cells}`;
     }).join("");
 
-    const dayBars = days.slice(0, 14).reverse().map(d => {
+    const hourLabels = Array.from({ length: 24 }, (_, h) =>
+      `<div class="heat-hour">${h % 3 === 0 ? String(h).padStart(2, "0") : ""}</div>`).join("");
+
+    const legend = [0, 0.25, 0.5, 0.75, 1].map((t) =>
+      `<i style="background:${t === 0 ? "var(--surface-3)" : `rgba(229,169,78,${(0.16 + t * 0.84).toFixed(2)})`}"></i>`).join("");
+
+    const rangePicker = HEAT_RANGES.map((r) =>
+      `<button type="button" class="heat-range${r.days === insights.rangeDays ? " on" : ""}" data-days="${r.days}">${r.label}</button>`).join("");
+
+    // Say exactly what period is on screen. Without this the grid looks like a
+    // stable long-run pattern when it may only be the last few days.
+    const spanNote = insights.totalStored === 0 ? "" :
+      insights.rangeDays > 0
+        ? `last ${insights.rangeDays} days · ${insights.totalUsed} of ${insights.totalStored} stored slots`
+        : `${shortDate(insights.oldest)} → ${shortDate(insights.newest)} · all ${insights.totalStored} stored slots`;
+
+    const capNote = insights.atCap
+      ? `<div class="heat-cap">Slot history is at its storage cap, so older records have been pruned. "All" means the surviving window above, not the whole history.</div>`
+      : "";
+
+    const heatPanel = insights.totalStored === 0
+      ? `<div class="ins-empty">No slot history recorded yet. Once clients start finding slots this fills in — it needs nothing but time.</div>`
+      : insights.totalUsed === 0
+        ? `<div class="ins-empty">No slots recorded in the last ${insights.rangeDays} days. Widen the range above.</div>`
+        : `
+        <div class="heat-grid">
+          <div></div>${hourLabels}
+          ${heatCells}
+        </div>
+        <div class="heat-legend"><span>fewer</span><span class="heat-swatch">${legend}</span><span>more slots seen</span></div>
+        ${insights.bestSum > 0 ? `<div class="heat-peak">Densest 3-hour window across all consulates: <b>${String(insights.bestStart).padStart(2, "0")}:00–${String((insights.bestStart + 3) % 24).padStart(2, "0")}:00 IST</b> — that is when it is worth having clients running, and when a page-view is worth spending.</div>` : ""}
+        ${capNote}`;
+
+    // ── 04 client health: error rate per client, worst first ──────────
+    const healthPanel = health.length === 0
+      ? `<div class="ins-empty">No client has enough completed rounds yet to judge.</div>`
+      : health.slice(0, 8).map((h) => {
+        const C = 2 * Math.PI * 19;
+        const off = (C * h.rate).toFixed(1);
+        const tone = h.rate > 0.15 ? "var(--danger)" : h.rate > 0.07 ? "var(--accent)" : "var(--ok)";
+        return `
+          <div class="health-row">
+            <svg class="health-ring" viewBox="0 0 46 46" aria-hidden="true">
+              <circle class="hr-track" cx="23" cy="23" r="19" fill="none" stroke-width="4"/>
+              <circle cx="23" cy="23" r="19" fill="none" stroke="${tone}" stroke-width="4"
+                      stroke-linecap="round" stroke-dasharray="${C.toFixed(1)}" stroke-dashoffset="${off}"/>
+            </svg>
+            <div class="health-text">
+              <div class="health-who">${esc(h.name)}</div>
+              <div class="health-pct${h.rate > 0.15 ? " bad" : ""}">${(h.rate * 100).toFixed(1)}% errors · ${h.errs}/${h.rounds} rounds</div>
+            </div>
+          </div>`;
+      }).join("");
+
+    // ── 03 pipeline value + staff board (owner only) ──────────────────
+    let pipelinePanel = "";
+    if (pipeline) {
+      const totalVal = pipeline.bookedValue + pipeline.flightValue + pipeline.riskValue || 1;
+      const staffRows = Object.entries(pipeline.byStaff)
+        .sort((a, b) => b[1].value - a[1].value)
+        .slice(0, 6)
+        .map(([sid, v]) => {
+          const maxV = Math.max(...Object.values(pipeline.byStaff).map((x) => x.value), 1);
+          const who = sid === "__me" ? "Unassigned / me" : (staffById[sid] ? staffById[sid].name : "Unknown");
+          return `
+            <div class="staff-row">
+              <span class="staff-who">${esc(who)}</span>
+              <span class="staff-bar"><i style="width:${Math.round((v.value / maxV) * 100)}%"></i></span>
+              <span class="staff-val">${v.count} · ${rupees(v.value)}</span>
+            </div>`;
+        }).join("");
+
+      pipelinePanel = `
+        <div class="ins-panel">
+          <div class="ins-head">PIPELINE · owner only</div>
+          <div class="pipe-grid">
+            <div class="pipe-money">
+              <div class="pipe-row booked">
+                <div class="k">CONFIRMED THIS MONTH</div>
+                <div class="v">${rupees(pipeline.bookedValue)}</div>
+                <div class="n">${pipeline.bookedCount} client${pipeline.bookedCount === 1 ? "" : "s"} · ${pipeline.bookedApplicants} applicant${pipeline.bookedApplicants === 1 ? "" : "s"}</div>
+              </div>
+              <div class="pipe-row flight">
+                <div class="k">IN FLIGHT</div>
+                <div class="v">${rupees(pipeline.flightValue)}</div>
+                <div class="n">${pipeline.flightCount} still hunting</div>
+                <div class="pipe-bar">
+                  <i style="width:${(pipeline.bookedValue / totalVal * 100).toFixed(1)}%;background:var(--ok)"></i>
+                  <i style="width:${(pipeline.flightValue / totalVal * 100).toFixed(1)}%;background:var(--live)"></i>
+                  <i style="width:${(pipeline.riskValue / totalVal * 100).toFixed(1)}%;background:var(--danger)"></i>
+                </div>
+              </div>
+              <div class="pipe-row risk">
+                <div class="k">BLOCKED / AT RISK</div>
+                <div class="v">${rupees(pipeline.riskValue)}</div>
+                <div class="n">${pipeline.riskCount} rate-limited or errored</div>
+              </div>
+            </div>
+            <div>
+              <div class="ins-sub">CONFIRMED BY STAFF</div>
+              <div class="staff-board">${staffRows || '<div class="ins-empty">Nothing confirmed yet.</div>'}</div>
+            </div>
+          </div>
+        </div>`;
+    }
+
+    const maxDay = Math.max(...days.map((x) => x.stats?.slotsFound || 0), 1);
+    const dayBars = days.slice(0, 14).reverse().map((d) => {
       const total = d.stats?.slotsFound || 0;
       const inR = d.stats?.slotsInRange || 0;
-      const max = Math.max(...days.map(x => x.stats?.slotsFound || 0), 1);
-      const h = (total / max) * 80;
-      const inH = (inR / max) * 80;
+      const h = (total / maxDay) * 74;
+      const inH = (inR / maxDay) * 74;
       return `
-        <div style="display:inline-block;width:36px;text-align:center;margin:0 2px;vertical-align:bottom;">
-          <div style="position:relative;height:80px;display:flex;flex-direction:column;justify-content:flex-end;">
-            <div style="height:${h - inH}px;background:#90a4ae;border-radius:2px 2px 0 0;"></div>
-            <div style="height:${inH}px;background:#27ae60;"></div>
+        <div class="day-col" title="${esc(d.label)} — ${total} seen, ${inR} in range">
+          <div class="day-stack">
+            <div class="day-out" style="height:${Math.max(h - inH, 0)}px"></div>
+            <div class="day-in" style="height:${inH}px"></div>
           </div>
-          <div style="font-size:9px;color:#78909c;margin-top:2px;">${d.label.substring(5) || d.label.substring(0, 3)}</div>
-          <div style="font-size:10px;color:#cfd8dc;font-weight:bold;">${total}</div>
+          <div class="day-lab">${esc(d.label.substring(5) || d.label.substring(0, 3))}</div>
+          <div class="day-num">${total}</div>
         </div>`;
     }).join("");
 
     const storageBar = storageStats ? `
-      <div style="margin-top:14px;padding:8px;background:#0a1119;border-radius:6px;">
-        <div style="font-size:11px;color:#78909c;margin-bottom:4px;">Storage: ${storageStats.mb} MB / 10 MB</div>
-        <div style="height:6px;background:#1a2733;border-radius:3px;overflow:hidden;">
-          <div style="height:100%;width:${(storageStats.mb / 10) * 100}%;background:${storageStats.mb > 8 ? '#e74c3c' : storageStats.mb > 6 ? '#f39c12' : '#27ae60'};"></div>
-        </div>
-        ${storageStats.lastPrune ? `<div style="font-size:10px;color:#78909c;margin-top:4px;">Last prune: ${timeAgo(storageStats.lastPrune.at)} (${storageStats.lastPrune.pruned.join(", ")})</div>` : ""}
+      <div class="ins-panel">
+        <div class="ins-head">STORAGE</div>
+        <div class="store-line">${storageStats.mb} MB of 10 MB</div>
+        <div class="store-bar"><i style="width:${Math.min((storageStats.mb / 10) * 100, 100)}%;background:${storageStats.mb > 8 ? "var(--danger)" : storageStats.mb > 6 ? "var(--accent)" : "var(--ok)"}"></i></div>
+        ${storageStats.lastPrune ? `<div class="store-note">Last prune ${timeAgo(storageStats.lastPrune.at)} — ${esc(storageStats.lastPrune.pruned.join(", "))}</div>` : ""}
       </div>` : "";
 
-    container.innerHTML = `
-      <div style="padding:14px;color:#cfd8dc;">
-        <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px;">
-          <div style="background:#0a1119;padding:10px;border-radius:6px;text-align:center;">
-            <div style="font-size:22px;font-weight:bold;color:#3498db;">${weekTotal.slotsFound}</div>
-            <div style="font-size:10px;color:#78909c;">Slots (7d)</div>
-          </div>
-          <div style="background:#0a1119;padding:10px;border-radius:6px;text-align:center;">
-            <div style="font-size:22px;font-weight:bold;color:#27ae60;">${weekTotal.slotsInRange}</div>
-            <div style="font-size:10px;color:#78909c;">In Range</div>
-          </div>
-          <div style="background:#0a1119;padding:10px;border-radius:6px;text-align:center;">
-            <div style="font-size:22px;font-weight:bold;color:#27ae60;">${weekTotal.booked}</div>
-            <div style="font-size:10px;color:#78909c;">Booked</div>
-          </div>
-          <div style="background:#0a1119;padding:10px;border-radius:6px;text-align:center;">
-            <div style="font-size:22px;font-weight:bold;color:#e67e22;">${weekTotal.missed}</div>
-            <div style="font-size:10px;color:#78909c;">Missed</div>
-          </div>
-          <div style="background:#0a1119;padding:10px;border-radius:6px;text-align:center;">
-            <div style="font-size:22px;font-weight:bold;color:#e74c3c;">${weekTotal.errors}</div>
-            <div style="font-size:10px;color:#78909c;">Errors</div>
-          </div>
+    const html = `
+      <div class="ins-wrap">
+        <div class="ins-totals">
+          <div class="ins-tile"><div class="n">${weekTotal.slotsFound}</div><div class="l">SEEN 7D</div></div>
+          <div class="ins-tile ok"><div class="n">${weekTotal.slotsInRange}</div><div class="l">IN RANGE</div></div>
+          <div class="ins-tile ok"><div class="n">${weekTotal.booked}</div><div class="l">BOOKED</div></div>
+          <div class="ins-tile warn"><div class="n">${weekTotal.missed}</div><div class="l">MISSED</div></div>
+          <div class="ins-tile bad"><div class="n">${weekTotal.errors}</div><div class="l">ERRORS</div></div>
         </div>
 
-        <div style="background:#0a1119;padding:12px;border-radius:6px;margin-bottom:14px;">
-          <div style="font-size:12px;color:#78909c;margin-bottom:8px;font-weight:bold;">📅 LAST 14 DAYS</div>
-          <div style="display:flex;align-items:flex-end;justify-content:flex-start;flex-wrap:nowrap;overflow-x:auto;">
-            ${dayBars}
+        <div class="ins-panel">
+          <div class="ins-head heat-head">
+            <span>RELEASE HEATMAP · consulate × hour, IST</span>
+            <span class="heat-range-picker">${rangePicker}</span>
           </div>
-          <div style="font-size:10px;color:#78909c;margin-top:6px;">
-            <span style="color:#27ae60;">■</span> In range
-            <span style="color:#90a4ae;margin-left:10px;">■</span> Out of range
-          </div>
+          ${spanNote ? `<div class="heat-span">${esc(spanNote)}</div>` : ""}
+          ${heatPanel}
         </div>
 
-        <div style="background:#0a1119;padding:12px;border-radius:6px;margin-bottom:14px;">
-          <div style="font-size:12px;color:#78909c;margin-bottom:8px;font-weight:bold;">🕐 HOUR HEATMAP (IST, last 7 days)</div>
-          <div style="white-space:nowrap;overflow-x:auto;">${hourBars}</div>
-          <div style="font-size:9px;color:#78909c;margin-top:4px;display:flex;justify-content:space-between;">
-            <span>00</span><span>06</span><span>12</span><span>18</span><span>23</span>
-          </div>
+        ${pipelinePanel}
+
+        <div class="ins-panel">
+          <div class="ins-head">CLIENT HEALTH · worst error rate first</div>
+          <div class="health-list">${healthPanel}</div>
         </div>
 
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-          <div style="background:#0a1119;padding:12px;border-radius:6px;">
-            <div style="font-size:12px;color:#78909c;margin-bottom:8px;font-weight:bold;">📍 TOP LOCATIONS</div>
-            ${topLocs.length === 0 ? '<div style="color:#78909c;font-size:11px;">No data</div>' :
-              topLocs.slice(0, 5).map(([loc, c]) => `
-                <div style="font-size:12px;display:flex;justify-content:space-between;padding:3px 0;">
-                  <span>${loc}</span><b>${c}</b>
-                </div>`).join("")}
-          </div>
-          <div style="background:#0a1119;padding:12px;border-radius:6px;">
-            <div style="font-size:12px;color:#78909c;margin-bottom:8px;font-weight:bold;">🔥 HOT HOURS</div>
-            ${topHours.length === 0 ? '<div style="color:#78909c;font-size:11px;">No data</div>' :
-              topHours.slice(0, 5).map(([h, c]) => `
-                <div style="font-size:12px;display:flex;justify-content:space-between;padding:3px 0;">
-                  <span>${h}:00 IST</span><b>${c}</b>
-                </div>`).join("")}
-          </div>
+        <div class="ins-panel">
+          <div class="ins-head">LAST 14 DAYS</div>
+          <div class="day-bars">${dayBars}</div>
+          <div class="day-key"><span class="sw-in"></span>in range<span class="sw-out"></span>out of range</div>
         </div>
 
         ${storageBar}
-      </div>
-    `;
+      </div>`;
+
+    const sig = hashString(html);
+    if (statsSignature === sig) return;
+    statsSignature = sig;
+    container.innerHTML = html;
   }
 
   // ─── SLOT HISTORY ──────────────────────────────────────────────────
@@ -609,25 +796,17 @@
 
     const esc = (s) => (s || "").toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-    const actionColor = {
-      detected: "#78909c",
-      selected: "#3498db",
-      submitted: "#f39c12",
-      confirmed: "#27ae60",
-      missed: "#e74c3c",
-    };
-
-    container.innerHTML = display.map((e) => {
-      const color = actionColor[e.action] || "#78909c";
-      const rangeIcon = e.inRange ? "✅" : "⚪";
-      return `
-      <div class="log-entry" style="border-left:3px solid ${color};">
+    // #59 Must emit the same five grid children as the activity log — the
+    // shared .log-entry grid would otherwise shunt every column across.
+    // in-range is carried by the spine dot instead of an emoji.
+    container.innerHTML = display.map((e) => `
+      <div class="log-entry sev-${e.inRange ? "found" : "info"}">
         <span class="log-time">${formatTime(e.foundAt)}</span>
-        <span class="log-type" style="background:${color};color:white;">${esc(e.action)}</span>
+        <span class="log-spine"><i></i></span>
+        <span class="log-type log-slot-${esc(e.action)}">${esc(e.action)}</span>
         <span class="log-user">${esc(deriveProfileName(e.username))}</span>
-        <span class="log-message">${rangeIcon} ${esc(e.location)} → <b>${esc(e.date)}</b></span>
-      </div>`;
-    }).join("");
+        <span class="log-message">${esc(e.location)} → <b>${esc(e.date)}</b>${e.inRange ? '<span class="in-range">in range</span>' : ""}</span>
+      </div>`).join("");
   }
 
   // ─── USER ACTIONS ──────────────────────────────────────────────────
@@ -768,9 +947,24 @@
     });
   }
 
-  document.getElementById("clear-log-btn").addEventListener("click", () => {
-    chrome.storage.local.set({ eventLog: [] });
-  });
+  // #59 Clearing the log is destructive and had no confirmation at all — one
+  // stray click wiped every event. With the shell UI on it becomes a press-
+  // and-hold. With the shell off it keeps the original one-click behaviour,
+  // so the kill switch really does restore what shipped before.
+  function clearEventLog() {
+    chrome.storage.local.set({ eventLog: [] }, refresh);
+  }
+
+  {
+    const clearLogBtn = document.getElementById("clear-log-btn");
+    if (window.SHUI && !window.__SH_UI_KIT_OFF) {
+      clearLogBtn.textContent = "Hold to clear";
+      clearLogBtn.title = "Press and hold to clear the activity log";
+      window.SHUI.bindHold(clearLogBtn, clearEventLog);
+    } else {
+      clearLogBtn.addEventListener("click", clearEventLog);
+    }
+  }
 
   // ─── EXPORT / IMPORT ──────────────────────────────────────────────
 
@@ -858,9 +1052,11 @@
     const urlInput = document.getElementById("sheets-url-input");
     try {
       const connected = await SheetsSync.isConnected();
+      // #59 State lives on a class so the header stylesheet stays in charge;
+      // an inline background here would override every token below it.
+      btn.classList.toggle("is-on", connected);
       if (connected) {
-        btn.textContent = "🔄 Sync Sheets";
-        btn.style.background = "#0f9d58";
+        btn.textContent = "Sync sheets";
         // #57b Keep the URL box available for the owner even when connected, so a
         // different sheet can be linked by pasting its URL. Hiding it here was
         // why a pasted URL never reached connect(). Staff never see it.
@@ -872,8 +1068,7 @@
           link.style.display = "inline";
         }
       } else {
-        btn.textContent = "📊 Sheets Sync";
-        btn.style.background = "#4285f4";
+        btn.textContent = "Sheets";
         link.style.display = "none";
         urlInput.style.display = staffMode ? "none" : "inline-block";
       }
@@ -1023,14 +1218,515 @@
 
   // ─── MAIN REFRESH LOOP ────────────────────────────────────────────
 
+  // ─── INSIGHTS (issue #59) ──────────────────────────────────────────
+  // Consulate rail, release heatmap, pipeline value, client health.
+  // All derived from data the extension already stores — slotHistory,
+  // userStatuses and the profiles themselves. No new collection, no new
+  // permission, no network call.
+
+  const CONSULATES = ["Mumbai", "New Delhi", "Chennai", "Kolkata", "Hyderabad"];
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+  // slotHistory stores whatever the site calls the place — "CHENNAI VAC",
+  // "NEW DELHI VAC", "MUMBAI OFC" and so on (auto-booking.js writes
+  // `location: loc.name` verbatim). Match on the city token so every
+  // spelling folds onto one consulate.
+  const CONSULATE_TOKENS = [
+    ["Mumbai", "MUMBAI"],
+    ["New Delhi", "DELHI"],
+    ["Chennai", "CHENNAI"],
+    ["Kolkata", "KOLKATA"],
+    ["Hyderabad", "HYDERABAD"],
+  ];
+
+  function normaliseConsulate(raw) {
+    if (!raw) return null;
+    const up = String(raw).toUpperCase();
+    for (const [canonical, token] of CONSULATE_TOKENS) {
+      if (up.indexOf(token) !== -1) return canonical;
+    }
+    return null;
+  }
+
+  // Slot records are written with `foundAt`; rows pulled back from Supabase
+  // may carry `detectedAt` or `timestamp` instead.
+  function slotTime(s) {
+    const raw = s.foundAt || s.timestamp || s.detectedAt || null;
+    if (!raw) return 0;
+    const t = new Date(raw).getTime();
+    return isNaN(t) ? 0 : t;
+  }
+
+  // Hour-of-day in IST, which is the only timezone these consulates release in.
+  function istHour(ts) {
+    const t = typeof ts === "number" ? ts : new Date(ts).getTime();
+    if (!t || isNaN(t)) return null;
+    return new Date(t + IST_OFFSET_MS).getUTCHours();
+  }
+
+  function istDayKey(ts) {
+    const t = typeof ts === "number" ? ts : new Date(ts).getTime();
+    if (!t || isNaN(t)) return null;
+    return new Date(t + IST_OFFSET_MS).toISOString().substring(0, 10);
+  }
+
+  // How far back the heatmap looks. 0 = every record still in storage.
+  // slotHistory is capped (1500 by the writer, pruned to 1000 by the service
+  // worker at 8 MB), so "all" is not "forever" — it is however far back the
+  // surviving records reach. renderStats reports the real span either way.
+  const HEAT_RANGES = [
+    { days: 7, label: "7d" },
+    { days: 30, label: "30d" },
+    { days: 0, label: "All" },
+  ];
+  let heatRangeDays = 30;
+
+  // One pass over slotHistory feeds the rail and the heatmap.
+  // sinceMs limits the heatmap grid only — the rail always reports today.
+  function buildSlotInsights(slotHistory, rangeDays) {
+    const days = rangeDays === undefined ? heatRangeDays : rangeDays;
+    const cutoff = days > 0 ? Date.now() - days * 86400000 : 0;
+    const today = istDayKey(Date.now());
+    const perCity = {};
+    const grid = {};            // city → 24 hour buckets
+    let gridMax = 0;
+    let totalUsed = 0;
+    let oldest = 0, newest = 0, totalStored = 0;
+
+    CONSULATES.forEach((c) => {
+      perCity[c] = { todayInRange: 0, todayTotal: 0, lastAt: 0, lastDate: null, allTime: 0 };
+      grid[c] = new Array(24).fill(0);
+    });
+
+    (slotHistory || []).forEach((s) => {
+      const city = normaliseConsulate(s.location);
+      if (!city) return;                            // a place we don't chart
+      const t = slotTime(s);
+      if (!t) return;
+
+      totalStored++;
+      if (!oldest || t < oldest) oldest = t;
+      if (t > newest) newest = t;
+
+      // The rail is always "today", regardless of the heatmap range.
+      perCity[city].allTime++;
+      if (t > perCity[city].lastAt) {
+        perCity[city].lastAt = t;
+        perCity[city].lastDate = s.date || null;
+      }
+      if (istDayKey(t) === today) {
+        perCity[city].todayTotal++;
+        if (s.inRange) perCity[city].todayInRange++;
+      }
+
+      if (cutoff && t < cutoff) return;             // outside the heatmap window
+      totalUsed++;
+
+      const h = istHour(t);
+      if (h !== null) {
+        grid[city][h]++;
+        if (grid[city][h] > gridMax) gridMax = grid[city][h];
+      }
+    });
+
+    // Densest 3-hour window across all consulates — the actionable number.
+    const colTotals = new Array(24).fill(0);
+    CONSULATES.forEach((c) => grid[c].forEach((v, h) => { colTotals[h] += v; }));
+    let bestStart = 0, bestSum = -1;
+    for (let h = 0; h < 24; h++) {
+      const sum = colTotals[h] + colTotals[(h + 1) % 24] + colTotals[(h + 2) % 24];
+      if (sum > bestSum) { bestSum = sum; bestStart = h; }
+    }
+
+    return {
+      perCity, grid, gridMax, colTotals, bestStart, bestSum, totalUsed, today,
+      rangeDays: days, oldest, newest, totalStored,
+      // The writer caps at 1500 and the service worker prunes to 1000, so a
+      // full-looking history is really a moving window. Say so when at the cap.
+      atCap: totalStored >= 995,
+    };
+  }
+
+  function shortDate(ms) {
+    if (!ms) return "—";
+    return new Date(ms + IST_OFFSET_MS).toISOString().substring(0, 10);
+  }
+
+  function shortAgo(ms) {
+    if (!ms) return "never";
+    const d = Date.now() - ms;
+    if (d < 60000) return Math.max(1, Math.round(d / 1000)) + "s ago";
+    if (d < 3600000) return Math.round(d / 60000) + "m ago";
+    if (d < 86400000) return Math.round(d / 3600000) + "h ago";
+    return Math.round(d / 86400000) + "d ago";
+  }
+
+  let railSignature = "";
+
+  // 01 — Consulate rail. Which city is actually releasing, and how stale.
+  function renderConsulateRail(insights) {
+    const wrap = document.getElementById("consulate-rail-wrap");
+    const rail = document.getElementById("consulate-rail");
+    const hint = document.getElementById("rail-hint");
+    if (!wrap || !rail) return;
+
+    if (!insights.totalUsed) {          // nothing recorded yet — stay out of the way
+      wrap.hidden = true;
+      railSignature = "";
+      return;
+    }
+    wrap.hidden = false;
+
+    const rows = CONSULATES.map((c) => {
+      const d = insights.perCity[c];
+      const mins = d.lastAt ? (Date.now() - d.lastAt) / 60000 : Infinity;
+      const heat = d.todayInRange > 0 ? "hot" : mins < 120 ? "warm" : "cold";
+      return { c, d, heat };
+    });
+
+    const signature = rows.map((r) => `${r.c}:${r.d.todayInRange}:${r.d.todayTotal}:${Math.floor(r.d.lastAt / 60000)}`).join("~");
+    if (signature === railSignature) return;
+    railSignature = signature;
+
+    if (hint) {
+      hint.textContent = insights.bestSum > 0
+        ? `busiest ${String(insights.bestStart).padStart(2, "0")}:00–${String((insights.bestStart + 3) % 24).padStart(2, "0")}:00 IST`
+        : "";
+    }
+
+    rail.innerHTML = rows.map(({ c, d, heat }) => `
+      <div class="city ${heat}" data-city="${esc(c)}">
+        <span class="freshdot"></span>
+        <div class="city-name">${esc(c.toUpperCase())}</div>
+        <div class="city-big">${d.todayInRange}</div>
+        <div class="city-sub">in range today<br>${d.todayTotal} seen · last ${shortAgo(d.lastAt)}</div>
+      </div>`).join("");
+  }
+
+  // 04 — Client health. errorCount ÷ roundCount, worst first.
+  function buildHealth(profiles, statuses) {
+    const out = [];
+    for (const p of profiles) {
+      const st = statuses[p.username] || {};
+      const rounds = st.roundCount || 0;
+      const errs = st.errorCount || 0;
+      if (rounds < 10) continue;               // too little data to judge
+      out.push({
+        username: p.username,
+        name: p.name || deriveProfileName(p.username),
+        rounds, errs,
+        rate: errs / rounds,
+      });
+    }
+    out.sort((a, b) => b.rate - a.rate);
+    return out;
+  }
+
+  // 03 — Pipeline value. Owner-only: prices are hidden from staff by the
+  // same rule that hides the price column on the card.
+  function buildPipeline(profiles, statuses) {
+    const cloudMap = {};
+    cloudProfiles.forEach((cp) => { cloudMap[cp.username] = cp; });
+
+    const monthKey = istDayKey(Date.now()).substring(0, 7);
+    const p = {
+      bookedValue: 0, bookedCount: 0, bookedApplicants: 0,
+      flightValue: 0, flightCount: 0,
+      riskValue: 0, riskCount: 0,
+      byStaff: {},
+    };
+
+    for (const prof of profiles) {
+      const a = resolveAttention(prof, statuses, cloudMap);
+      const price = Number(prof.agreedPrice) || 0;
+      const st = statuses[prof.username] || {};
+      const cloud = cloudMap[prof.username] || {};
+
+      if (a.status === "confirmed") {
+        const when = st.confirmedAt || cloud.confirmedAt;
+        if (when && istDayKey(when) && istDayKey(when).substring(0, 7) === monthKey) {
+          p.bookedValue += price;
+          p.bookedCount++;
+          p.bookedApplicants += Number(prof.applicantCount) || 1;
+        }
+        const sid = cloud.assignedStaffId || "__me";
+        if (!p.byStaff[sid]) p.byStaff[sid] = { count: 0, value: 0 };
+        p.byStaff[sid].count++;
+        p.byStaff[sid].value += price;
+      // "at risk" is a money bucket, not the strict 24h rate-limit gate, so a
+      // local rate_limited status counts even without a cloud timestamp.
+      } else if (a.rateLimited || ["error", "session_expired", "rate_limited"].includes(a.status)) {
+        p.riskValue += price;
+        p.riskCount++;
+      } else {
+        p.flightValue += price;
+        p.flightCount++;
+      }
+    }
+    return p;
+  }
+
+  function rupees(n) {
+    return "₹" + Math.round(n || 0).toLocaleString("en-IN");
+  }
+
+  // 05 — Wall mode. A read-only overlay for a second monitor. Purely a
+  // different view of numbers already on screen; it starts nothing and
+  // stops nothing, so it cannot affect a running client.
+  let wallOn = false;
+  let wallSignature = "";
+  let lastRefresh = null;      // last payload, so wall mode can paint at once
+
+  function toggleWallMode(on) {
+    wallOn = on === undefined ? !wallOn : !!on;
+    const el = document.getElementById("wall-mode");
+    if (!el) return;
+    el.hidden = !wallOn;
+    document.body.classList.toggle("wall-open", wallOn);
+    const btn = document.getElementById("wall-mode-btn");
+    if (btn) btn.setAttribute("aria-pressed", wallOn ? "true" : "false");
+
+    if (!wallOn) return;
+    wallSignature = "";
+    // Paint from the cached payload immediately — refresh() is async and
+    // waiting on it would show a blank black screen for up to 2 seconds.
+    if (lastRefresh) {
+      renderWallMode(lastRefresh.profiles, lastRefresh.statuses,
+                     buildSlotInsights(lastRefresh.slotHistory), lastRefresh.events);
+    }
+    refresh();
+  }
+
+  function renderWallMode(profiles, statuses, insights, events) {
+    if (!wallOn) return;
+    const el = document.getElementById("wall-mode");
+    if (!el) return;
+
+    const cloudMap = {};
+    cloudProfiles.forEach((cp) => { cloudMap[cp.username] = cp; });
+
+    let cycling = 0, found = 0, confirmed = 0, blocked = 0;
+    for (const p of profiles) {
+      const a = resolveAttention(p, statuses, cloudMap);
+      if (["cycling", "logging_in", "security_questions", "on_dashboard"].includes(a.status)) cycling++;
+      if (a.status === "slot_found") found++;
+      if (a.status === "confirmed") confirmed++;
+      if (a.rateLimited) blocked++;
+    }
+
+    const todaySeen = CONSULATES.reduce((s, c) => s + insights.perCity[c].todayTotal, 0);
+    const cityLine = CONSULATES
+      .map((c) => ({ c, d: insights.perCity[c] }))
+      .sort((a, b) => b.d.todayInRange - a.d.todayInRange || b.d.todayTotal - a.d.todayTotal)
+      .map(({ c, d }) => `<span class="wall-city${d.todayInRange > 0 ? " hot" : ""}">${esc(c)} <b>${d.todayInRange}</b></span>`)
+      .join("");
+
+    const feed = (events || []).slice(0, 6).map((e) => `
+      <div class="wall-ev${e.type === "slot_found" ? " found" : e.type === "error" ? " err" : ""}">
+        <span class="t">${formatTime(e.timestamp)}</span>
+        <span>${esc(deriveProfileName(e.username))} — ${esc(e.message)}</span>
+      </div>`).join("");
+
+    const html = `
+      <div class="wall-top">
+        <span class="wall-brand">SLOTHUNTER · OPS</span>
+        <span class="wall-clock">${new Date().toLocaleTimeString("en-IN", { hour12: false, timeZone: "Asia/Kolkata" })} IST</span>
+      </div>
+      <div class="wall-stats">
+        <div class="wall-stat a"><div class="k">CYCLING</div><div class="v">${cycling}</div></div>
+        <div class="wall-stat b"><div class="k">SLOTS TODAY</div><div class="v">${todaySeen}</div></div>
+        <div class="wall-stat c"><div class="k">CONFIRMED</div><div class="v">${confirmed}</div></div>
+        <div class="wall-stat d"><div class="k">BLOCKED</div><div class="v">${blocked}</div></div>
+      </div>
+      <div class="wall-cities">${cityLine}</div>
+      <div class="wall-feed">${feed}</div>
+      <div class="wall-exit">Esc to exit</div>`;
+
+    const sig = hashString(html.replace(/\d{2}:\d{2}:\d{2}/, ""));  // ignore the ticking clock
+    if (sig !== wallSignature) {
+      wallSignature = sig;
+      el.innerHTML = html;
+    } else {
+      const clock = el.querySelector(".wall-clock");
+      if (clock) clock.textContent = new Date().toLocaleTimeString("en-IN", { hour12: false, timeZone: "Asia/Kolkata" }) + " IST";
+    }
+  }
+
+  // ─── SHELL UI (issue #59, Phase 1) ─────────────────────────────────
+  // Attention lane, header sync dots, overflow menu, command palette and
+  // the background-tab badge. Everything here is additive: if ui-kit.js
+  // fails to load, or __SH_UI_KIT_OFF is set, UI_SHELL goes false and
+  // every hook below turns into a no-op. Nothing existing depends on it.
+
+  const UI_SHELL = !window.__SH_UI_KIT_OFF && !!window.SHUI;
+
+  const ATTENTION_ACTIVE_STATES = ["cycling", "logging_in", "security_questions", "on_dashboard", "slot_found"];
+  let laneSignature = "";          // skips the DOM write when nothing changed
+  const announcedSlots = new Set(); // usernames already counted in the tab badge
+
+  const LANE_ICONS = {
+    found: '<path d="M12 2.6l2.7 5.9 6.4.8-4.7 4.4 1.2 6.3L12 16.9 6.4 20l1.2-6.3L2.9 9.3l6.4-.8z"/>',
+    blocked: '<circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/>',
+  };
+
+  // Same precedence rules renderUserCards uses, kept in one place so the
+  // lane can never disagree with the card it points at.
+  function resolveAttention(profile, statuses, cloudMap) {
+    const cloud = cloudMap[profile.username] || {};
+    const local = statuses[profile.username] || {};
+    const localSt = local.status || "";
+    const cloudSt = cloud.status || "";
+    const status = ATTENTION_ACTIVE_STATES.includes(localSt)
+      ? localSt
+      : (ATTENTION_ACTIVE_STATES.includes(cloudSt) ? cloudSt : (localSt || cloudSt || "idle"));
+
+    const rlMs = cloud.rateLimitedAt ? new Date(cloud.rateLimitedAt).getTime() : 0;
+    const rateLimited = rlMs > 0 && (Date.now() - rlMs < 24 * 60 * 60 * 1000);
+    const hoursLeft = rateLimited
+      ? Math.max(0, Math.ceil((24 * 60 * 60 * 1000 - (Date.now() - rlMs)) / 3600000))
+      : 0;
+
+    return { status, rateLimited, hoursLeft, local, cloud };
+  }
+
+  function collectAttention(profiles, statuses) {
+    const cloudMap = {};
+    cloudProfiles.forEach((cp) => { cloudMap[cp.username] = cp; });
+
+    const items = [];
+    for (const p of profiles) {
+      const a = resolveAttention(p, statuses, cloudMap);
+      const name = p.name || deriveProfileName(p.username);
+
+      if (a.status === "slot_found") {
+        const st = a.local.foundAt || a.cloud.foundAt || null;
+        items.push({
+          kind: "found",
+          username: p.username,
+          title: `Slot in range — ${name}`,
+          detail: st ? `Found ${timeAgo(st)} · waiting on you` : "Waiting on you",
+        });
+      } else if (a.rateLimited) {
+        items.push({
+          kind: "blocked",
+          username: p.username,
+          title: `Rate limited — ${name}`,
+          detail: `Blocked ~${a.hoursLeft}h more · do not log in from any device`,
+        });
+      }
+    }
+    // Found first: it is time-critical, a block is not.
+    items.sort((x, y) => (x.kind === y.kind ? 0 : x.kind === "found" ? -1 : 1));
+    return items;
+  }
+
+  function renderAttentionLane(profiles, statuses) {
+    if (!UI_SHELL) return;
+    const lane = document.getElementById("attention-lane");
+    const grid = document.getElementById("lane-grid");
+    const count = document.getElementById("lane-count");
+    if (!lane || !grid || !count) return;
+
+    const items = collectAttention(profiles, statuses);
+
+    // The lane redraws on the same 2s tick as everything else. Hashing the
+    // rendered content means an unchanged lane never touches the DOM, so
+    // hover and the breathing animation survive.
+    const signature = items.map((i) => `${i.kind}|${i.username}|${i.detail}`).join("~");
+    if (signature === laneSignature) return;
+    laneSignature = signature;
+
+    if (!items.length) {
+      lane.hidden = true;
+      grid.innerHTML = "";
+      count.textContent = "0";
+      return;
+    }
+
+    lane.hidden = false;
+    count.textContent = String(items.length);
+    grid.innerHTML = items.map((i) => `
+      <div class="lane-item lane-${i.kind}">
+        <svg class="lane-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${LANE_ICONS[i.kind]}</svg>
+        <div class="lane-body">
+          <h4>${SHUI.esc(i.title)}</h4>
+          <p>${SHUI.esc(i.detail)}</p>
+        </div>
+        <button type="button" class="btn btn-small lane-goto" data-user="${SHUI.esc(i.username)}">Show</button>
+      </div>`).join("");
+  }
+
+  // A slot going from not-found to found is the one event worth stealing
+  // the operator's attention for, so it drives both the toast and the badge.
+  function announceNewSlots(profiles, statuses) {
+    if (!UI_SHELL) return;
+    const cloudMap = {};
+    cloudProfiles.forEach((cp) => { cloudMap[cp.username] = cp; });
+
+    const stillFound = new Set();
+    for (const p of profiles) {
+      const a = resolveAttention(p, statuses, cloudMap);
+      if (a.status !== "slot_found") continue;
+      stillFound.add(p.username);
+      if (announcedSlots.has(p.username)) continue;
+      announcedSlots.add(p.username);
+
+      const name = p.name || deriveProfileName(p.username);
+      SHUI.bumpBadge("Slot found");
+      SHUI.toast({
+        kind: "found",
+        title: `Slot in range — ${name}`,
+        body: "Open the client to submit.",
+        actionLabel: "Show",
+        onAction: () => focusProfileCard(p.username),
+      });
+    }
+    // Let a client re-announce if it drops out of slot_found and returns.
+    announcedSlots.forEach((u) => { if (!stillFound.has(u)) announcedSlots.delete(u); });
+  }
+
+  function focusProfileCard(username) {
+    const card = document.querySelector(`#user-cards .user-card[data-username="${CSS.escape(username)}"]`);
+    if (!card) return;
+    card.scrollIntoView({ block: "center", behavior: SHUI.reduceMotion ? "auto" : "smooth" });
+    card.classList.add("sh-flash");
+    setTimeout(() => card.classList.remove("sh-flash"), 1200);
+  }
+
+  // Connection dots on the header sync cluster.
+  function updateSyncDots() {
+    if (!UI_SHELL) return;
+    const cloudOn = !!(typeof SUPA !== "undefined" && SUPA && SUPA.isReady && SUPA.isReady());
+    document.getElementById("cloud-btn")?.classList.toggle("is-on", cloudOn);
+
+    // The sheets dot is owned by updateSheetsUI(), which is the only place
+    // that knows the real connection state. Touching it here too would make
+    // the two fight over the class on every 2s tick.
+
+    chrome.storage.local.get(["telegramBotToken", "telegramChatId"], (d) => {
+      const on = !!(d.telegramBotToken && d.telegramChatId);
+      document.getElementById("telegram-btn")?.classList.toggle("is-on", on);
+    });
+  }
+
   async function refresh() {
     const data = await loadData();
+    lastRefresh = data;
     updateStats(data.profiles, data.statuses, data.events);
+    renderAttentionLane(data.profiles, data.statuses);
+    announceNewSlots(data.profiles, data.statuses);
+    updateSyncDots();
     renderUserCards(data.profiles, data.statuses, data.slotHistory);
     renderActivityLog(data.events);
     renderSlotHistory(data.slotHistory, data.profiles);
-    renderStats(data.dailyStats, data.storageStats);
+    renderStats(data.dailyStats, data.storageStats, data.slotHistory, data.profiles, data.statuses);
     updateLogUserFilter(data.profiles);
+
+    // #59 Insights — one slotHistory pass shared by the rail and wall mode.
+    const insights = buildSlotInsights(data.slotHistory);
+    renderConsulateRail(insights);
+    renderWallMode(data.profiles, data.statuses, insights, data.events);
 
     // Update header with active user
     const badge = document.getElementById("active-user-status");
@@ -1127,6 +1823,13 @@
     } else if (tab === "stats") {
       tabStats.style.opacity = "1";
       paneStats.style.display = "block";
+      // renderStats skips itself while the pane is hidden, so on first reveal
+      // paint straight from the cached payload — otherwise the tab sits empty
+      // until the next 2s tick.
+      if (lastRefresh) {
+        renderStats(lastRefresh.dailyStats, lastRefresh.storageStats,
+                    lastRefresh.slotHistory, lastRefresh.profiles, lastRefresh.statuses);
+      }
     } else {
       tabLog.style.opacity = "1";
       ctrlA.style.display = "flex";
@@ -1210,8 +1913,7 @@
       document.getElementById("edit-auto-select").checked = profile.autoSelect !== false;
       document.getElementById("edit-auto-submit").checked = profile.autoSubmit === true;
 
-      const captchaRadio = document.querySelector(`input[name="edit-captcha"][value="${profile.captchaMode || "manual"}"]`);
-      if (captchaRadio) captchaRadio.checked = true;
+      // #63 CAPTCHA row removed from the form — nothing to populate.
 
       document.getElementById("edit-delete-btn").style.display = "inline-block";
       applyStaffModeToEditModal();
@@ -1238,7 +1940,8 @@
       locations.push(cb.value);
     });
 
-    const captchaMode = (document.querySelector('input[name="edit-captcha"]:checked') || {}).value || "manual";
+    // #63 CAPTCHA selector removed from the form — always auto (OCR).
+    const captchaMode = "auto";
 
     const updated = {
       username: document.getElementById("edit-username").value.trim(),
@@ -1560,8 +2263,8 @@
     document.getElementById("edit-auto-login").checked = true;
     document.getElementById("edit-auto-dashboard").checked = true;
     document.getElementById("edit-auto-select").checked = true;
-    document.getElementById("edit-auto-submit").checked = false;
-    document.querySelector('input[name="edit-captcha"][value="auto"]').checked = true;
+    document.getElementById("edit-auto-submit").checked = true;   // #63 auto-submit on by default
+    // #63 CAPTCHA selector removed from the form — captchaMode is always "auto".
     document.getElementById("edit-delete-btn").style.display = "none";
     document.getElementById("edit-paste-area").style.display = "none";
     document.getElementById("edit-paste-box").value = "";
@@ -2555,6 +3258,105 @@
       setTimeout(refreshStaff, 1500);     // let cloud sync connect first
     }
   });
+
+  // ─── SHELL UI WIRING (issue #59, Phase 1) ──────────────────────────
+  // Every action below re-uses an existing control by clicking it, so the
+  // palette and the overflow menu cannot drift from the buttons they
+  // stand in for, and no logic is duplicated.
+
+  if (UI_SHELL) {
+    // Attention lane → jump to the card.
+    document.getElementById("lane-grid")?.addEventListener("click", (e) => {
+      const btn = e.target.closest(".lane-goto");
+      if (btn) focusProfileCard(btn.dataset.user);
+    });
+
+    // Consulate rail → filter the grid to that city's clients.
+    document.getElementById("consulate-rail")?.addEventListener("click", (e) => {
+      const tile = e.target.closest(".city");
+      if (!tile) return;
+      const search = document.getElementById("profile-search");
+      if (!search) return;
+      const city = tile.dataset.city || "";
+      search.value = search.value.trim().toLowerCase() === city.toLowerCase() ? "" : city;
+      refresh();
+    });
+
+    // Wall mode.
+    document.getElementById("wall-mode-btn")?.addEventListener("click", () => toggleWallMode());
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && wallOn) { e.preventDefault(); toggleWallMode(false); }
+    });
+
+    // Header overflow menu.
+    const moreBtn = document.getElementById("hdr-more-btn");
+    const morePanel = document.getElementById("hdr-more-panel");
+    if (moreBtn && morePanel) {
+      const setMenu = (open) => {
+        morePanel.setAttribute("data-open", open ? "1" : "0");
+        moreBtn.setAttribute("aria-expanded", open ? "true" : "false");
+      };
+      moreBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        setMenu(morePanel.getAttribute("data-open") !== "1");
+      });
+      // Import opens a file dialog, so the menu must not eat the click.
+      morePanel.addEventListener("click", (e) => {
+        if (e.target.closest("input")) return;
+        if (e.target.closest("button, a")) setMenu(false);
+      });
+      document.addEventListener("click", (e) => {
+        if (!e.target.closest(".hdr-more")) setMenu(false);
+      });
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") setMenu(false);
+      });
+    }
+
+    const clickById = (id) => document.getElementById(id)?.click();
+
+    SHUI.setPaletteProvider(() => {
+      const items = [];
+
+      document.querySelectorAll("#user-cards .user-card").forEach((card) => {
+        const username = card.dataset.username;
+        if (!username) return;
+        const badge = card.querySelector(".status-badge");
+        const statusText = badge ? badge.textContent.trim() : "";
+        const tone = card.classList.contains("slot-found") ? "found"
+          : card.classList.contains("error") ? "error"
+          : card.classList.contains("active") ? "live"
+          : card.classList.contains("confirmed") ? "ok" : "idle";
+        items.push({
+          group: "Clients",
+          label: card.querySelector(".card-name")?.textContent.trim() || username,
+          meta: statusText,
+          tone,
+          run: () => focusProfileCard(username),
+        });
+      });
+
+      const cmd = (label, id) => {
+        const el = document.getElementById(id);
+        // Skip anything hidden — staff mode hides owner-only controls, and
+        // the palette must not offer what the page will not honour.
+        if (!el || el.style.display === "none") return;
+        items.push({ group: "Commands", label, tone: "cmd", run: () => clickById(id) });
+      };
+
+      cmd("Add client", "add-user-btn");
+      cmd("Open Cloud Sync", "cloud-btn");
+      cmd("Open Telegram settings", "telegram-btn");
+      cmd("Open Google Sheets sync", "sheets-sync-btn");
+      cmd("Open Staff", "staff-btn");
+      cmd("Export JSON", "export-btn");
+      cmd("Export CSV", "export-csv-btn");
+      cmd("Import JSON", "import-btn");
+      cmd("Toggle activity log panel", "toggle-logs-btn");
+
+      return items;
+    });
+  }
 
   refresh();
   setInterval(refresh, REFRESH_INTERVAL);

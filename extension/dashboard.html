@@ -8,52 +8,86 @@
 <body>
   <header>
     <div class="header-left">
-      <img src="img/32.png" alt="icon" class="header-icon">
+      <img src="img/32.png" alt="SlotHunter" class="header-icon">
       <h1>SlotHunter</h1>
     </div>
     <div class="header-right">
-      <button id="cloud-btn" class="btn btn-small" style="background:#3ecf8e;color:#fff;">Cloud Sync</button>
-      <button id="telegram-btn" class="btn btn-small" style="background:#0088cc;color:#fff;">Telegram</button>
-      <button id="staff-btn" class="btn btn-small" style="background:#8e44ad;color:#fff;display:none;">Staff</button>
-      <button id="export-btn" class="btn btn-small btn-blue">Export</button>
-      <button id="export-csv-btn" class="btn btn-small" style="background:#0f9d58;color:#fff;">Export CSV</button>
-      <button id="sheets-sync-btn" class="btn btn-small" style="background:#4285f4;color:#fff;">📊 Sheets Sync</button>
-      <a id="sheets-link" href="#" target="_blank" style="display:none;font-size:11px;color:#4285f4;text-decoration:underline;margin-left:4px;">Open Sheet</a>
-      <input type="text" id="sheets-url-input" placeholder="Paste Google Sheet URL (optional)" style="display:none;width:220px;padding:3px 6px;border:1px solid #ccc;border-radius:4px;font-size:11px;margin-left:4px;">
-      <button id="import-btn" class="btn btn-small btn-gray">Import</button>
-      <input type="file" id="import-file" accept=".json" style="display:none">
-      <button id="toggle-logs-btn" class="btn btn-small" style="background:#546e7a;color:#fff;">Logs ▶</button>
       <span id="active-user-status" class="queue-badge">No active user</span>
-      <span id="staff-mode-badge" style="display:none;background:#8e44ad;color:#fff;padding:4px 10px;border-radius:4px;font-size:12px;font-weight:bold;">STAFF VIEW</span>
+      <span id="staff-mode-badge" style="display:none;">STAFF VIEW</span>
+
+      <div class="sync-cluster">
+        <button id="cloud-btn" class="btn btn-small">Cloud</button>
+        <button id="telegram-btn" class="btn btn-small">Telegram</button>
+        <button id="sheets-sync-btn" class="btn btn-small">Sheets</button>
+      </div>
+
+      <button id="staff-btn" class="btn btn-small" style="display:none;">Staff</button>
+      <button id="toggle-logs-btn" class="btn btn-small">Logs ▶</button>
+      <button id="wall-mode-btn" class="btn btn-small" title="Wall mode — big display for a second monitor (Esc to exit)">Wall</button>
+
+      <div class="hdr-more">
+        <button id="hdr-more-btn" class="btn btn-small hdr-more-btn" aria-label="More actions" aria-haspopup="true" aria-expanded="false">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>
+        </button>
+        <div id="hdr-more-panel" class="hdr-more-panel">
+          <div class="menu-label">DATA</div>
+          <button id="export-btn" class="btn btn-small">Export JSON</button>
+          <button id="export-csv-btn" class="btn btn-small">Export CSV</button>
+          <button id="import-btn" class="btn btn-small">Import JSON</button>
+          <input type="file" id="import-file" accept=".json" style="display:none">
+          <div class="menu-label">GOOGLE SHEET</div>
+          <a id="sheets-link" href="#" target="_blank" rel="noreferrer" style="display:none;" class="btn btn-small">Open sheet</a>
+          <input type="text" id="sheets-url-input" placeholder="Paste Google Sheet URL (optional)" style="display:none;">
+        </div>
+      </div>
     </div>
   </header>
 
   <div class="stats-bar">
-    <div class="stat-card">
-      <div class="stat-value" id="stat-total">0</div>
-      <div class="stat-label">Total Users</div>
+    <div class="stat-hero">
+      <div class="stat-label">Cycling now</div>
+      <div class="stat-hero-row">
+        <div class="stat-value" id="stat-active">0</div>
+        <div class="stat-hero-of">of <span class="stat-value" id="stat-total">0</span> clients</div>
+      </div>
     </div>
-    <div class="stat-card stat-active">
-      <div class="stat-value" id="stat-active">0</div>
-      <div class="stat-label">Active</div>
-    </div>
-    <div class="stat-card stat-found">
-      <div class="stat-value" id="stat-slots-found">0</div>
-      <div class="stat-label">Slots Found</div>
-    </div>
-    <div class="stat-card stat-confirmed">
-      <div class="stat-value" id="stat-confirmed">0</div>
-      <div class="stat-label">Confirmed</div>
-    </div>
-    <div class="stat-card stat-errors">
-      <div class="stat-value" id="stat-errors">0</div>
-      <div class="stat-label">Errors</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-value" id="stat-captcha">0%</div>
-      <div class="stat-label">CAPTCHA Rate</div>
+    <div class="stat-rail">
+      <div class="stat-card stat-found">
+        <div class="stat-value" id="stat-slots-found">0</div>
+        <div class="stat-label">Slots found</div>
+      </div>
+      <div class="stat-card stat-confirmed">
+        <div class="stat-value" id="stat-confirmed">0</div>
+        <div class="stat-label">Confirmed</div>
+      </div>
+      <div class="stat-card stat-errors">
+        <div class="stat-value" id="stat-errors">0</div>
+        <div class="stat-label">Errors</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="stat-captcha">0%</div>
+        <div class="stat-label">CAPTCHA rate</div>
+      </div>
     </div>
   </div>
+
+  <section id="consulate-rail-wrap" class="consulate-wrap" hidden>
+    <div class="lane-head">
+      <b>CONSULATES</b>
+      <span class="rule"></span>
+      <span class="lane-hint" id="rail-hint"></span>
+    </div>
+    <div class="consulate-rail" id="consulate-rail"></div>
+  </section>
+
+  <section id="attention-lane" class="attention-lane" hidden>
+    <div class="lane-head">
+      <b>NEEDS YOU</b>
+      <span class="lane-count" id="lane-count">0</span>
+      <span class="rule"></span>
+    </div>
+    <div class="lane-grid" id="lane-grid"></div>
+  </section>
 
   <div class="main-content">
     <div class="left-panel">
@@ -173,7 +207,7 @@
           <button id="clear-slots-btn" class="btn btn-small btn-gray">Clear</button>
         </div>
       </div>
-      <div id="activity-log" class="activity-log"></div>
+      <div id="activity-log" class="activity-log" role="log" aria-live="polite" aria-relevant="additions"></div>
       <div id="slot-history" class="activity-log" style="display:none;"></div>
       <div id="stats-pane" class="activity-log" style="display:none;"></div>
     </div>
@@ -383,11 +417,7 @@
           <label><input type="checkbox" id="edit-auto-select"> Auto-Select</label>
           <label><input type="checkbox" id="edit-auto-submit"> Auto-Submit</label>
         </div>
-        <div class="form-row">
-          <label>CAPTCHA:</label>
-          <label><input type="radio" name="edit-captcha" value="manual"> Manual</label>
-          <label><input type="radio" name="edit-captcha" value="auto"> Auto (OCR)</label>
-        </div>
+        <!-- #63 CAPTCHA choice removed — always auto (OCR). -->
       </div>
       <div class="modal-footer">
         <button id="edit-delete-btn" class="btn btn-red">Delete</button>
@@ -399,8 +429,11 @@
     </div>
   </div>
 
+  <section id="wall-mode" class="wall-mode" hidden></section>
+
   <script src="js/supabase-sync.js"></script>
   <script src="js/sheets-sync.js"></script>
+  <script src="js/ui-kit.js"></script>
   <script src="js/dashboard.js"></script>
 </body>
 </html>

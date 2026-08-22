@@ -12,6 +12,24 @@ Format:
 
 ---
 
+## 2026-08-23 — Removed bundled code that was reporting your bookings to a competitor (Issue #69)
+**What we found:** buried in the extension was the original **CheckVisaSlots** extension code. It was still calling home to their servers — including an endpoint literally named **`/push/appointment-confirmation`**, i.e. reporting your clients' confirmed bookings.
+
+**Was anything actually sent?** No. Their server refuses our requests, because our extension isn't one of theirs. But it was **trying on every booking**, and if they ever relaxed that check it would have started working. Client appointment data going to a competitor is not something to leave on a maybe.
+
+**It was also causing noise** — the repeated `outerText` crash and the `Extension context invalidated` messages both came from this file.
+
+**Removed it entirely.** Checked carefully first that nothing depends on it:
+- The date and city selection is done by the bot itself and by `page.js`, not this file
+- All slot data reaches us through `page.js`
+- Nothing in our code calls into it
+
+**What you lose:** the small *"Overview of available slots — shown by Check US Visa Slots extension"* box at the bottom of the booking page. Cosmetic only — the bot's own detection, panel, and booking are untouched.
+
+**Still to do on your side:** the separate **Visa Slots Guru** extension is a different problem — it is *successfully* uploading screenshots of your booking page (with client names on them) to its own servers, and its own off-switch does nothing. Remove it at `chrome://extensions/` on every machine.
+
+---
+
 ## 2026-08-22 — Fix: same "CHANGE IP" alert firing 30+ times (Issue #68)
 **What you saw:** the same 🚫 CHANGE IP message arriving over and over — about **twice a second**, endlessly.
 
