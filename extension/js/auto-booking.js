@@ -3061,38 +3061,58 @@
 
   // Handle severe rate errors (429, Error 1015) — these are PER-IP. Logging out doesn't help
   // (re-login is on the same rate-limited IP). #49: pause at dashboard + alert to change IP.
+  // #68 Alert once per episode, and NEVER navigate on a hard block.
+  // Cloudflare 1015/1020 refuse the whole IP, so the dashboard we used to
+  // navigate to was blocked too: detect -> alert -> navigate -> detect ->
+  // alert ... roughly twice a second, forever. The in-page guard could not stop
+  // it because every navigation created a fresh page.
+  const SEVERE_ALERT_COOLDOWN_MS = 15 * 60 * 1000;
+
   function handleSevereError(reason) {
     // Re-entry guard — prevent flood within the same page
     if (window.__severeErrorHandling) return;
     window.__severeErrorHandling = true;
 
+    // Cross-navigation guard: sessionStorage survives same-origin navigation,
+    // so a repeated block on the next page stays silent.
+    const last = parseInt(sessionStorage.getItem("__abSevereAt") || "0", 10) || 0;
+    const withinCooldown = last && (Date.now() - last < SEVERE_ALERT_COOLDOWN_MS);
+    sessionStorage.setItem("__abSevereAt", String(Date.now()));
+
     if (cycling.active) stopCycling(`${reason} — paused, change IP`);
+
+    // Stop everything regardless — the IP is refused, nothing will work.
+    __abortAll = true;
+    window.__autoBookingLoginActive = false;
+    if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
+    chrome.storage.local.remove(["activeAutomationUser"]);
+    sessionStorage.removeItem("ab-cycling-state");
+    sessionStorage.removeItem("__abSevereLogout");
+    sessionStorage.removeItem("__abSevereCount");
+    sessionStorage.setItem("__abPausedRateLimit", reason);
+
+    if (withinCooldown) {
+      log(`Severe: ${reason} — already alerted ${Math.round((Date.now() - last) / 1000)}s ago, staying quiet`);
+      return;
+    }
 
     chrome.storage.local.get(["loginDetails"], (d) => {
       const u = d.loginDetails?.username || "";
-      log(`Severe rate error: ${reason} — pausing at dashboard, alerting to change IP (NO logout)`);
-      trackEvent(EVENT_TYPES.ERROR, `Severe: ${reason} — paused at dashboard, change IP (no logout)`, u);
+      const isFirewall = /1020|firewall|have been blocked/i.test(reason);
+      log(`Severe: ${reason} — stopped, alerting once. No navigation (every page on this IP is blocked).`);
+      trackEvent(EVENT_TYPES.ERROR, `Severe: ${reason} — stopped, change IP`, u);
       sendTelegramNotification("error",
-        `🚫 <b>RATE LIMITED — CHANGE IP</b>\n\n` +
+        (isFirewall ? `🚫 <b>IP BLOCKED — CHANGE IP</b>\n\n` : `🚫 <b>RATE LIMITED — CHANGE IP</b>\n\n`) +
         `👤 <b>User:</b> ${u}\n` +
         `⚠️ ${reason}\n` +
         `🔁 Ran <b>${cycling.round}</b> rounds\n` +
-        `🌐 This IP is being rate-limited (per-IP block). <b>Change the IP address</b> (different network / proxy), then restart this client.\n` +
-        `⏸️ Paused at dashboard — staying logged in (no logout).`
+        (isFirewall
+          ? `🌐 Cloudflare is refusing this IP outright (firewall rule, not a speed limit). Waiting will not clear it.\n`
+          : `🌐 This IP is rate-limited. It may clear on its own, but changing IP is faster.\n`) +
+        `🔧 <b>Change the IP</b> (different network / VPN exit), then restart this client.\n` +
+        `⏸️ Stopped — still logged in, no logout.`
       );
       updateUserStatus(u, "rate_limited");
-
-      __abortAll = true;
-      window.__autoBookingLoginActive = false;
-      if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
-      chrome.storage.local.remove(["activeAutomationUser"]); // stop auto-cycling on the next page
-      sessionStorage.removeItem("ab-cycling-state");          // don't auto-resume
-      sessionStorage.removeItem("__abSevereLogout");          // ensure we do NOT sign out
-      sessionStorage.removeItem("__abSevereCount");
-      sessionStorage.setItem("__abPausedRateLimit", reason);  // #49 pause at dashboard (no continue, no logout)
-
-      // Get off the rate-limited page to the dashboard; stay logged in, paused.
-      window.location.href = window.location.origin + "/en-US/";
     });
   }
 
@@ -5446,6 +5466,14 @@
       log(`Cloudflare block detected on page load — ${reason} — pausing and alerting to change IP`);
       handleSevereError(reason);
       return;
+    }
+
+    // #68 Reached a normal page on this origin -> the block has cleared. Drop the
+    // alert-suppression marker so the NEXT genuine block alerts immediately
+    // instead of being silenced by the cooldown.
+    if (host.includes("usvisascheduling.com") && sessionStorage.getItem("__abSevereAt")) {
+      sessionStorage.removeItem("__abSevereAt");
+      log("Normal page reached — cleared severe-alert cooldown");
     }
 
     // Generic site error page detection ("We're sorry, but something went wrong")

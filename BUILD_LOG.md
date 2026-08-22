@@ -12,6 +12,20 @@ Format:
 
 ---
 
+## 2026-08-22 — Fix: same "CHANGE IP" alert firing 30+ times (Issue #68)
+**What you saw:** the same 🚫 CHANGE IP message arriving over and over — about **twice a second**, endlessly.
+
+**Why:** when Cloudflare blocked the IP, the bot's plan was "get off this page, go back to the dashboard". But a 1020 block refuses **the whole IP address** — so the dashboard was blocked too. It saw a block, alerted, moved to the dashboard, saw a block, alerted, moved... in a circle. The bot's "don't repeat yourself" check only lasted for one page, and every move created a fresh page, so it reset every time.
+
+**Fixed three things:**
+1. **It no longer moves anywhere** when the IP is blocked. There is nowhere to go — every page is blocked. Moving was the whole cause.
+2. **It remembers it already told you**, even across page changes. A repeat within 15 minutes stays silent. It still stops the client — it just doesn't message you again.
+3. **The memory clears** as soon as a normal page loads, so the next genuine block alerts you straight away rather than being muted.
+
+**Also corrected the wording.** Block **1020** is a firewall rule — the site is refusing that IP outright, and **waiting will not clear it**; you must change IP. Block **1015** is a speed limit, which can clear by itself. Both used to say "RATE LIMITED", which sent you after the wrong fix.
+
+---
+
 ## 2026-08-22 — Fix: the bot's session/rate-limit watcher never worked on the booking page (Issue #67)
 **What was wrong:** the bot installs a small watcher to notice when the website says *"session expired"* (401) or *"too many requests"* (429). On the booking page that watcher was **being rejected every single time** — so those two things went unnoticed there.
 
