@@ -2940,6 +2940,12 @@
   function detectTurnstileChallenge() {
     // Waiting room pages have CF elements but are NOT challenges — exclude them
     if (isWaitingRoom()) return false;
+    // #66 A HARD BLOCK ("Sorry, you have been blocked" / Error 1020) is not a
+    // solvable challenge — there is no checkbox. Its body text contains
+    // "using a security service to protect itself", which matched the phrase
+    // check below, so the bot sat waiting 5 minutes for a solve that could
+    // never happen instead of alerting to change IP.
+    if (isCloudflareBlocked()) return false;
     // Check for Turnstile container div
     if (document.querySelector(".cf-turnstile, #cf-turnstile, [data-sitekey]")) return true;
     // Cloudflare interstitial widget (often inside closed shadow-root, but these markers live on the OUTER page)
@@ -3103,9 +3109,12 @@
     if (document.getElementById("__ab401marker")) return;
     // #65 Skip on Cloudflare interstitials — their CSP blocks inline scripts.
     // Detect cheaply, without depending on functions defined later.
+    const t = (document.title || "").toLowerCase();
     const cfPage = /[?&]__cf_chl/.test(window.location.search)
-      || document.querySelector("#challenge-running, #challenge-form, #challenge-stage, .cf-turnstile, iframe[src*='challenges.cloudflare.com']")
-      || /just a moment/i.test(document.title || "");
+      || document.querySelector("#challenge-running, #challenge-form, #challenge-stage, .cf-turnstile, iframe[src*='challenges.cloudflare.com'], #cf-error-details, .cf-error-overview, .cf-wrapper")
+      || /just a moment|attention required|access denied/.test(t)
+      // #66 hard-block page ("Sorry, you have been blocked") also blocks inline scripts
+      || /sorry, you have been blocked/i.test((document.querySelector("h1, h2")?.textContent || ""));
     if (cfPage) {
       log("[401det] Cloudflare interstitial — skipping detector injection (CSP blocks inline scripts)");
       return;
@@ -5379,8 +5388,19 @@
 
     // Cloudflare block detection on page load — severe error, auto-logout
     if (host.includes("usvisascheduling.com") && isCloudflareBlocked()) {
-      log("Cloudflare block detected on page load — triggering auto-logout");
-      handleSevereError("Cloudflare Blocked (Error 1015)");
+      // #66 Report what the page actually says. A hard block ("Sorry, you have
+      // been blocked", error 1020) is a firewall rule, not the 1015 rate limit;
+      // both need the IP changed, but mislabelling it sends the operator
+      // looking for the wrong thing. Also: handleSevereError pauses at the
+      // dashboard and does NOT log out (changed in #49) — the old log line
+      // claiming "auto-logout" was stale.
+      const bodyTxt = (document.body?.textContent || "").toLowerCase();
+      const reason =
+        /error 1015|being rate limited/.test(bodyTxt) ? "Cloudflare rate limit (1015)"
+        : /sorry, you have been blocked|error 1020/.test(bodyTxt) ? "Cloudflare firewall block (1020) — IP refused"
+        : "Cloudflare blocked this IP";
+      log(`Cloudflare block detected on page load — ${reason} — pausing and alerting to change IP`);
+      handleSevereError(reason);
       return;
     }
 

@@ -12,6 +12,21 @@ Format:
 
 ---
 
+## 2026-08-22 — Fix: bot waited 5 minutes on a Cloudflare BLOCK, thinking it could be solved (Issue #66)
+**What happened:** a client hit Cloudflare's **"Sorry, you have been blocked"** page. The bot told you *"remote solve needed"* and sat waiting five minutes for you to click a checkbox — **but that page has no checkbox.** It's a hard block, not a puzzle. Nothing could ever be solved, so it just timed out.
+
+**Why it got confused:** the block page contains the sentence *"This website is using a security service to protect itself from online attacks."* The bot used that exact phrase to recognise the solvable "verify you are human" page — so it mistook one for the other. And because that check ran first, the bot never got as far as the code that knows what a real block is.
+
+**Now:** the bot recognises a hard block properly and immediately tells you **"change the IP address"**, then pauses that client. No five-minute wait, and the right instruction.
+
+**Two related corrections:**
+- The alert used to always say *"Error 1015"*, which is Cloudflare's *rate limit*. This page is a *firewall block* (1020). Both are fixed by changing IP, but the message now says which one you actually hit.
+- The log claimed it was "logging out" — it hasn't done that since an earlier change; it pauses at the dashboard instead. Message corrected.
+
+**Also:** the console error about blocked scripts came back on this page, because the fix before it only recognised pages titled "Just a moment". This one is titled "Attention Required!". Now covered.
+
+---
+
 ## 2026-08-16 — Fix: console errors on Cloudflare "verify you are human" pages (Issue #65)
 **What you saw:** a stream of red "Content Security Policy" errors in the console whenever the bot landed on a Cloudflare verification page.
 
