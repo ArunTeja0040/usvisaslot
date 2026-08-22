@@ -12,6 +12,21 @@ Format:
 
 ---
 
+## 2026-08-23 — Cloud updates no longer vanish when the VPN drops (Issue #71)
+**What was happening:** every so often the dashboard showed `[SupabaseSync] Failed to fetch` and the update was simply gone. Cause: the cloud database sits behind **Cloudflare** — the very thing refusing your VPN addresses on the visa site. So whenever the VPN was on a bad exit, or mid-switch, cloud sync died with it.
+
+(The database itself was fine throughout — it answered a direct request in one second while the extension was failing.)
+
+**The one that mattered:** the **heartbeat**, the "I'm still alive" ping each machine sends. If it goes missing for 10 minutes, other dashboards assume that machine is dead and hand its client to someone else — so **the same client could get started on two machines at once**, doubling how hard you hit a site that's already blocking you.
+
+Also being lost silently: statistics, slot history, client status, and the rate-limit flags.
+
+**Fixed:** those eight updates now try again — three attempts, a second or two apart. Only for genuine connection failures; if the database gives a real answer like "not allowed", it accepts that and doesn't retry pointlessly.
+
+**Your side, and it's the better half of the fix:** in Mullvad, turn on **split tunnelling** and exclude `supabase.co` from the VPN. Then cloud sync uses your normal internet while the visa site still goes through the VPN — the two stop fighting altogether. The retry survives the gap; split tunnelling stops the gap happening.
+
+---
+
 ## 2026-08-23 — Blocked IP now changes itself (Issue #70)
 **What it does:** when Cloudflare refuses a client's IP, the bot no longer just stops and waits for you. It asks the VPN to move to a different city, checks the IP actually changed, and restarts that client on the fresh connection — all by itself.
 
