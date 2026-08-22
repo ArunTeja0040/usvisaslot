@@ -3170,6 +3170,16 @@
 
   function inject401Detector() {
     if (document.getElementById("__ab401marker")) return;
+
+    // #69 page.js already covers every /*schedule/* page (registered by the
+    // service worker via chrome.scripting, so page CSP cannot block it). On
+    // those pages this inline fallback is redundant AND guaranteed to be
+    // refused by the site's CSP — which is the console noise. Skip it.
+    if (/\/[^/]+\/[^/]*schedule\//i.test(window.location.pathname)) {
+      log("[401det] page.js covers this page — skipping inline fallback");
+      return;
+    }
+
     // #65 Skip on Cloudflare interstitials — their CSP blocks inline scripts.
     // Detect cheaply, without depending on functions defined later.
     const t = (document.title || "").toLowerCase();
