@@ -2196,13 +2196,17 @@
         updateUserStatus(settings.loginDetails.username, "logging_in");
         runLogin(settings);
       } else {
-        log("No credentials found for active user — falling back to settings panel");
-        trackEvent(EVENT_TYPES.ERROR, "No credentials found for active user — showing settings panel", targetUser || "");
-        sendTelegramNotification("error", `⚠️ <b>NO CREDENTIALS</b>\n\n👤 <b>User:</b> ${targetUser || "unknown"}\n❌ No saved credentials found\n💡 Enter credentials in settings panel`);
-        injectSettingsPanel();
+        // #64 On-page settings panel removed — the dashboard is the control
+        // surface now, and the panel showed credentials in plain text on a page
+        // anyone walking past could see.
+        log("No credentials found for active user — cannot auto-login");
+        trackEvent(EVENT_TYPES.ERROR, "No credentials found for active user", targetUser || "");
+        sendTelegramNotification("error", `⚠️ <b>NO CREDENTIALS</b>\n\n👤 <b>User:</b> ${targetUser || "unknown"}\n❌ No saved credentials found\n💡 Add them on the dashboard, then Start Now`);
       }
     } else {
-      injectSettingsPanel();
+      // #64 No client started from the dashboard — do nothing and leave the
+      // site usable by hand. (Was: inject the on-page settings panel.)
+      log("Login page open with no active client — idle. Start a client from the dashboard.");
     }
   }
 
@@ -2936,6 +2940,12 @@
   function detectTurnstileChallenge() {
     // Waiting room pages have CF elements but are NOT challenges — exclude them
     if (isWaitingRoom()) return false;
+    // #66 A HARD BLOCK ("Sorry, you have been blocked" / Error 1020) is not a
+    // solvable challenge — there is no checkbox. Its body text contains
+    // "using a security service to protect itself", which matched the phrase
+    // check below, so the bot sat waiting 5 minutes for a solve that could
+    // never happen instead of alerting to change IP.
+    if (isCloudflareBlocked()) return false;
     // Check for Turnstile container div
     if (document.querySelector(".cf-turnstile, #cf-turnstile, [data-sitekey]")) return true;
     // Cloudflare interstitial widget (often inside closed shadow-root, but these markers live on the OUTER page)
@@ -3051,38 +3061,127 @@
 
   // Handle severe rate errors (429, Error 1015) — these are PER-IP. Logging out doesn't help
   // (re-login is on the same rate-limited IP). #49: pause at dashboard + alert to change IP.
+  // #68 Alert once per episode, and NEVER navigate on a hard block.
+  // Cloudflare 1015/1020 refuse the whole IP, so the dashboard we used to
+  // navigate to was blocked too: detect -> alert -> navigate -> detect ->
+  // alert ... roughly twice a second, forever. The in-page guard could not stop
+  // it because every navigation created a fresh page.
+  const SEVERE_ALERT_COOLDOWN_MS = 15 * 60 * 1000;
+
+  // #70 Auto-rotate the VPN when an IP is refused, instead of waiting for a
+  // human to change it. Bounded: a client whose block follows it across exits
+  // must not chew through every server.
+  const VPN_AUTOROTATE_MAX = 3;                   // rotations per window
+  const VPN_AUTOROTATE_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+
+  function vpnCommand(command) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ action: "vpnControl", command }, (resp) => {
+          if (chrome.runtime.lastError) return resolve({ ok: false, error: chrome.runtime.lastError.message });
+          resolve(resp || { ok: false, error: "no response" });
+        });
+      } catch (e) { resolve({ ok: false, error: e.message }); }
+    });
+  }
+
+  // Returns the new IP on success, null if it could not (or should not) rotate.
+  async function autoRotateVpn(reason) {
+    const store = await new Promise((r) => chrome.storage.local.get(["__abVpnRotates"], r));
+    const hist = (store.__abVpnRotates || []).filter((t) => Date.now() - t < VPN_AUTOROTATE_WINDOW_MS);
+    if (hist.length >= VPN_AUTOROTATE_MAX) {
+      log(`[vpn] auto-rotate budget spent (${hist.length}/${VPN_AUTOROTATE_MAX} this hour) — not rotating`);
+      return null;
+    }
+
+    const status = await vpnCommand("status");
+    if (status.error || !status.connected) {
+      log("[vpn] server offline or not connected — cannot auto-rotate");
+      return null;
+    }
+    const before = status.public_ip || "";
+
+    log(`[vpn] ${reason} — rotating exit (attempt ${hist.length + 1}/${VPN_AUTOROTATE_MAX})`);
+    const res = await vpnCommand("rotate");
+    if (res.error) { log("[vpn] rotate failed: " + res.error); return null; }
+
+    const after = res.public_ip || "";
+    if (after && after === before) { log("[vpn] rotate returned the same IP — treating as failed"); return null; }
+
+    hist.push(Date.now());
+    await new Promise((r) => chrome.storage.local.set({ __abVpnRotates: hist }, r));
+    log(`[vpn] rotated ${before || "?"} -> ${after || "?"}${res.city ? " (" + res.city + ")" : ""}`);
+    return after || "changed";
+  }
+
   function handleSevereError(reason) {
     // Re-entry guard — prevent flood within the same page
     if (window.__severeErrorHandling) return;
     window.__severeErrorHandling = true;
 
+    // Cross-navigation guard: sessionStorage survives same-origin navigation,
+    // so a repeated block on the next page stays silent.
+    const last = parseInt(sessionStorage.getItem("__abSevereAt") || "0", 10) || 0;
+    const withinCooldown = last && (Date.now() - last < SEVERE_ALERT_COOLDOWN_MS);
+    sessionStorage.setItem("__abSevereAt", String(Date.now()));
+
     if (cycling.active) stopCycling(`${reason} — paused, change IP`);
 
-    chrome.storage.local.get(["loginDetails"], (d) => {
+    // Stop everything regardless — the IP is refused, nothing will work.
+    __abortAll = true;
+    window.__autoBookingLoginActive = false;
+    if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
+    chrome.storage.local.remove(["activeAutomationUser"]);
+    sessionStorage.removeItem("ab-cycling-state");
+    sessionStorage.removeItem("__abSevereLogout");
+    sessionStorage.removeItem("__abSevereCount");
+    sessionStorage.setItem("__abPausedRateLimit", reason);
+
+    if (withinCooldown) {
+      log(`Severe: ${reason} — already alerted ${Math.round((Date.now() - last) / 1000)}s ago, staying quiet`);
+      return;
+    }
+
+    chrome.storage.local.get(["loginDetails"], async (d) => {
       const u = d.loginDetails?.username || "";
-      log(`Severe rate error: ${reason} — pausing at dashboard, alerting to change IP (NO logout)`);
-      trackEvent(EVENT_TYPES.ERROR, `Severe: ${reason} — paused at dashboard, change IP (no logout)`, u);
+      const isFirewall = /1020|firewall|have been blocked/i.test(reason);
+
+      // #70 Try to change the IP ourselves before asking a human to.
+      const newIp = await autoRotateVpn(reason);
+      if (newIp) {
+        trackEvent(EVENT_TYPES.SESSION, `Auto-rotated VPN after ${reason} — new IP ${newIp}`, u);
+        sendTelegramNotification("rate",
+          `🔄 <b>IP CHANGED AUTOMATICALLY</b>\n\n` +
+          `👤 <b>User:</b> ${u}\n` +
+          `⚠️ ${reason}\n` +
+          `🌐 New IP: <b>${newIp}</b>\n` +
+          `▶️ Restarting this client on the new IP...`);
+        updateUserStatus(u, "idle");
+        // Clear the pause so the restarted client is not held back, then let the
+        // saved state bring cycling back on the fresh IP.
+        sessionStorage.removeItem("__abPausedRateLimit");
+        sessionStorage.removeItem("__abSevereAt");
+        chrome.storage.local.set({ activeAutomationUser: u }, () => {
+          setTimeout(() => { window.location.href = window.location.origin + "/en-US/"; }, 4000);
+        });
+        return;
+      }
+
+      log(`Severe: ${reason} — stopped, alerting once. No navigation (every page on this IP is blocked).`);
+      trackEvent(EVENT_TYPES.ERROR, `Severe: ${reason} — stopped, change IP`, u);
       sendTelegramNotification("error",
-        `🚫 <b>RATE LIMITED — CHANGE IP</b>\n\n` +
+        (isFirewall ? `🚫 <b>IP BLOCKED — CHANGE IP</b>\n\n` : `🚫 <b>RATE LIMITED — CHANGE IP</b>\n\n`) +
         `👤 <b>User:</b> ${u}\n` +
         `⚠️ ${reason}\n` +
         `🔁 Ran <b>${cycling.round}</b> rounds\n` +
-        `🌐 This IP is being rate-limited (per-IP block). <b>Change the IP address</b> (different network / proxy), then restart this client.\n` +
-        `⏸️ Paused at dashboard — staying logged in (no logout).`
+        (isFirewall
+          ? `🌐 Cloudflare is refusing this IP outright (firewall rule, not a speed limit). Waiting will not clear it.\n`
+          : `🌐 This IP is rate-limited. It may clear on its own, but changing IP is faster.\n`) +
+        `🔧 <b>Change the IP</b> (different network / VPN exit), then restart this client.\n` +
+        `🔄 <i>Auto-rotate did not run — VPN server offline, or the hourly rotation budget is spent.</i>\n` +
+        `⏸️ Stopped — still logged in, no logout.`
       );
       updateUserStatus(u, "rate_limited");
-
-      __abortAll = true;
-      window.__autoBookingLoginActive = false;
-      if (cycling.keepAliveTimer) { clearInterval(cycling.keepAliveTimer); cycling.keepAliveTimer = null; }
-      chrome.storage.local.remove(["activeAutomationUser"]); // stop auto-cycling on the next page
-      sessionStorage.removeItem("ab-cycling-state");          // don't auto-resume
-      sessionStorage.removeItem("__abSevereLogout");          // ensure we do NOT sign out
-      sessionStorage.removeItem("__abSevereCount");
-      sessionStorage.setItem("__abPausedRateLimit", reason);  // #49 pause at dashboard (no continue, no logout)
-
-      // Get off the rate-limited page to the dashboard; stay logged in, paused.
-      window.location.href = window.location.origin + "/en-US/";
     });
   }
 
@@ -3095,8 +3194,73 @@
   // Uses a minimal MAIN-world script that signals via DOM attribute (no XHR/fetch re-wrapping).
   // page.js already wraps XHR — this hooks into the existing wrappers' load events
   // by using a PerformanceObserver for failed network requests instead.
+  // #67 Primary 401/429 path: page.js (MAIN world, injected by the service
+  // worker via chrome.scripting, so page CSP cannot block it) dispatches
+  // "abHttpStatus". The inline-script injection below is kept as a fallback for
+  // pages page.js does not cover, but on the booking page it was always blocked
+  // by the site's CSP — which is why 401/429 detection appeared dead there.
+  function listenForHttpStatus() {
+    if (window.__abHttpStatusWired) return;
+    window.__abHttpStatusWired = true;
+
+    window.addEventListener("abHttpStatus", (e) => {
+      const d = (e && e.detail) || {};
+      if (d.status === 401) {
+        log("401 detected (page.js)");
+        __session401Detected = true;
+        chrome.storage.local.get(["loginDetails"], (dd) => {
+          const u = dd.loginDetails?.username || "";
+          trackEvent(EVENT_TYPES.ERROR, "401 session expired", u);
+          updateUserStatus(u, "session_expired");
+          sendTelegramNotification("error", `⚠️ <b>401 SESSION EXPIRED</b>\n\n👤 <b>User:</b> ${u}\n🔄 Will attempt auto re-login`);
+        });
+        return;
+      }
+
+      if (d.status === 429) {
+        __rateLimited429 = true;
+        __submit429At = Date.now();
+        __lastSubmitDiag = d;
+        const src = d.cfRay ? "CLOUDFLARE edge"
+                  : (d.msBurst || d.msTime) ? "platform throttle"
+                  : "site/app limiter";
+        log(`429 detected (page.js) — source=${src} retryAfter=${d.retryAfter || "none"} url=${d.url}`);
+        if (d.body) log(`[429 diag] body: ${String(d.body).substring(0, 200)}`);
+        chrome.storage.local.get(["loginDetails"], (dd) => {
+          const u = dd.loginDetails?.username || "";
+          trackEvent(EVENT_TYPES.ERROR, `429 rate limited — source=${src}, retryAfter=${d.retryAfter || "none"}`, u);
+          updateUserStatus(u, "rate_limited");
+          sendTelegramNotification("rate", `🟠 <b>429 RATE LIMITED</b>\n\n👤 <b>User:</b> ${u}\n🔎 ${src}\n⏳ Backoff activated`);
+        });
+      }
+    });
+    log("[401det] listening for page.js HTTP status events");
+  }
+
   function inject401Detector() {
     if (document.getElementById("__ab401marker")) return;
+
+    // #69 page.js already covers every /*schedule/* page (registered by the
+    // service worker via chrome.scripting, so page CSP cannot block it). On
+    // those pages this inline fallback is redundant AND guaranteed to be
+    // refused by the site's CSP — which is the console noise. Skip it.
+    if (/\/[^/]+\/[^/]*schedule\//i.test(window.location.pathname)) {
+      log("[401det] page.js covers this page — skipping inline fallback");
+      return;
+    }
+
+    // #65 Skip on Cloudflare interstitials — their CSP blocks inline scripts.
+    // Detect cheaply, without depending on functions defined later.
+    const t = (document.title || "").toLowerCase();
+    const cfPage = /[?&]__cf_chl/.test(window.location.search)
+      || document.querySelector("#challenge-running, #challenge-form, #challenge-stage, .cf-turnstile, iframe[src*='challenges.cloudflare.com'], #cf-error-details, .cf-error-overview, .cf-wrapper")
+      || /just a moment|attention required|access denied/.test(t)
+      // #66 hard-block page ("Sorry, you have been blocked") also blocks inline scripts
+      || /sorry, you have been blocked/i.test((document.querySelector("h1, h2")?.textContent || ""));
+    if (cfPage) {
+      log("[401det] Cloudflare interstitial — skipping detector injection (CSP blocks inline scripts)");
+      return;
+    }
     const marker = document.createElement("div");
     marker.id = "__ab401marker";
     marker.style.display = "none";
@@ -3175,7 +3339,11 @@
         }
       })();
     `;
-    document.documentElement.appendChild(script);
+    try {
+      document.documentElement.appendChild(script);
+    } catch (e) {
+      log("[401det] injection blocked: " + e.message);
+    }
     script.remove();
 
     const observer = new MutationObserver((mutations) => {
@@ -5229,7 +5397,12 @@
 
     // Inject 401 detector on scheduling pages (MAIN world XHR intercept)
     if (host.includes("usvisascheduling.com")) {
-      inject401Detector();
+      // #65 Cloudflare challenge/waiting-room pages ship a strict CSP that
+      // forbids injected inline scripts, so this only produced console errors.
+      // The detector is pointless there anyway — the site's own API calls are
+      // not running yet. Skip it; the next real page load installs it.
+      listenForHttpStatus();   // #67 CSP-proof primary path
+      inject401Detector();     // fallback for pages page.js does not cover
 
       // Parallel-scan A1: capture the real schedule-days request template from page.js (MAIN world)
       window.addEventListener("vSCPTemplate", (e) => {
@@ -5358,9 +5531,28 @@
 
     // Cloudflare block detection on page load — severe error, auto-logout
     if (host.includes("usvisascheduling.com") && isCloudflareBlocked()) {
-      log("Cloudflare block detected on page load — triggering auto-logout");
-      handleSevereError("Cloudflare Blocked (Error 1015)");
+      // #66 Report what the page actually says. A hard block ("Sorry, you have
+      // been blocked", error 1020) is a firewall rule, not the 1015 rate limit;
+      // both need the IP changed, but mislabelling it sends the operator
+      // looking for the wrong thing. Also: handleSevereError pauses at the
+      // dashboard and does NOT log out (changed in #49) — the old log line
+      // claiming "auto-logout" was stale.
+      const bodyTxt = (document.body?.textContent || "").toLowerCase();
+      const reason =
+        /error 1015|being rate limited/.test(bodyTxt) ? "Cloudflare rate limit (1015)"
+        : /sorry, you have been blocked|error 1020/.test(bodyTxt) ? "Cloudflare firewall block (1020) — IP refused"
+        : "Cloudflare blocked this IP";
+      log(`Cloudflare block detected on page load — ${reason} — pausing and alerting to change IP`);
+      handleSevereError(reason);
       return;
+    }
+
+    // #68 Reached a normal page on this origin -> the block has cleared. Drop the
+    // alert-suppression marker so the NEXT genuine block alerts immediately
+    // instead of being silenced by the cooldown.
+    if (host.includes("usvisascheduling.com") && sessionStorage.getItem("__abSevereAt")) {
+      sessionStorage.removeItem("__abSevereAt");
+      log("Normal page reached — cleared severe-alert cooldown");
     }
 
     // Generic site error page detection ("We're sorry, but something went wrong")

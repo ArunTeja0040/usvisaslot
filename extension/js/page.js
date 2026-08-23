@@ -20,3 +20,44 @@
     return oSend.apply(this, arguments);
   };
 })();
+// ── #67 HTTP status detection (401 / 429) — MAIN world, CSP-immune ──
+// auto-booking.js used to inject an inline <script> for this. The site's own
+// pages ship a CSP with no 'unsafe-inline', so that injection was blocked and
+// 401/429 detection was silently dead on the booking page — exactly where it
+// matters. page.js is registered by the service worker via
+// chrome.scripting.registerContentScripts (browser-level, so page CSP does not
+// apply), which makes this the right home for it.
+(function () {
+  if (XMLHttpRequest.prototype.__abStatusPatched) return;
+  XMLHttpRequest.prototype.__abStatusPatched = true;
+
+  var oOpen = XMLHttpRequest.prototype.open;
+  var oSend = XMLHttpRequest.prototype.send;
+
+  XMLHttpRequest.prototype.open = function (m, u) {
+    this.__abUrl = u;
+    return oOpen.apply(this, arguments);
+  };
+
+  XMLHttpRequest.prototype.send = function () {
+    this.addEventListener("load", function () {
+      if (this.status !== 401 && this.status !== 429) return;
+      var detail = { status: this.status, url: String(this.__abUrl || "").substring(0, 200), at: Date.now() };
+      if (this.status === 429) {
+        // Capture which system refused us — Cloudflare edge, the platform
+        // throttle, or the site's own limiter all return 429 but need
+        // opposite responses.
+        try {
+          detail.retryAfter = this.getResponseHeader("Retry-After");
+          detail.cfRay = this.getResponseHeader("CF-Ray");
+          detail.msBurst = this.getResponseHeader("x-ms-ratelimit-burst-remaining-xrm-requests");
+          detail.msTime = this.getResponseHeader("x-ms-ratelimit-time-remaining-xrm-requests");
+          detail.ctype = this.getResponseHeader("Content-Type");
+          detail.body = String(this.responseText || "").substring(0, 500);
+        } catch (e) {}
+      }
+      try { dispatchEvent(new CustomEvent("abHttpStatus", { detail: detail })); } catch (e) {}
+    });
+    return oSend.apply(this, arguments);
+  };
+})();

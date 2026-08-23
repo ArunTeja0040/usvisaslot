@@ -24,7 +24,7 @@
         },
         {
             "matches": ["https://*.usvisascheduling.com/*"],
-            "js": ["js/html2canvas.js", "js/supabase-sync.js", "js/content.js", "js/auto-booking.js"],
+            "js": ["js/html2canvas.js", "js/supabase-sync.js", "js/auto-booking.js"],
             "run_at": "document_end"
         },
         {

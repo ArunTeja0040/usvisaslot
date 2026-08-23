@@ -44,6 +44,38 @@ const SupabaseSync = (() => {
     return h;
   }
 
+  // #71 The VPN and Supabase both sit behind Cloudflare, so a rotation or a
+  // burned exit drops cloud sync for a few seconds. Only flushEvents retried;
+  // everything else lost its write silently — including the heartbeat, whose
+  // absence makes other dashboards declare the device dead and hand the same
+  // client to a second machine.
+  //
+  // Retries ONLY transport failures ("Failed to fetch"). An HTTP error (403,
+  // 400, RLS rejection) is a real answer and must not be retried.
+  const RETRY_ATTEMPTS = 3;
+  const RETRY_BACKOFF_MS = [800, 2500];
+
+  function isTransient(err) {
+    const m = String((err && err.message) || err || "");
+    return /failed to fetch|networkerror|network request failed|load failed|connection closed|net::err_|timed? ?out|aborted/i.test(m);
+  }
+
+  async function withRetry(fn, label) {
+    let lastErr;
+    for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++) {
+      try {
+        return await fn();
+      } catch (e) {
+        lastErr = e;
+        if (!isTransient(e) || attempt === RETRY_ATTEMPTS) break;
+        const wait = RETRY_BACKOFF_MS[attempt - 1] || 2500;
+        console.warn(`[SupabaseSync] ${label} network failure (try ${attempt}/${RETRY_ATTEMPTS}) — retrying in ${wait}ms`);
+        await new Promise((r) => setTimeout(r, wait));
+      }
+    }
+    throw lastErr;
+  }
+
   async function query(table, params = "") {
     const res = await fetch(`${REST_URL}/${table}?${params}`, { headers: headers() });
     if (!res.ok) throw new Error(`GET ${table}: ${res.status} ${await res.text()}`);
@@ -281,9 +313,11 @@ const SupabaseSync = (() => {
   async function heartbeat() {
     if (!isReady()) return;
     try {
-      await update("devices", { id: deviceId }, { last_seen: new Date().toISOString() });
+      await withRetry(() => update("devices", { id: deviceId }, { last_seen: new Date().toISOString() }), "heartbeat");
     } catch (e) {
-      console.warn("[SupabaseSync] Heartbeat failed:", e.message);
+      // A missed heartbeat makes other dashboards treat this device as dead and
+      // release the client — say so loudly rather than as a passing warning.
+      console.error("[SupabaseSync] Heartbeat failed after retries — other dashboards may release this client:", e.message);
     }
   }
 
@@ -428,9 +462,9 @@ const SupabaseSync = (() => {
       }
     }
     try {
-      await update("user_profiles", { operator_id: operatorId, username }, data);
+      await withRetry(() => update("user_profiles", { operator_id: operatorId, username }, data), "updateProfileStatus");
     } catch (e) {
-      console.error("[SupabaseSync] updateProfileStatus failed:", e.message);
+      console.error("[SupabaseSync] updateProfileStatus failed after retries:", e.message);
     }
   }
 
@@ -439,7 +473,7 @@ const SupabaseSync = (() => {
   async function pushSlot(entry) {
     if (!isReady()) return;
     try {
-      await insert("slot_history", {
+      await withRetry(() => insert("slot_history", {
         operator_id: operatorId,
         device_id: deviceId,
         username: entry.username,
@@ -449,9 +483,9 @@ const SupabaseSync = (() => {
         in_range: entry.inRange || false,
         round: entry.round || null,
         detected_at: entry.detectedAt || new Date().toISOString(),
-      });
+      }), "pushSlot");
     } catch (e) {
-      console.error("[SupabaseSync] pushSlot failed:", e.message);
+      console.error("[SupabaseSync] pushSlot failed after retries:", e.message);
     }
   }
 
@@ -469,9 +503,9 @@ const SupabaseSync = (() => {
       detected_at: e.detectedAt || new Date().toISOString(),
     }));
     try {
-      await insert("slot_history", rows);
+      await withRetry(() => insert("slot_history", rows), "pushSlotBatch");
     } catch (e) {
-      console.error("[SupabaseSync] pushSlotBatch failed:", e.message);
+      console.error("[SupabaseSync] pushSlotBatch failed after retries:", e.message);
     }
   }
 
@@ -563,7 +597,7 @@ const SupabaseSync = (() => {
   async function pushDailyStat(stat) {
     if (!isReady()) return;
     try {
-      await upsert("daily_stats", {
+      await withRetry(() => upsert("daily_stats", {
         operator_id: operatorId,
         device_id: deviceId,
         username: stat.username || null,
@@ -578,38 +612,38 @@ const SupabaseSync = (() => {
         errors: stat.errors || 0,
         captcha_attempts: stat.captchaAttempts || 0,
         captcha_success: stat.captchaSuccess || 0,
-      }, "operator_id,device_id,username,stat_date,stat_hour,location");
+      }, "operator_id,device_id,username,stat_date,stat_hour,location"), "pushDailyStat");
     } catch (e) {
-      console.error("[SupabaseSync] pushDailyStat failed:", e.message);
+      console.error("[SupabaseSync] pushDailyStat failed after retries:", e.message);
     }
   }
 
   async function setRateLimitedAt(username, timestamp) {
     if (!isReady()) return;
     try {
-      await update("user_profiles", { operator_id: operatorId, username }, {
+      await withRetry(() => update("user_profiles", { operator_id: operatorId, username }, {
         rate_limited_at: timestamp,
         status: "rate_limited",
         is_active: false,
         active_device_id: null,
         active_device_name: null,
         updated_at: new Date().toISOString(),
-      });
+      }), "setRateLimitedAt");
     } catch (e) {
-      console.error("[SupabaseSync] setRateLimitedAt failed:", e.message);
+      console.error("[SupabaseSync] setRateLimitedAt failed after retries:", e.message);
     }
   }
 
   async function clearRateLimitedAt(username) {
     if (!isReady()) return;
     try {
-      await update("user_profiles", { operator_id: operatorId, username }, {
+      await withRetry(() => update("user_profiles", { operator_id: operatorId, username }, {
         rate_limited_at: null,
         status: "idle",
         updated_at: new Date().toISOString(),
-      });
+      }), "clearRateLimitedAt");
     } catch (e) {
-      console.error("[SupabaseSync] clearRateLimitedAt failed:", e.message);
+      console.error("[SupabaseSync] clearRateLimitedAt failed after retries:", e.message);
     }
   }
 
@@ -617,7 +651,7 @@ const SupabaseSync = (() => {
     if (!isReady()) return;
     try {
       const stored = await chrome.storage.local.get(["__supabase_device_name"]);
-      await insert("request_stats", {
+      await withRetry(() => insert("request_stats", {
         device_name: stored.__supabase_device_name || null,
         username: stats.username || "",
         period_start: stats.periodStart,
@@ -628,9 +662,9 @@ const SupabaseSync = (() => {
         avg_delay_sec: stats.avgDelaySec || 0,
         locations_checked: stats.locationsChecked || [],
         error_types: stats.errorTypes || {},
-      });
+      }), "pushRequestStats");
     } catch (e) {
-      console.error("[SupabaseSync] pushRequestStats failed:", e.message);
+      console.error("[SupabaseSync] pushRequestStats failed after retries:", e.message);
     }
   }
 
