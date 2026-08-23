@@ -1210,8 +1210,7 @@
       document.getElementById("edit-auto-select").checked = profile.autoSelect !== false;
       document.getElementById("edit-auto-submit").checked = profile.autoSubmit === true;
 
-      const captchaRadio = document.querySelector(`input[name="edit-captcha"][value="${profile.captchaMode || "manual"}"]`);
-      if (captchaRadio) captchaRadio.checked = true;
+      // #63 CAPTCHA row removed from the form — nothing to populate.
 
       document.getElementById("edit-delete-btn").style.display = "inline-block";
       applyStaffModeToEditModal();
@@ -1238,7 +1237,8 @@
       locations.push(cb.value);
     });
 
-    const captchaMode = (document.querySelector('input[name="edit-captcha"]:checked') || {}).value || "manual";
+    // #63 CAPTCHA selector removed from the form — always auto (OCR).
+    const captchaMode = "auto";
 
     const updated = {
       username: document.getElementById("edit-username").value.trim(),
@@ -1560,8 +1560,8 @@
     document.getElementById("edit-auto-login").checked = true;
     document.getElementById("edit-auto-dashboard").checked = true;
     document.getElementById("edit-auto-select").checked = true;
-    document.getElementById("edit-auto-submit").checked = false;
-    document.querySelector('input[name="edit-captcha"][value="auto"]').checked = true;
+    document.getElementById("edit-auto-submit").checked = true;   // #63 auto-submit on by default
+    // #63 CAPTCHA selector removed from the form — captchaMode is always "auto".
     document.getElementById("edit-delete-btn").style.display = "none";
     document.getElementById("edit-paste-area").style.display = "none";
     document.getElementById("edit-paste-box").value = "";
