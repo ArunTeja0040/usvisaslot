@@ -12,6 +12,23 @@ Format:
 
 ---
 
+## 2026-08-27 — Slots overview is back, and better (Issue #72)
+**What you get:** the availability table returns to the booking page — consulate name, a live timestamp, and a **Month | Dates** list for the city you're on.
+
+**What's new versus the old one:**
+- **Dates inside your client's range show in green**, everything else in grey. The old table had no idea what your date range was — it listed everything the same.
+- It **spells out the range** underneath, or warns in red if that client has no range set.
+- **Times appear** for whichever date is currently open. The old box never showed times at all.
+- It reports to **nobody**. The old one sent everything it saw to CheckVisaSlots.
+
+**One deliberate limit:** times are only shown for the date that's actually open. The scan only ever returns *dates* — getting times for every date would mean one extra request per date, aimed at exactly the limit that's already blocking you. So it shows what's already there and never asks for more.
+
+**No extra load.** It reads the same data feed the bot already uses, so it costs nothing and can't slow anything down.
+
+**One more thing the old file was doing:** it clicked a date on the calendar every single scan — the first date it saw, with **no check against your date range**. That could fight your own bot for control of the calendar. The new panel only displays; it never touches the calendar.
+
+---
+
 ## 2026-08-23 — Cloud updates no longer vanish when the VPN drops (Issue #71)
 **What was happening:** every so often the dashboard showed `[SupabaseSync] Failed to fetch` and the update was simply gone. Cause: the cloud database sits behind **Cloudflare** — the very thing refusing your VPN addresses on the visa site. So whenever the VPN was on a bad exit, or mid-switch, cloud sync died with it.
 

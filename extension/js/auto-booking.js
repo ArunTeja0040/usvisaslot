@@ -4259,14 +4259,119 @@
     });
   }
 
+  // ─── SLOTS OVERVIEW PANEL (#72) ────────────────────────────────────
+  // Replaces the table the removed content.js used to draw. Same idea — month
+  // and dates for the city currently selected — but it marks which dates fall
+  // in this client's range, and it reports to nobody.
+  //
+  // Times are shown only when the site has actually loaded them (i.e. a date is
+  // open). Fetching times for every date would mean extra requests against the
+  // very limit that blocks us, so it deliberately shows what is already here.
+  const OVERVIEW_ID = "ab-slots-overview";
+
+  function renderSlotsOverview(cityName, dates, times) {
+    try {
+      const host = document.getElementById("page_form") || document.getElementById("main_container");
+      if (!host) return;
+
+      const startDate = document.getElementById("ab-start-date")?.value || "";
+      const endDate = document.getElementById("ab-end-date")?.value || "";
+      const all = Array.isArray(dates) ? dates.slice().sort() : [];
+      const inSet = new Set(all.filter((d) => isDateInRange(d, startDate, endDate)));
+
+      // Group by month, keeping in-range days visually distinct.
+      const months = {};
+      all.forEach((ds) => {
+        const d = new Date(ds + "T00:00:00");
+        const key = d.toLocaleString("en-US", { month: "long", year: "numeric" });
+        (months[key] = months[key] || []).push({ day: d.getDate(), inRange: inSet.has(ds) });
+      });
+
+      const rows = Object.entries(months).map(([mo, days]) => {
+        const cells = days
+          .sort((a, b) => a.day - b.day)
+          .map((x) => x.inRange
+            ? `<b style="color:#1e8449;">${x.day}</b>`
+            : `<span style="color:#7f8c8d;">${x.day}</span>`)
+          .join(", ");
+        return `<tr><td style="white-space:nowrap;">${mo}</td><td>${cells}</td></tr>`;
+      }).join("");
+
+      const noSlots = `<tr><td colspan="2" class="text-center" style="color:#7f8c8d;">No slots available</td></tr>`;
+      const rangeNote = (startDate || endDate)
+        ? `<span style="font-size:11px;color:#7f8c8d;">green = inside ${startDate || "…"} → ${endDate || "…"}</span>`
+        : `<span style="font-size:11px;color:#c0392b;">no date range set for this client</span>`;
+
+      const timeRow = (times && times.length)
+        ? `<div style="margin-top:6px;font-size:12px;">🕐 <b>Times on the open date:</b> ${
+             times.map((t) => t.Time).filter(Boolean).slice(0, 24).join(", ")}</div>`
+        : "";
+
+      const stamp = new Date().toLocaleString("en-IN", {
+        timeZone: "Asia/Kolkata", day: "2-digit", month: "short",
+        hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+      });
+
+      document.getElementById(OVERVIEW_ID)?.remove();
+      const el = document.createElement("div");
+      el.id = OVERVIEW_ID;
+      el.className = "atlas_section mt-3";
+      el.innerHTML = `
+        <div class="row">
+          <div class="col-sm-12 atlas_section_header_row text-white" style="position:relative;">
+            Overview of available slots at
+            <h2 style="margin:2px 0;">${esc(cityName || "—")}</h2>
+            <span style="position:absolute;top:1em;right:1.5em;font-size:12px;">${stamp} IST</span>
+          </div>
+        </div>
+        <div class="row"><div class="col-sm-12">
+          <table class="table table-bordered table-striped table-hover" style="margin-bottom:4px;">
+            <thead><tr><th style="width:180px;">Month</th><th>Dates</th></tr></thead>
+            <tbody>${rows || noSlots}</tbody>
+          </table>
+          ${rangeNote}
+          ${timeRow}
+        </div></div>`;
+      host.appendChild(el);
+    } catch (e) {
+      log("[overview] render failed: " + e.message);
+    }
+  }
+
+  // Small HTML escape — city names come from the page's own dropdown.
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"]/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+
   // Cache the latest time-slot entries feed (vST) so we can report the real
   // booked time (ScheduleEntries[].Time = "09:00") instead of the radio's value/index.
+  // #72 what the overview is currently showing
+  let __overviewCity = "";
+  let __overviewDates = [];
+
   let __lastScheduleEntries = null;
   addEventListener("vSCP", (e) => {
-    if (e.detail && e.detail.resource === "vST" && e.detail.data && Array.isArray(e.detail.data.ScheduleEntries)) {
+    if (!e.detail) return;
+
+    if (e.detail.resource === "vST" && e.detail.data && Array.isArray(e.detail.data.ScheduleEntries)) {
       __lastScheduleEntries = e.detail.data.ScheduleEntries;
+      // #72 times just arrived for the open date — redraw with them
+      if (__overviewCity) renderSlotsOverview(__overviewCity, __overviewDates, __lastScheduleEntries);
+      return;
+    }
+
+    // #72 schedule days for the selected city — refresh the overview table.
+    if (e.detail.resource === "vSD" && e.detail.data && Array.isArray(e.detail.data.ScheduleDays)) {
+      const sel = document.getElementById("post_select");
+      const name = sel && sel.selectedIndex >= 0 ? (sel.options[sel.selectedIndex].text || "").trim() : "";
+      __overviewCity = name || __overviewCity;
+      __overviewDates = e.detail.data.ScheduleDays.map((d) => d.Date).filter(Boolean);
+      __lastScheduleEntries = null;   // times belong to the previous date
+      renderSlotsOverview(__overviewCity, __overviewDates, null);
     }
   });
+
 
   function waitForScheduleData(timeout = 15000) {
     return new Promise((resolve) => {
