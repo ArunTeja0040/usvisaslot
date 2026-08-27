@@ -4315,13 +4315,14 @@
       }).join("");
 
       const noSlots = `<tr><td colspan="2" class="text-center" style="color:#7f8c8d;">No slots available</td></tr>`;
+      const inCount = inSet.size;
       const rangeNote = (startDate || endDate)
-        ? `<span style="font-size:11px;color:#7f8c8d;">green = inside ${startDate || "…"} → ${endDate || "…"}</span>`
-        : `<span style="font-size:11px;color:#c0392b;">no date range set for this client</span>`;
+        ? `<b>${inCount}</b> in range &nbsp;·&nbsp; green = inside ${startDate || "…"} → ${endDate || "…"}`
+        : `<b style="color:#ffd2cc;">No date range set for this client — booking is blocked</b>`;
 
       const timeRow = (times && times.length)
         ? `<div style="margin-top:6px;font-size:12px;">🕐 <b>Times on the open date:</b> ${
-             times.map((t) => t.Time).filter(Boolean).slice(0, 24).join(", ")}</div>`
+             esc(times.map((t) => t.Time).filter(Boolean).slice(0, 24).join(", "))}</div>`
         : "";
 
       const stamp = new Date().toLocaleString("en-IN", {
@@ -4342,13 +4343,17 @@
           </div>
         </div>
         <div class="row"><div class="col-sm-12">
-          <table class="table table-bordered table-striped table-hover" style="margin-bottom:4px;">
+          <table class="table table-bordered table-striped table-hover" style="margin-bottom:0;">
             <thead><tr><th style="width:180px;">Month</th><th>Dates</th></tr></thead>
             <tbody>${rows || noSlots}</tbody>
           </table>
-          ${rangeNote}
           ${timeRow}
-        </div></div>`;
+        </div></div>
+        <div class="row">
+          <div class="col-sm-12 atlas_section_header_row text-white" style="font-size:12px;padding:6px 12px;">
+            ${rangeNote}
+          </div>
+        </div>`;
       host.appendChild(el);
     } catch (e) {
       log("[overview] render failed: " + e.message);
