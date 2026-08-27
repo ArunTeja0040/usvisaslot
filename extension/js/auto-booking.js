@@ -4268,6 +4268,23 @@
   // open). Fetching times for every date would mean extra requests against the
   // very limit that blocks us, so it deliberately shows what is already here.
   const OVERVIEW_ID = "ab-slots-overview";
+  const NOSLOT_MARK = "ab-noslot-msg";   // so we only ever clear our own message
+
+  // #72b The site leaves #datepicker-message empty when a city has nothing.
+  // content.js used to fill it with "No Slots Available - <CITY>"; restore that,
+  // since it is the line you actually read while watching the calendar.
+  function setCalendarNoSlots(cityName, hasSlots) {
+    const box = document.getElementById("datepicker-message");
+    if (!box) return;
+    if (hasSlots) {
+      // Only clear what we wrote — the site uses this element for its own
+      // validation messages and those must survive.
+      if (box.querySelector("." + NOSLOT_MARK)) box.innerHTML = "";
+      return;
+    }
+    box.innerHTML = `<br><span class="atlas_validation alert alert-danger warning ${NOSLOT_MARK}">` +
+                    `No Slots Available - ${esc(cityName || "")}</span>`;
+  }
 
   function renderSlotsOverview(cityName, dates, times) {
     try {
@@ -4368,6 +4385,7 @@
       __overviewCity = name || __overviewCity;
       __overviewDates = e.detail.data.ScheduleDays.map((d) => d.Date).filter(Boolean);
       __lastScheduleEntries = null;   // times belong to the previous date
+      setCalendarNoSlots(__overviewCity, __overviewDates.length > 0);
       renderSlotsOverview(__overviewCity, __overviewDates, null);
     }
   });

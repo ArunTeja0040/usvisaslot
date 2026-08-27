@@ -13,6 +13,8 @@ Format:
 ---
 
 ## 2026-08-27 — Slots overview is back, and better (Issue #72)
+
+**Update — the in-calendar line is back too.** The red **"No Slots Available - NEW DELHI VAC"** that used to appear inside the Calendar block, just under the date field, is restored. That is the line you actually glance at while watching a city, so it belongs there rather than only at the bottom of the page. It clears itself the moment that city has dates, and it only ever removes its own message — the site's own validation warnings in that spot are left alone.
 **What you get:** the availability table returns to the booking page — consulate name, a live timestamp, and a **Month | Dates** list for the city you're on.
 
 **What's new versus the old one:**
