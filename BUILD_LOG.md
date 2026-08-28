@@ -12,7 +12,19 @@ Format:
 
 ---
 
+## 2026-08-28 — IP changing: no limit, and four countries (Issue #73)
+
+**What it does:** Two changes to the automatic IP switching. First, the old "only 3 IP changes per hour" limit is gone — when the site blocks you, the bot now changes IP as many times as it takes. Second, it no longer only uses American servers. It now picks from **25 locations across the US, Canada, Australia and Italy**, and never picks the one it is already on.
+
+**Why:** If a block covers a whole run of American addresses, having only US servers to move between means nowhere to go. Adding three more countries widens the escape route a lot. And the 3-per-hour cap could leave a client stuck waiting for you, when the fix was one more switch away.
+
+**What changed for you:** Nothing to set up — same VPN, same buttons. When a block happens you may now see the Telegram "IP CHANGED AUTOMATICALLY" message name a city like Toronto, Sydney or Milan instead of always a US one. Every one of the 25 locations was checked against Mullvad's real server list first, so none of them can fail to connect. Calgary was left out on purpose because it has no server on our approved list, and Rome was dropped because Mullvad has no Rome — Italy is Milan and Palermo.
+
+**One thing to watch:** with no limit, if a block is ever tied to the *account* rather than the address, the bot will keep switching IPs and retrying roughly every 15-20 seconds rather than stopping. You asked for no cap, so that is deliberate — but if you see that pattern in Telegram, stop the client and tell me, because it means the block is not about the IP at all.
+
 ## 2026-08-27 — Slots overview is back, and better (Issue #72)
+
+**Update — bolder text in the table.** "No slots available" is now bold, matching the weight of the Month and Dates headings above it, so an empty city reads clearly instead of fading into the row. Month names and every date number are bold too. Colours are unchanged: green dates are inside the client's range, grey dates are outside it. Only the thickness changed.
 
 **Update — blue footer bar.** The panel now closes with a blue bar matching its header, like the old one did. Instead of the old bar's "shown by Check US Visa Slots extension" advert, it carries something useful: **how many dates fall inside this client's range**, and what that range is. If no range is set it turns into a clear warning that booking is blocked for that client.
 

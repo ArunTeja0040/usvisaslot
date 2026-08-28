@@ -3071,7 +3071,9 @@
   // #70 Auto-rotate the VPN when an IP is refused, instead of waiting for a
   // human to change it. Bounded: a client whose block follows it across exits
   // must not chew through every server.
-  const VPN_AUTOROTATE_MAX = 3;                   // rotations per window
+  // #73 No cap — the operator wants the IP changed as many times as it takes.
+  // The window is kept only so the log can report how many rotations have
+  // happened in the last hour.
   const VPN_AUTOROTATE_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 
   function vpnCommand(command) {
@@ -3089,11 +3091,6 @@
   async function autoRotateVpn(reason) {
     const store = await new Promise((r) => chrome.storage.local.get(["__abVpnRotates"], r));
     const hist = (store.__abVpnRotates || []).filter((t) => Date.now() - t < VPN_AUTOROTATE_WINDOW_MS);
-    if (hist.length >= VPN_AUTOROTATE_MAX) {
-      log(`[vpn] auto-rotate budget spent (${hist.length}/${VPN_AUTOROTATE_MAX} this hour) — not rotating`);
-      return null;
-    }
-
     const status = await vpnCommand("status");
     if (status.error || !status.connected) {
       log("[vpn] server offline or not connected — cannot auto-rotate");
@@ -3101,7 +3098,7 @@
     }
     const before = status.public_ip || "";
 
-    log(`[vpn] ${reason} — rotating exit (attempt ${hist.length + 1}/${VPN_AUTOROTATE_MAX})`);
+    log(`[vpn] ${reason} — rotating exit (${hist.length + 1} this hour)`);
     const res = await vpnCommand("rotate");
     if (res.error) { log("[vpn] rotate failed: " + res.error); return null; }
 
@@ -4309,12 +4306,12 @@
           .sort((a, b) => a.day - b.day)
           .map((x) => x.inRange
             ? `<b style="color:#1e8449;">${x.day}</b>`
-            : `<span style="color:#7f8c8d;">${x.day}</span>`)
+            : `<b style="color:#7f8c8d;">${x.day}</b>`)
           .join(", ");
-        return `<tr><td style="white-space:nowrap;">${mo}</td><td>${cells}</td></tr>`;
+        return `<tr><td style="white-space:nowrap;"><b>${mo}</b></td><td>${cells}</td></tr>`;
       }).join("");
 
-      const noSlots = `<tr><td colspan="2" class="text-center" style="color:#7f8c8d;">No slots available</td></tr>`;
+      const noSlots = `<tr><td colspan="2" class="text-center" style="color:#000;font-weight:700;">No slots available</td></tr>`;
       const inCount = inSet.size;
       const rangeNote = (startDate || endDate)
         ? `<b>${inCount}</b> in range &nbsp;·&nbsp; green = inside ${startDate || "…"} → ${endDate || "…"}`
