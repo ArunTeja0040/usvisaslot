@@ -12,6 +12,17 @@ Format:
 
 ---
 
+## 2026-08-28 — IP changing: no limit, and four countries (Issue #73)
+**What it does:** Two changes to the automatic IP switching. First, the old "only 3 IP changes per hour" limit is gone — when the site blocks you, the bot now changes IP as many times as it takes. Second, it no longer uses only American servers: it picks from **25 locations across the US, Canada, Australia and Italy**, and never picks the one it is already on.
+**Why:** If a block covers a whole run of American addresses, having only US servers to move between means nowhere left to go. Three more countries widen the escape route a lot. And the 3-per-hour cap could leave a client stuck waiting for you when the fix was one more switch away.
+**What changed for you:** Nothing to set up — same VPN, same buttons. When a block happens, the Telegram "IP CHANGED AUTOMATICALLY" message may now name a city like Toronto, Sydney or Milan instead of always a US one. All 25 locations were checked against Mullvad's real server list first, so none can fail to connect. Calgary was left out on purpose (no server on our approved list), and Rome was dropped because Mullvad has no Rome — Italy is Milan and Palermo.
+**One thing to watch:** with no limit, if a block is ever tied to the *account* rather than the address, the bot will keep switching IPs and retrying every 15-20 seconds instead of stopping. This was a deliberate choice. If you see that pattern in Telegram, stop the client and say so — it means the block is not about the IP at all.
+
+## 2026-08-28 — The slots overview panel is back (Issue #72)
+**What it does:** Brings back the summary panel under the calendar that shows, at a glance, **which months and dates are open at the city being checked**, plus the times on whichever date is open. Dates inside your client's wanted range show green; dates outside show grey. Both are bold, and so is the month name, so the table reads clearly instead of being a wall of thin digits. When a city has nothing, the table says **No slots available** in bold black, and the calendar itself shows the old "No Slots Available - CITY" line again. The panel closes with a blue bar showing how many dates fall inside that client's range.
+**Why:** That overview disappeared when we removed the old third-party file that was quietly uploading your clients' screenshots to a competitor's server. The panel was genuinely useful, so this rebuilds it in our own code — same usefulness, nothing leaving your machine.
+**What changed for you:** While the bot cycles you can now see each city's open months, dates and times without opening the calendar. If a client has no date range set, the blue bar warns you in red that booking is blocked for them.
+
 ## 2026-07-21 — Fix: Deactivate did nothing on production (Issue #53 follow-up)
 **What was wrong:** Clicking **Deactivate** on a staff member did nothing at all — the person didn't grey out, and their clients didn't come back to you. The database was rejecting the whole action.
 **Why:** When someone is deactivated, the system writes a note into the activity log for each client it returns to you. That note was written to a column called `type` — but your real activity-log table names that column `event_type`. (The mismatch came from a throwaway test database that happened to use the other name.) So every deactivate hit an error and the database undid the entire thing, leaving nothing changed.

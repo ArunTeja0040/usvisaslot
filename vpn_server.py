@@ -38,10 +38,21 @@ if IS_WINDOWS:
 else:
     MULLVAD = "/usr/local/bin/mullvad"
 
-CITIES = [
-    "qas", "atl", "bos", "chi", "dal", "den", "hou",
-    "mkc", "lax", "mia", "nyc", "phx", "rag", "slc", "sjc",
-]
+# #73 Exit pool, country -> cities. Every city listed is served by at least one
+# SAFE_PROVIDERS host (verified against `mullvad relay list`), so the provider
+# pin below still matches a relay in each of them.
+# Deliberately excluded: ca-yyc (Calgary) — techfutures only, no safe provider,
+# so pinning providers there would leave Mullvad with nothing to connect to.
+POOLS = {
+    "us": ["qas", "atl", "bos", "chi", "dal", "den", "hou",
+           "mkc", "lax", "mia", "nyc", "phx", "rag", "slc", "sjc"],
+    "ca": ["mtr", "tor", "van"],
+    "au": ["adl", "bne", "mel", "per", "syd"],
+    "it": ["mil", "pmo"],
+}
+
+# Flat [(country, city), ...] so a rotation can pick uniformly across the pool.
+EXITS = [(cc, city) for cc, cities in POOLS.items() for city in cities]
 
 CITY_NAMES = {
     "qas": "Ashburn, VA", "atl": "Atlanta, GA", "bos": "Boston, MA",
@@ -50,9 +61,16 @@ CITY_NAMES = {
     "lax": "Los Angeles, CA", "mia": "Miami, FL", "nyc": "New York, NY",
     "phx": "Phoenix, AZ", "rag": "Raleigh, NC", "slc": "Salt Lake City, UT",
     "sfo": "San Francisco, CA", "sjc": "San Jose, CA", "txc": "McAllen, TX",
+    "mtr": "Montreal, QC", "tor": "Toronto, ON", "van": "Vancouver, BC",
+    "adl": "Adelaide", "bne": "Brisbane", "mel": "Melbourne",
+    "per": "Perth", "syd": "Sydney",
+    "mil": "Milan", "pmo": "Palermo",
 }
 
 SAFE_PROVIDERS = ["Tzulo", "DataPacket", "xtom", "hostuniversal"]
+
+# Relay names look like "us-sjc-wg-501" / "au-syd-wg-101".
+RELAY_RE = re.compile(r"\b([a-z]{2})-([a-z]{3})-wg", re.IGNORECASE)
 
 rotation_timer = None
 auto_rotating = False
@@ -100,27 +118,32 @@ def refresh_ip():
     return cached_ip
 
 
-def do_rotate():
+def current_exit():
+    """(country, city) of the relay we are on, or ("", "") when not connected."""
     out, _ = run_cmd([MULLVAD, "status"])
-    current = ""
-    m = re.search(r"us-(\w+)-wg", out)
-    if m:
-        current = m.group(1)
+    m = RELAY_RE.search(out)
+    return (m.group(1).lower(), m.group(2).lower()) if m else ("", "")
 
-    candidates = [c for c in CITIES if c != current]
-    selected = random.choice(candidates) if candidates else random.choice(CITIES)
+
+def do_rotate():
+    current = current_exit()
+
+    # Never re-pick the exit we are already on — a rotation that lands on the
+    # same IP is treated as a failure by the extension.
+    candidates = [e for e in EXITS if e != current]
+    country, city = random.choice(candidates) if candidates else random.choice(EXITS)
 
     run_cmd([MULLVAD, "disconnect"])
     time.sleep(1)
     run_cmd([MULLVAD, "relay", "set", "provider"] + SAFE_PROVIDERS)
-    run_cmd([MULLVAD, "relay", "set", "location", "us", selected])
+    run_cmd([MULLVAD, "relay", "set", "location", country, city])
     run_cmd([MULLVAD, "connect", "--wait"])
     time.sleep(5)
 
     ip = refresh_ip()
-    city = CITY_NAMES.get(selected, selected)
-    print(f"[VPN] Rotated → us-{selected} ({city}) | IP: {ip}")
-    return selected, ip
+    name = CITY_NAMES.get(city, city)
+    print(f"[VPN] Rotated → {country}-{city} ({name}) | IP: {ip}")
+    return f"{country}-{city}", ip
 
 
 def rotation_loop():
@@ -162,8 +185,9 @@ def get_status():
 
     connected = "Connected" in out and "Disconnected" not in out
 
-    relay_match = re.search(r"us-(\w+)-wg", out)
-    city_code = relay_match.group(1) if relay_match else ""
+    relay_match = RELAY_RE.search(out)
+    country_code = relay_match.group(1).lower() if relay_match else ""
+    city_code = relay_match.group(2).lower() if relay_match else ""
     city_name = CITY_NAMES.get(city_code, city_code)
 
     return {
@@ -171,7 +195,8 @@ def get_status():
         "auto_rotating": auto_rotating,
         "vpn_status": out,
         "public_ip": cached_ip,
-        "server": f"us-{city_code}" if city_code else "",
+        "server": f"{country_code}-{city_code}" if city_code else "",
+        "country": country_code,
         "city": city_name,
     }
 

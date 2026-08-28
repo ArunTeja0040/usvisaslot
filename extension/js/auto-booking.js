@@ -3071,7 +3071,9 @@
   // #70 Auto-rotate the VPN when an IP is refused, instead of waiting for a
   // human to change it. Bounded: a client whose block follows it across exits
   // must not chew through every server.
-  const VPN_AUTOROTATE_MAX = 3;                   // rotations per window
+  // #73 No cap — the operator wants the IP changed as many times as it takes.
+  // The window is kept only so the log can report how many rotations have
+  // happened in the last hour.
   const VPN_AUTOROTATE_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 
   function vpnCommand(command) {
@@ -3089,11 +3091,6 @@
   async function autoRotateVpn(reason) {
     const store = await new Promise((r) => chrome.storage.local.get(["__abVpnRotates"], r));
     const hist = (store.__abVpnRotates || []).filter((t) => Date.now() - t < VPN_AUTOROTATE_WINDOW_MS);
-    if (hist.length >= VPN_AUTOROTATE_MAX) {
-      log(`[vpn] auto-rotate budget spent (${hist.length}/${VPN_AUTOROTATE_MAX} this hour) — not rotating`);
-      return null;
-    }
-
     const status = await vpnCommand("status");
     if (status.error || !status.connected) {
       log("[vpn] server offline or not connected — cannot auto-rotate");
@@ -3101,7 +3098,7 @@
     }
     const before = status.public_ip || "";
 
-    log(`[vpn] ${reason} — rotating exit (attempt ${hist.length + 1}/${VPN_AUTOROTATE_MAX})`);
+    log(`[vpn] ${reason} — rotating exit (${hist.length + 1} this hour)`);
     const res = await vpnCommand("rotate");
     if (res.error) { log("[vpn] rotate failed: " + res.error); return null; }
 
@@ -4259,14 +4256,142 @@
     });
   }
 
+  // ─── SLOTS OVERVIEW PANEL (#72) ────────────────────────────────────
+  // Replaces the table the removed content.js used to draw. Same idea — month
+  // and dates for the city currently selected — but it marks which dates fall
+  // in this client's range, and it reports to nobody.
+  //
+  // Times are shown only when the site has actually loaded them (i.e. a date is
+  // open). Fetching times for every date would mean extra requests against the
+  // very limit that blocks us, so it deliberately shows what is already here.
+  const OVERVIEW_ID = "ab-slots-overview";
+  const NOSLOT_MARK = "ab-noslot-msg";   // so we only ever clear our own message
+
+  // #72b The site leaves #datepicker-message empty when a city has nothing.
+  // content.js used to fill it with "No Slots Available - <CITY>"; restore that,
+  // since it is the line you actually read while watching the calendar.
+  function setCalendarNoSlots(cityName, hasSlots) {
+    const box = document.getElementById("datepicker-message");
+    if (!box) return;
+    if (hasSlots) {
+      // Only clear what we wrote — the site uses this element for its own
+      // validation messages and those must survive.
+      if (box.querySelector("." + NOSLOT_MARK)) box.innerHTML = "";
+      return;
+    }
+    box.innerHTML = `<br><span class="atlas_validation alert alert-danger warning ${NOSLOT_MARK}">` +
+                    `No Slots Available - ${esc(cityName || "")}</span>`;
+  }
+
+  function renderSlotsOverview(cityName, dates, times) {
+    try {
+      const host = document.getElementById("page_form") || document.getElementById("main_container");
+      if (!host) return;
+
+      const startDate = document.getElementById("ab-start-date")?.value || "";
+      const endDate = document.getElementById("ab-end-date")?.value || "";
+      const all = Array.isArray(dates) ? dates.slice().sort() : [];
+      const inSet = new Set(all.filter((d) => isDateInRange(d, startDate, endDate)));
+
+      // Group by month, keeping in-range days visually distinct.
+      const months = {};
+      all.forEach((ds) => {
+        const d = new Date(ds + "T00:00:00");
+        const key = d.toLocaleString("en-US", { month: "long", year: "numeric" });
+        (months[key] = months[key] || []).push({ day: d.getDate(), inRange: inSet.has(ds) });
+      });
+
+      const rows = Object.entries(months).map(([mo, days]) => {
+        const cells = days
+          .sort((a, b) => a.day - b.day)
+          .map((x) => x.inRange
+            ? `<b style="color:#1e8449;">${x.day}</b>`
+            : `<b style="color:#7f8c8d;">${x.day}</b>`)
+          .join(", ");
+        return `<tr><td style="white-space:nowrap;"><b>${mo}</b></td><td>${cells}</td></tr>`;
+      }).join("");
+
+      const noSlots = `<tr><td colspan="2" class="text-center" style="color:#000;font-weight:700;">No slots available</td></tr>`;
+      const inCount = inSet.size;
+      const rangeNote = (startDate || endDate)
+        ? `<b>${inCount}</b> in range &nbsp;·&nbsp; green = inside ${startDate || "…"} → ${endDate || "…"}`
+        : `<b style="color:#ffd2cc;">No date range set for this client — booking is blocked</b>`;
+
+      const timeRow = (times && times.length)
+        ? `<div style="margin-top:6px;font-size:12px;">🕐 <b>Times on the open date:</b> ${
+             esc(times.map((t) => t.Time).filter(Boolean).slice(0, 24).join(", "))}</div>`
+        : "";
+
+      const stamp = new Date().toLocaleString("en-IN", {
+        timeZone: "Asia/Kolkata", day: "2-digit", month: "short",
+        hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+      });
+
+      document.getElementById(OVERVIEW_ID)?.remove();
+      const el = document.createElement("div");
+      el.id = OVERVIEW_ID;
+      el.className = "atlas_section mt-3";
+      el.innerHTML = `
+        <div class="row">
+          <div class="col-sm-12 atlas_section_header_row text-white" style="position:relative;">
+            Overview of available slots at
+            <h2 style="margin:2px 0;">${esc(cityName || "—")}</h2>
+            <span style="position:absolute;top:1em;right:1.5em;font-size:12px;">${stamp} IST</span>
+          </div>
+        </div>
+        <div class="row"><div class="col-sm-12">
+          <table class="table table-bordered table-striped table-hover" style="margin-bottom:0;">
+            <thead><tr><th style="width:180px;">Month</th><th>Dates</th></tr></thead>
+            <tbody>${rows || noSlots}</tbody>
+          </table>
+          ${timeRow}
+        </div></div>
+        <div class="row">
+          <div class="col-sm-12 atlas_section_header_row text-white" style="font-size:12px;padding:6px 12px;">
+            ${rangeNote}
+          </div>
+        </div>`;
+      host.appendChild(el);
+    } catch (e) {
+      log("[overview] render failed: " + e.message);
+    }
+  }
+
+  // Small HTML escape — city names come from the page's own dropdown.
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"]/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+
   // Cache the latest time-slot entries feed (vST) so we can report the real
   // booked time (ScheduleEntries[].Time = "09:00") instead of the radio's value/index.
+  // #72 what the overview is currently showing
+  let __overviewCity = "";
+  let __overviewDates = [];
+
   let __lastScheduleEntries = null;
   addEventListener("vSCP", (e) => {
-    if (e.detail && e.detail.resource === "vST" && e.detail.data && Array.isArray(e.detail.data.ScheduleEntries)) {
+    if (!e.detail) return;
+
+    if (e.detail.resource === "vST" && e.detail.data && Array.isArray(e.detail.data.ScheduleEntries)) {
       __lastScheduleEntries = e.detail.data.ScheduleEntries;
+      // #72 times just arrived for the open date — redraw with them
+      if (__overviewCity) renderSlotsOverview(__overviewCity, __overviewDates, __lastScheduleEntries);
+      return;
+    }
+
+    // #72 schedule days for the selected city — refresh the overview table.
+    if (e.detail.resource === "vSD" && e.detail.data && Array.isArray(e.detail.data.ScheduleDays)) {
+      const sel = document.getElementById("post_select");
+      const name = sel && sel.selectedIndex >= 0 ? (sel.options[sel.selectedIndex].text || "").trim() : "";
+      __overviewCity = name || __overviewCity;
+      __overviewDates = e.detail.data.ScheduleDays.map((d) => d.Date).filter(Boolean);
+      __lastScheduleEntries = null;   // times belong to the previous date
+      setCalendarNoSlots(__overviewCity, __overviewDates.length > 0);
+      renderSlotsOverview(__overviewCity, __overviewDates, null);
     }
   });
+
 
   function waitForScheduleData(timeout = 15000) {
     return new Promise((resolve) => {
