@@ -37,10 +37,129 @@
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   }
 
+  // ─── DATE RANGE HELPERS (issue #74) ────────────────────────────────
+  // Profile dates are plain "YYYY-MM-DD" from <input type="date">, so they
+  // are parsed by string rather than by Date() — no timezone can shift the
+  // month out from under us.
+
+  const monthIndex = (year, month0) => year * 12 + month0;
+
+  function parseYMD(s) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || "").trim());
+    if (!m) return null;
+    const year = +m[1], month0 = +m[2] - 1, day = +m[3];
+    if (month0 < 0 || month0 > 11 || day < 1 || day > 31) return null;
+    return { year, month0, day };
+  }
+
+  // The client's window as inclusive month indices. A missing end is treated
+  // as open-ended, matching how the old filter behaved.
+  function profileMonthSpan(p) {
+    const s = parseYMD(p.startDate);
+    const e = parseYMD(p.endDate);
+    if (!s && !e) return null;
+
+    let start = s ? monthIndex(s.year, s.month0) : -Infinity;
+    let end = e ? monthIndex(e.year, e.month0) : Infinity;
+    // A reversed range is a data-entry error, not "matches nothing" —
+    // normalise so the client still shows up where they should.
+    if (start > end) { const t = start; start = end; end = t; }
+    return { start, end };
+  }
+
+  // ─── BOOKED / VIEWS (issue #75) ────────────────────────────────────
+  // "Booked" is derived from the status the automation already writes, not a
+  // new status value — auto-booking.js sets `confirmed` + `confirmedAt` when
+  // an appointment goes through, and a second source of truth would only
+  // drift from it.
+
+  let clientView = "active";   // active | booked | expired | all
+
+  // A booking is two separate appointments — OFC (biometrics) and the consular
+  // interview — and is only complete when both exist. The engine used to flatten
+  // both into status "confirmed", so a client who had done only OFC looked
+  // finished and dropped out of the working list.
+  //
+  // Resolved in three steps, because existing clients pre-date the timestamps:
+  //   1. the ofcBookedAt / interviewBookedAt stamps the engine now writes
+  //   2. failing that, slotHistory — "submitted" is OFC, "confirmed" is consular
+  //   3. failing that, a legacy "confirmed" with no evidence is grandfathered,
+  //      so nobody already booked silently falls out of the Booked list
+  function bookingHalves(username, statuses, cloudMap, slotHistory) {
+    const local = statuses[username] || {};
+    const cloud = (cloudMap || {})[username] || {};
+    const confirmedStatus = local.status === "confirmed" || cloud.status === "confirmed";
+
+    let ofc = !!(local.ofcBookedAt || cloud.ofcBookedAt);
+    let interview = !!(local.interviewBookedAt || cloud.interviewBookedAt);
+    let source = (ofc || interview) ? "stamps" : null;
+
+    if (!source && slotHistory) {
+      (slotHistory || []).forEach((s) => {
+        if (s.username !== username) return;
+        if (s.action === "submitted") ofc = true;
+        else if (s.action === "confirmed") interview = true;
+      });
+      if (ofc || interview) source = "history";
+    }
+
+    // Grandfathered: confirmed before the halves were tracked, and slot
+    // history no longer carries the evidence (it is capped and pruned).
+    if (!source && confirmedStatus) {
+      return { ofc: true, interview: true, complete: true, source: "legacy", confirmedStatus };
+    }
+
+    return { ofc, interview, complete: ofc && interview, source: source || "none", confirmedStatus };
+  }
+
+  function isBooked(username, statuses, cloudMap, slotHistory) {
+    return bookingHalves(username, statuses, cloudMap, slotHistory).complete;
+  }
+
+  function bookedAt(username, statuses, cloudMap) {
+    const local = statuses[username] || {};
+    const cloud = (cloudMap || {})[username] || {};
+    return local.confirmedAt || cloud.confirmedAt || null;
+  }
+
+  const paidOf = (p) => Math.max(0, Number(p.paidAmount) || 0);
+  const agreedOf = (p) => Math.max(0, Number(p.agreedPrice) || 0);
+  const balanceOf = (p) => Math.max(0, agreedOf(p) - paidOf(p));
+
+  // True when the promised window has already finished. Almost always a
+  // range that was stored with the wrong year on intake.
+  function isRangeExpired(p) {
+    const e = parseYMD(p.endDate);
+    if (!e) return false;
+    const now = new Date();
+    return monthIndex(e.year, e.month0) < monthIndex(now.getFullYear(), now.getMonth());
+  }
+
   function formatDate(dateStr) {
     if (!dateStr) return "—";
     const d = new Date(dateStr + "T00:00:00");
     return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short" });
+  }
+
+  // #74 Card dates used to omit the year entirely, which is exactly why a
+  // range stored as 2026 instead of 2027 was invisible. The year is shown
+  // whenever it is not the current one, and on both ends of a range that
+  // crosses a year boundary so "Nov — Feb 27" cannot be misread.
+  function formatDateY(dateStr, force) {
+    const p = parseYMD(dateStr);
+    if (!p) return "—";
+    const base = formatDate(dateStr);
+    const show = force || p.year !== new Date().getFullYear();
+    return show ? `${base} ${String(p.year).slice(2)}` : base;
+  }
+
+  // `force` is set for an expired range: the year is the whole reason it is
+  // expired, so hiding it would hide the diagnosis.
+  function formatRange(startStr, endStr, force) {
+    const s = parseYMD(startStr), e = parseYMD(endStr);
+    const crossesYear = !!(s && e && s.year !== e.year);
+    const show = force || crossesYear;
+    return `${formatDateY(startStr, show)} — ${formatDateY(endStr, show)}`;
   }
 
   function timeAgo(isoString) {
@@ -72,7 +191,7 @@
   function loadData() {
     return new Promise((resolve) => {
       chrome.storage.local.get(
-        ["userProfilesList", "userStatuses", "eventLog", "slotHistory", "dailyStats", "__storageStats"],
+        ["userProfilesList", "userStatuses", "eventLog", "slotHistory", "dailyStats", "__storageStats", "__abLoginHealth", "__abVerifyUser", "__abSweep"],
         (data) => resolve({
           profiles: data.userProfilesList || [],
           statuses: data.userStatuses || {},
@@ -80,6 +199,9 @@
           slotHistory: data.slotHistory || [],
           dailyStats: data.dailyStats || {},
           storageStats: data.__storageStats || null,
+          loginHealth: data.__abLoginHealth || {},
+          verifyUser: data.__abVerifyUser || null,
+          sweep: data.__abSweep || null,
         })
       );
     });
@@ -120,6 +242,152 @@
   }
 
   // ─── USER CARDS ────────────────────────────────────────────────────
+
+  // ─── BOOKED VIEW + MONEY (issue #75) ───────────────────────────────
+
+  let bookedSignature = "";
+
+  function viewCloudMap() {
+    const m = {};
+    cloudProfiles.forEach((cp) => {
+      m[cp.username] = {
+        status: cp.status, confirmedAt: cp.confirmedAt, assignedStaffId: cp.assignedStaffId,
+        ofcBookedAt: cp.ofcBookedAt, interviewBookedAt: cp.interviewBookedAt,
+      };
+    });
+    return m;
+  }
+
+  // Counts for the switcher. Independent of the current view, so you can see
+  // the split without clicking through.
+  function updateViewCounts(profiles, statuses, slotHistory) {
+    const cloudMap = viewCloudMap();
+    let booked = 0, expired = 0, active = 0;
+    (profiles || []).forEach((p) => {
+      const b = isBooked(p.username, statuses, cloudMap, slotHistory);
+      const e = isRangeExpired(p);
+      if (b) booked++;
+      if (e) expired++;
+      if (!b && !e) active++;
+    });
+    const set = (id, n) => { const el = document.getElementById(id); if (el && el.textContent !== String(n)) el.textContent = n; };
+    set("ct-active", active);
+    set("ct-booked", booked);
+    set("ct-expired", expired);
+    set("ct-all", (profiles || []).length);
+  }
+
+  // The appointment a booked client actually got, from slot history.
+  function bookedAppointment(username, slotHistory) {
+    let best = null;
+    (slotHistory || []).forEach((s) => {
+      if (s.username !== username) return;
+      if (s.action !== "confirmed" && s.action !== "submitted") return;
+      const t = slotTime(s);
+      if (!best || t > best.t) best = { t, date: s.date, location: s.location, action: s.action };
+    });
+    return best;
+  }
+
+  function renderBookedPanel(profiles, statuses, slotHistory) {
+    const panel = document.getElementById("booked-panel");
+    const tbody = document.getElementById("booked-rows");
+    if (!panel || !tbody) return;
+
+    panel.hidden = clientView !== "booked";
+    if (panel.hidden) return;
+
+    const cloudMap = viewCloudMap();
+    const booked = (profiles || [])
+      .filter((p) => isBooked(p.username, statuses, cloudMap, slotHistory))
+      .map((p) => ({ p, at: bookedAt(p.username, statuses, cloudMap) }))
+      .sort((a, b) => new Date(b.at || 0) - new Date(a.at || 0));
+
+    // Money. Collected is what has actually been recorded as received, not
+    // the agreed price — an advance must not read as paid in full.
+    let collected = 0, agreedTotal = 0, owing = 0;
+    booked.forEach(({ p }) => {
+      collected += paidOf(p);
+      agreedTotal += agreedOf(p);
+      if (balanceOf(p) > 0) owing++;
+    });
+    const outstanding = Math.max(0, agreedTotal - collected);
+
+    let hunting = 0, huntingN = 0;
+    (profiles || []).forEach((p) => {
+      if (isBooked(p.username, statuses, cloudMap, slotHistory) || isRangeExpired(p)) return;
+      hunting += agreedOf(p);
+      huntingN++;
+    });
+
+    const rows = booked.map(({ p, at }) => {
+      const appt = bookedAppointment(p.username, slotHistory);
+      const bal = balanceOf(p);
+      const paid = paidOf(p);
+      const agreed = agreedOf(p);
+      const state = agreed === 0 ? ["pay-none", "No price"]
+        : bal <= 0 ? ["pay-full", "Paid"]
+        : paid > 0 ? ["pay-part", "Part"]
+        : ["pay-none", "Unpaid"];
+      const safeUser = esc(p.username);
+      return `
+        <tr data-username="${safeUser}">
+          <td>
+            <div class="bk-who">${esc(p.name || deriveProfileName(p.username))}</div>
+            <div class="bk-sub">${safeUser}</div>
+          </td>
+          <td class="bk-mono">${at ? formatDateY(String(at).substring(0, 10), true) : "—"}</td>
+          <td class="bk-mono">${appt
+            ? `${esc(appt.date)}<div class="bk-sub">${esc(appt.location)}</div>`
+            : "—"}</td>
+          <td class="bk-halves">${(() => {
+            const h = bookingHalves(p.username, statuses, cloudMap, slotHistory);
+            if (h.source === "legacy") {
+              return `<span class="half legacy" title="Confirmed before the halves were tracked separately, and slot history no longer carries the detail">pre-existing</span>`;
+            }
+            return `<span class="half${h.ofc ? " on" : ""}">OFC</span><span class="half${h.interview ? " on" : ""}">Consular</span>`;
+          })()}</td>
+          <td class="r bk-mono">${p.applicantCount || 1}</td>
+          ${staffMode ? "" : `
+          <td class="r bk-mono">${agreed ? rupees(agreed) : "—"}</td>
+          <td class="r"><input class="bk-paid" type="number" min="0" inputmode="numeric"
+                 value="${paid || ""}" placeholder="0" data-user="${safeUser}"
+                 aria-label="Amount received from ${esc(p.name || p.username)}"></td>
+          <td class="r bk-mono ${bal > 0 ? "bk-due" : "bk-zero"}">${bal > 0 ? rupees(bal) : "—"}</td>`}
+          <td class="r">${staffMode ? "" : `<span class="pay-pill ${state[0]}">${state[1]}</span>`}</td>
+        </tr>`;
+    }).join("");
+
+    const html = rows || `<tr><td colspan="9"><div class="log-empty">No confirmed bookings yet.</div></td></tr>`;
+
+    // Hash-guarded like the cards: this is inside the 2s loop, and rewriting
+    // it every tick would fight whatever is being typed into a Paid box.
+    const sig = hashString(html + collected + outstanding + hunting);
+    if (sig !== bookedSignature) {
+      const typing = document.activeElement && document.activeElement.classList.contains("bk-paid")
+        ? document.activeElement.dataset.user : null;
+      if (!typing) {
+        bookedSignature = sig;
+        tbody.innerHTML = html;
+      }
+    }
+
+    const strip = document.getElementById("money-strip");
+    if (strip) strip.hidden = staffMode;        // owner-only, same rule as the price row
+    if (!staffMode) {
+      const put = (id, v) => { const el = document.getElementById(id); if (el && el.textContent !== v) el.textContent = v; };
+      put("money-collected", rupees(collected));
+      put("money-collected-note", `${booked.length} booked · ${rupees(agreedTotal)} agreed`);
+      put("money-outstanding", rupees(outstanding));
+      put("money-outstanding-note", owing === 0 ? "nothing owed" : `${owing} client${owing === 1 ? "" : "s"} still owe you`);
+      put("money-hunting", rupees(hunting));
+      put("money-hunting-note", `${huntingN} not booked yet`);
+      const pct = agreedTotal > 0 ? (collected / agreedTotal) * 100 : 0;
+      const g = document.getElementById("money-bar-got"), d = document.getElementById("money-bar-due");
+      if (g) g.style.width = pct.toFixed(1) + "%";
+      if (d) d.style.width = (100 - pct).toFixed(1) + "%";
+    }
+  }
 
   // ─── CARD RECONCILIATION (issue #59) ───────────────────────────────
   // The grid used to be rebuilt wholesale every 2s, which threw away hover,
@@ -208,12 +476,13 @@
     existing.forEach((el) => el.remove());
   }
 
-  function renderUserCards(profiles, statuses, slotHistory) {
+  function renderUserCards(profiles, statuses, slotHistory, loginHealth, verifyUser) {
     const container = document.getElementById("user-cards");
 
     const filterStatus = document.getElementById("filter-status").value;
     const filterVisa = document.getElementById("filter-visa")?.value || "all";
     const filterMonth = document.getElementById("filter-month")?.value || "all";
+    const filterYear = document.getElementById("filter-year")?.value || "all";
     const searchTerm = (document.getElementById("profile-search")?.value || "").trim().toLowerCase();
 
     // Build slot stats per user
@@ -236,6 +505,18 @@
         slotStats[u].lastLocation = s.location;
         slotStats[u].lastDate = s.date;
       }
+    });
+
+    // Cloud status map: username → { status, activeDeviceId, isActive }.
+    // Built before the filter because the view test below needs it.
+    const cloudStatusMap = {};
+    cloudProfiles.forEach((cp) => {
+      cloudStatusMap[cp.username] = {
+        status: cp.status, activeDeviceId: cp.activeDeviceId, isActive: cp.isActive,
+        rateLimitedAt: cp.rateLimitedAt, assignedStaffId: cp.assignedStaffId,
+        confirmedAt: cp.confirmedAt,
+        ofcBookedAt: cp.ofcBookedAt, interviewBookedAt: cp.interviewBookedAt,
+      };
     });
 
     const filtered = profiles.filter((p) => {
@@ -269,22 +550,46 @@
           return false;
         }
       }
-      // Month filter — show user if selected month falls within their date range
-      if (filterMonth !== "all") {
-        const m = parseInt(filterMonth);
-        const start = p.startDate ? new Date(p.startDate + "T00:00:00") : null;
-        const end = p.endDate ? new Date(p.endDate + "T00:00:00") : null;
-        if (!start && !end) return false;
-        const startMonth = start ? start.getFullYear() * 12 + start.getMonth() + 1 : 0;
-        const endMonth = end ? end.getFullYear() * 12 + end.getMonth() + 1 : 9999;
-        // Check all possible years the user's range spans
-        let monthInRange = false;
-        for (let y = (start ? start.getFullYear() : 2026); y <= (end ? end.getFullYear() : 2027); y++) {
-          const check = y * 12 + m;
-          if (check >= startMonth && check <= endMonth) { monthInRange = true; break; }
+      // #74 Date-range filter. A client matches when the period you picked
+      // OVERLAPS the window you promised them — so filtering "March 2027"
+      // finds anyone whose range is Jan 2027 – Dec 2027, and correctly
+      // misses someone whose range is Mar 2026 – Apr 2026.
+      if (filterYear !== "all" || filterMonth !== "all") {
+        const span = profileMonthSpan(p);
+        if (!span) return false;                 // no usable dates at all
+
+        const y = filterYear === "all" ? null : parseInt(filterYear, 10);
+        const m = filterMonth === "all" ? null : parseInt(filterMonth, 10) - 1;
+
+        let hit;
+        if (y !== null && m !== null) {
+          // One specific month.
+          const idx = monthIndex(y, m);
+          hit = idx >= span.start && idx <= span.end;
+        } else if (y !== null) {
+          // Any part of that calendar year.
+          hit = monthIndex(y, 11) >= span.start && monthIndex(y, 0) <= span.end;
+        } else {
+          // A month in any year — walk only the years the client actually spans.
+          hit = false;
+          const firstYear = Math.floor(span.start / 12);
+          const lastYear = Math.floor(span.end / 12);
+          for (let yy = firstYear; yy <= lastYear; yy++) {
+            const idx = monthIndex(yy, m);
+            if (idx >= span.start && idx <= span.end) { hit = true; break; }
+          }
         }
-        if (!monthInRange) return false;
+        if (!hit) return false;
       }
+
+      // #75 View. Active is the working list, so it drops anyone already
+      // booked and anyone whose window has lapsed.
+      const booked = isBooked(p.username, statuses, cloudStatusMap, slotHistory);
+      const expired = isRangeExpired(p);
+      if (clientView === "active" && (booked || expired)) return false;
+      if (clientView === "booked" && !booked) return false;
+      if (clientView === "expired" && !expired) return false;
+
       return true;
     });
 
@@ -292,12 +597,6 @@
       container.innerHTML = '<div class="log-empty">No users match the filter</div>';
       return;
     }
-
-    // Build cloud status map: username → { status, activeDeviceId, isActive }
-    const cloudStatusMap = {};
-    cloudProfiles.forEach(cp => {
-      cloudStatusMap[cp.username] = { status: cp.status, activeDeviceId: cp.activeDeviceId, isActive: cp.isActive, rateLimitedAt: cp.rateLimitedAt, assignedStaffId: cp.assignedStaffId };
-    });
 
     const myDeviceId = SUPA ? SUPA.getDeviceId() : null;
 
@@ -365,6 +664,14 @@
 
       const locs = (profile.locations || []).map((l) => `<span class="loc-tag">${esc(l)}</span>`).join("");
       const safeUser = esc(profile.username);
+      const rangeExpired = isRangeExpired(profile);
+      // #75 One appointment done, the other still outstanding. These stay in
+      // the working list precisely because the booking is not finished.
+      const halves = bookingHalves(profile.username, statuses, cloudStatusMap, slotHistory);
+      const halfDone = !halves.complete && (halves.ofc || halves.interview);
+      // #76 Result of the last credential check, and whether one is running now.
+      const health = (loginHealth || {})[profile.username] || null;
+      const checking = verifyUser === profile.username;
 
       const html = `
         <div class="${cardClass}" data-username="${safeUser}">
@@ -387,10 +694,13 @@
           ${activeOnOtherDevice ? `<div class="card-note note-warn">${CARD_ICON.warn}<span>Active on <b>${esc(activeDeviceName || "another device")}</b>${deviceLastSeen ? ` (${deviceLastSeen})` : ""}${isStaleDevice ? ` <span class="note-stale">— stale</span>` : ""}</span></div>` : ""}
           ${isActive && activeDeviceName && !activeOnOtherDevice ? `<div class="card-note note-live">${CARD_ICON.device}<span>Running on <b>${esc(activeDeviceName)}</b>${deviceLastSeen ? ` (${deviceLastSeen})` : ""}</span></div>` : ""}
           ${isRateLimited ? `<div class="card-note note-block">${CARD_ICON.block}<span><b>Rate limited</b> — blocked ~${rateLimitHoursLeft}h. Do not log in from any profile.</span></div>` : ""}
+          ${checking ? `<div class="card-note note-checking">${CARD_ICON.device}<span><b>Checking login…</b> signing in to test the credentials.</span></div>` : ""}
+          ${!checking && health && health.state !== "healthy" ? `<div class="card-note note-${health.state === "password_changed" || health.state === "security_mismatch" ? "block" : "half"}">${CARD_ICON.warn}<span><b>${esc(LOGIN_HEALTH_LABELS[health.state] || health.state)}</b>${health.detail ? " — " + esc(health.detail) : ""} <span class="note-when">checked ${timeAgo(health.checkedAt)}</span></span></div>` : ""}
+          ${halfDone ? `<div class="card-note note-half">${CARD_ICON.warn}<span><b>${halves.ofc ? "OFC done" : "Consular done"}</b> — ${halves.ofc ? "consular interview" : "OFC"} still to book.</span></div>` : ""}
           <div class="card-details">
             <div class="card-detail">
               <span class="detail-label">DATES</span>
-              <span class="detail-value">${formatDate(profile.startDate)} — ${formatDate(profile.endDate)}</span>
+              <span class="detail-value${rangeExpired ? " date-expired" : ""}"${rangeExpired ? ' title="This window has already ended — check the year is right"' : ""}>${formatRange(profile.startDate, profile.endDate, rangeExpired)}${rangeExpired ? " · expired" : ""}</span>
             </div>
             <div class="card-detail">
               <span class="detail-label">VISA</span>
@@ -461,10 +771,12 @@
             <span class="card-actions-rest">
               <button class="btn btn-small btn-edit" data-user="${safeUser}">Edit</button>
               <button class="btn btn-small btn-history" data-user="${safeUser}">History</button>
+              <button class="btn btn-small btn-check-login" data-user="${safeUser}" title="Log in as this client, check the credentials still work, then log out">Check login</button>
             </span>
           </div>
 
           <div class="card-footer">
+            ${health && health.state === "healthy" ? `<span class="login-ok">Login OK ${timeAgo(health.checkedAt)}</span> · ` : ""}
             ${status.updatedAt ? "Updated " + timeAgo(status.updatedAt) : "No activity yet"}
             ${status.cycleStartedAt ? " · Started " + timeAgo(status.cycleStartedAt) : ""}
             ${status.foundAt ? " · Slot found " + timeAgo(status.foundAt) : ""}
@@ -520,6 +832,35 @@
     const keepScroll = container.scrollTop;
     container.innerHTML = html;
     container.scrollTop = keepScroll;
+  }
+
+  // #74 Year options come from the data, not a hardcoded list, so the filter
+  // cannot go stale the way the old `2026..2027` loop bounds did. Always
+  // offers this year and next even when no profile reaches that far.
+  function updateYearFilter(profiles) {
+    const select = document.getElementById("filter-year");
+    if (!select) return;
+
+    const thisYear = new Date().getFullYear();
+    const years = new Set([thisYear, thisYear + 1]);
+    (profiles || []).forEach((p) => {
+      const s = parseYMD(p.startDate);
+      const e = parseYMD(p.endDate);
+      if (s) years.add(s.year);
+      if (e) years.add(e.year);
+    });
+
+    const sorted = [...years].sort((a, b) => a - b);
+    const markup = '<option value="all">Any year</option>' +
+      sorted.map((y) => `<option value="${y}">${y}</option>`).join("");
+
+    // Rebuilding every 2s would reset an open dropdown, so only touch the DOM
+    // when the option list actually changed.
+    if (select.dataset.years === sorted.join(",")) return;
+    const current = select.value;
+    select.dataset.years = sorted.join(",");
+    select.innerHTML = markup;
+    if (current && [...select.options].some((o) => o.value === current)) select.value = current;
   }
 
   function updateLogUserFilter(profiles) {
@@ -827,6 +1168,475 @@
         captchaMode: profile.captchaMode || "manual",
       }, () => {
         if (callback) callback(profile);
+      });
+    });
+  }
+
+  // ─── LOGIN HEALTH CHECK (issue #76) ────────────────────────────────
+  // Runs one client's credentials through a real login, records how far they
+  // got, then signs out. Deliberately does NOT set activeAutomationUser —
+  // every booking path is gated on that key, so a check cannot start hunting.
+
+  const LOGIN_HEALTH_LABELS = {
+    healthy: "Login OK",
+    security_mismatch: "Security answers wrong",
+    password_changed: "Password changed",
+    captcha_fail: "CAPTCHA failed",
+    blocked: "Blocked — try later",
+    timeout: "No answer",
+  };
+
+  function startLoginCheck(username) {
+    chrome.storage.local.get(["userProfilesList", "userStatuses", "activeAutomationUser"], (data) => {
+      const profile = (data.userProfilesList || []).find((p) => p.username === username);
+      if (!profile) return;
+
+      // Never check a client that is mid-session — logging in again would
+      // collide with a live run and could cost a real booking.
+      const st = (data.userStatuses || {})[username] || {};
+      const busy = ["cycling", "logging_in", "security_questions", "on_dashboard", "slot_found"];
+      if (busy.includes(st.status) || data.activeAutomationUser) {
+        const who = data.activeAutomationUser || username;
+        alert(`Can't check ${username} right now — ${who} is in the middle of a live session.\n\nStop that first, then check.`);
+        return;
+      }
+
+      chrome.storage.local.set({
+        __abVerifyUser: username,
+        __abVerifyStartedAt: new Date().toISOString(),
+        loginDetails: { username: profile.username, password: profile.password },
+        securityQuestions: profile.securityQuestions || {},
+        "is_auto-login": true,
+        // Hard off: stops the site-side flow clicking through toward booking.
+        "is_auto-dashboard": false,
+        "is_sel-1st-slot": false,
+        "is_auto-submit": false,
+        captchaMode: "auto",
+      }, () => {
+        openVisaSiteForVerify();
+        refresh();
+      });
+    });
+  }
+
+  // ─── LOGIN SWEEP (issue #76 part 2) ────────────────────────────────
+  // One button, every client, one at a time: sign in → see how far it got →
+  // sign out → wait → change IP → next. Ends with a report naming the clients
+  // that could not reach the dashboard.
+  //
+  // The dashboard's own 2s refresh drives the queue. That means the sweep only
+  // advances while this page is open — which is the safe failure mode: close
+  // the tab and it stops cleanly rather than grinding through accounts
+  // unattended with nobody watching.
+
+  const SWEEP_KEY = "__abSweep";
+  // No IP rotation and no long pacing between clients. Changing the exit IP
+  // mid-sweep makes Cloudflare treat us as a brand-new visitor and serve the
+  // "verify you are human" checkbox — which needs a person, so it defeats the
+  // whole unattended run. Observed behaviour, and it beats the theory that a
+  // fresh IP looks safer.
+  //
+  // What remains is a short settle: the previous client's sign-out has to land
+  // before the next one signs in, or the two sessions collide. This is the
+  // handover, not padding.
+  const SWEEP_SETTLE_MIN_MS = 4000;
+  const SWEEP_SETTLE_MAX_MS = 9000;
+  const SWEEP_STUCK_MS = 4 * 60 * 1000;     // a single check should never exceed this
+  // A Cloudflare challenge pauses rather than ends the run: the operator
+  // solves the checkbox and it carries on from the same place. Backoff grows
+  // so a challenge still sitting unsolved is not hammered.
+  const SWEEP_BLOCK_BACKOFF_MS = [60 * 1000, 3 * 60 * 1000, 6 * 60 * 1000];
+  const SWEEP_MAX_BLOCKS = 4;               // then stop and ask for a new IP
+
+  // States that mean "we could not get in" — these are what the report is for.
+  const SWEEP_FAIL_STATES = ["password_changed", "security_mismatch"];
+  const SWEEP_INCONCLUSIVE = ["captcha_fail", "blocked", "timeout"];
+
+  const sweepGap = () => SWEEP_SETTLE_MIN_MS + Math.random() * (SWEEP_SETTLE_MAX_MS - SWEEP_SETTLE_MIN_MS);
+
+  function readSweep() {
+    return new Promise((r) => chrome.storage.local.get([SWEEP_KEY], (d) => r(d[SWEEP_KEY] || null)));
+  }
+
+  function writeSweep(sweep) {
+    return new Promise((r) => chrome.storage.local.set({ [SWEEP_KEY]: sweep }, r));
+  }
+
+  async function startSweep(profiles, statuses) {
+    const cloudMap = viewCloudMap();
+    const skipped = [];
+    const queue = [];
+
+    (profiles || []).forEach((p) => {
+      const st = (statuses || {})[p.username] || {};
+      const busy = ["cycling", "logging_in", "security_questions", "on_dashboard", "slot_found"];
+      if (busy.includes(st.status)) { skipped.push(p.username); return; }
+      if (!p.password) { skipped.push(p.username); return; }
+      queue.push(p.username);
+    });
+
+    if (!queue.length) {
+      alert("Nothing to check — every client is either mid-session or has no saved password.");
+      return;
+    }
+
+    // ~45s per client: sign in, CAPTCHA, security questions, land, sign out.
+    const mins = Math.max(1, Math.round((queue.length * 45000) / 60000));
+    const ok = confirm(
+      `Check the login for ${queue.length} client${queue.length === 1 ? "" : "s"}, one after another?\n\n` +
+      `• Each one is a real sign-in and uses one of that client's daily page-views.\n` +
+      `• The next client starts as soon as the previous one has signed out.\n` +
+      `• Roughly ${mins} minutes in total.\n` +
+      `• Leave this dashboard tab open — closing it stops the run.\n\n` +
+      (skipped.length ? `Skipping ${skipped.length} (mid-session or no saved password).\n\n` : "") +
+      `You get a report at the end naming any client we could not sign in as.`);
+    if (!ok) return;
+
+    // Drop any tab id left from a previous run so the first client claims a
+    // tab cleanly (and closes duplicates) instead of reviving a stale one.
+    await new Promise((r) => chrome.storage.local.remove(["__abVerifyTabId"], r));
+
+    await writeSweep({
+      active: true, queue, total: queue.length, skipped,
+      current: null, nextAt: 0, startedAt: new Date().toISOString(),
+      finishedAt: null, stoppedReason: null, checked: [],
+    });
+    refresh();
+  }
+
+  async function stopSweep(reason) {
+    const sweep = await readSweep();
+    if (!sweep) return;
+    const inFlight = sweep.current;
+    sweep.active = false;
+    sweep.current = null;
+    sweep.finishedAt = new Date().toISOString();
+    sweep.stoppedReason = reason || "Stopped";
+    await writeSweep(sweep);
+    await new Promise((r) => chrome.storage.local.remove(
+      ["__abVerifyUser", "__abVerifyStartedAt", "__abVerifyPhase", "__abVerifyTabId"], r));
+
+    // #76 The client we were part-way through never reached finishVerify, so
+    // it is still sitting on "logging_in"/"security_questions" — which reads
+    // as running on this machine and inflates the cycling count. Put it back.
+    if (inFlight) await clearStuckCheckStatus(inFlight);
+    refresh();
+  }
+
+  // Returns a client left mid-check to idle, locally and in the cloud.
+  function clearStuckCheckStatus(username) {
+    return new Promise((resolve) => {
+      chrome.storage.local.get(["userStatuses"], (d) => {
+        const statuses = d.userStatuses || {};
+        const st = statuses[username];
+        const midCheck = ["logging_in", "security_questions", "on_dashboard"];
+        if (!st || !midCheck.includes(st.status)) return resolve();
+        statuses[username] = { ...st, status: "idle", updatedAt: new Date().toISOString() };
+        chrome.storage.local.set({ userStatuses: statuses }, () => {
+          if (SUPA && SUPA.isReady()) {
+            try { SUPA.updateProfileStatus(username, "idle", false); } catch (e) { /* offline is fine */ }
+          }
+          resolve();
+        });
+      });
+    });
+  }
+
+  // Called once per dashboard refresh. Advances the queue by at most one step.
+  let sweepTicking = false;
+  async function tickSweep(profiles, statuses, verifyUser, loginHealth) {
+    // Claim the guard BEFORE the first await. Checking it and then awaiting
+    // let two refresh ticks both get past the check and both suspend, so each
+    // started a client and each opened a tab.
+    if (sweepTicking) return;
+    sweepTicking = true;
+    try {
+      const sweep = await readSweep();
+      if (!sweep || !sweep.active) return;
+
+      // A check is in flight — let it finish, unless it has clearly hung.
+      if (verifyUser) {
+        const startedAt = await new Promise((r) =>
+          chrome.storage.local.get(["__abVerifyStartedAt"], (d) => r(d.__abVerifyStartedAt)));
+        // A missing start time used to mean "wait forever" — the sweep would sit
+        // on that client and never advance. No start time means nothing is
+        // genuinely running, so treat it as hung straight away.
+        const hung = !startedAt || Date.now() - new Date(startedAt).getTime() > SWEEP_STUCK_MS;
+        if (hung) {
+          await new Promise((r) => chrome.storage.local.remove(["__abVerifyUser", "__abVerifyStartedAt", "__abVerifyPhase"], r));
+          if (verifyUser) await clearStuckCheckStatus(verifyUser);
+          // fall through and let the next tick move on
+        } else {
+          return;
+        }
+      }
+
+      // Paused after a block. Come back by itself once the backoff is up —
+      // the operator solves the checkbox in the visa tab and the run resumes
+      // without them having to find their way back to this dashboard.
+      if (sweep.paused) {
+        if (sweep.retryAt && Date.now() < sweep.retryAt) return;
+        sweep.paused = false;
+        sweep.retryAt = 0;
+        sweep.nextAt = 0;
+        await writeSweep(sweep);
+        return;
+      }
+
+      // The client we just checked has finished — bank the result.
+      if (sweep.current) {
+        // Read health fresh rather than trusting the snapshot this refresh
+        // began with: the content script writes the result somewhere between
+        // the two, and a stale read here would miss a `blocked` and march the
+        // sweep straight on into a rate limit.
+        const fresh = await new Promise((r) =>
+          chrome.storage.local.get(["__abLoginHealth"], (d) => r(d.__abLoginHealth || {})));
+        const result = fresh[sweep.current];
+
+        // A block says nothing about this client — it is about us. Put them
+        // back at the front of the queue rather than counting them as checked,
+        // and PAUSE instead of ending the run, so solving the challenge picks
+        // up exactly where it stopped instead of restarting from the top and
+        // re-spending page-views on clients already done.
+        if (result && result.state === "blocked") {
+          const blockedOn = sweep.current;
+          sweep.queue.unshift(blockedOn);
+          sweep.current = null;
+          sweep.blocks = (sweep.blocks || 0) + 1;
+
+          if (sweep.blocks >= SWEEP_MAX_BLOCKS) {
+            await writeSweep(sweep);
+            // No early release here — `finally` owns the guard. Dropping it
+            // mid-await would let another tick in while this one is still
+            // shutting the run down.
+            await stopSweep(`Blocked ${sweep.blocks} times — stopped so it does not keep trying. Change IP, then run it again.`);
+            sendDashboardTelegram("error",
+              `⏹ <b>LOGIN CHECK STOPPED</b>\n\nBlocked ${sweep.blocks} times.\n` +
+              `✅ Checked ${sweep.checked.length} of ${sweep.total}\n🔧 Change IP, then start it again`);
+            return;
+          }
+
+          // Back off a little further each time, so a challenge that is still
+          // sitting there is not hammered.
+          sweep.paused = true;
+          sweep.retryAt = Date.now() + SWEEP_BLOCK_BACKOFF_MS[Math.min(sweep.blocks - 1, SWEEP_BLOCK_BACKOFF_MS.length - 1)];
+          await writeSweep(sweep);
+          sendDashboardTelegram("error",
+            `⏸ <b>LOGIN CHECK PAUSED</b>\n\nCloudflare challenge on <b>${blockedOn}</b>.\n` +
+            `✅ ${sweep.checked.length} of ${sweep.total} done\n` +
+            `👉 Solve the checkbox in the visa tab — it carries on by itself`);
+          return;
+        }
+
+        sweep.checked.push(sweep.current);
+        sweep.blocks = 0;            // a clean result clears the backoff
+        sweep.current = null;
+        sweep.nextAt = Date.now() + sweepGap();
+        await writeSweep(sweep);
+        return;
+      }
+
+      // Finished everything.
+      if (!sweep.queue.length) {
+        sweep.active = false;
+        sweep.finishedAt = new Date().toISOString();
+        await writeSweep(sweep);
+        await new Promise((r) => chrome.storage.local.remove(["__abVerifyTabId"], r));
+        await sendSweepReport(sweep, profiles, loginHealth);
+        refresh();
+        return;
+      }
+
+      // Still inside the gap between clients.
+      if (sweep.nextAt && Date.now() < sweep.nextAt) return;
+
+      // Start the next client.
+      const next = sweep.queue.shift();
+      const profile = (profiles || []).find((p) => p.username === next);
+      const st = (statuses || {})[next] || {};
+      const busy = ["cycling", "logging_in", "security_questions", "on_dashboard", "slot_found"];
+      if (!profile || busy.includes(st.status)) {
+        sweep.skipped.push(next);       // went live since the sweep began
+        await writeSweep(sweep);
+        return;
+      }
+
+      sweep.current = next;
+      await writeSweep(sweep);
+
+      await new Promise((r) => chrome.storage.local.set({
+        __abVerifyUser: next,
+        __abVerifyStartedAt: new Date().toISOString(),
+        loginDetails: { username: profile.username, password: profile.password },
+        securityQuestions: profile.securityQuestions || {},
+        "is_auto-login": true,
+        "is_auto-dashboard": false,
+        "is_sel-1st-slot": false,
+        "is_auto-submit": false,
+        captchaMode: "auto",
+      }, r));
+      openVisaSiteForVerify();
+    } finally {
+      sweepTicking = false;
+    }
+  }
+
+  function sweepBuckets(sweep, loginHealth) {
+    const failed = [], unsure = [], ok = [];
+    (sweep.checked || []).forEach((u) => {
+      const st = ((loginHealth || {})[u] || {}).state;
+      if (SWEEP_FAIL_STATES.includes(st)) failed.push({ u, st });
+      else if (SWEEP_INCONCLUSIVE.includes(st)) unsure.push({ u, st });
+      else if (st === "healthy") ok.push({ u, st });
+      else unsure.push({ u, st: st || "timeout" });
+    });
+    return { failed, unsure, ok };
+  }
+
+  async function sendSweepReport(sweep, profiles, loginHealth) {
+    const { failed, unsure, ok } = sweepBuckets(sweep, loginHealth);
+    const name = (u) => {
+      const p = (profiles || []).find((x) => x.username === u);
+      return p ? (p.name || deriveProfileName(u)) : u;
+    };
+
+    let msg = `🔑 <b>LOGIN CHECK DONE</b>\n\n` +
+      `✅ <b>${ok.length}</b> reached the dashboard\n` +
+      `🔴 <b>${failed.length}</b> could not sign in\n` +
+      `⚪ <b>${unsure.length}</b> inconclusive\n`;
+    if (failed.length) {
+      msg += `\n<b>Could not sign in:</b>\n` + failed
+        .map((f) => `• ${name(f.u)} — ${LOGIN_HEALTH_LABELS[f.st] || f.st}`).join("\n") + "\n";
+    }
+    if (unsure.length) {
+      msg += `\n<b>Worth retrying:</b>\n` + unsure
+        .map((f) => `• ${name(f.u)} — ${LOGIN_HEALTH_LABELS[f.st] || f.st}`).join("\n") + "\n";
+    }
+    if (sweep.skipped && sweep.skipped.length) {
+      msg += `\n⏭ Skipped ${sweep.skipped.length} (mid-session or no saved password)`;
+    }
+    sendDashboardTelegram("login", msg);
+  }
+
+  function renderSweep(sweep, loginHealth, profiles) {
+    const bar = document.getElementById("sweep-bar");
+    const report = document.getElementById("sweep-report");
+    if (!bar || !report) return;
+
+    if (sweep && sweep.active) {
+      report.hidden = true;
+      bar.hidden = false;
+      const done = (sweep.checked || []).length;
+      const pct = sweep.total ? Math.round((done / sweep.total) * 100) : 0;
+      document.getElementById("sweep-fill").style.width = pct + "%";
+      document.getElementById("sweep-count").textContent = `${done} of ${sweep.total}`;
+      document.getElementById("sweep-now").textContent = sweep.current ? `signing in as ${sweep.current}` : "";
+
+      const note = document.getElementById("sweep-note");
+      const resumeBtn = document.getElementById("sweep-resume");
+      const dot = bar.querySelector(".sweep-dot");
+
+      if (sweep.paused) {
+        bar.classList.add("is-paused");
+        if (dot) dot.classList.add("paused");
+        if (resumeBtn) resumeBtn.hidden = false;
+        document.getElementById("sweep-title").textContent = "Login check paused";
+        document.getElementById("sweep-now").textContent = "blocked by a Cloudflare challenge";
+        const secs = Math.max(0, Math.ceil(((sweep.retryAt || 0) - Date.now()) / 1000));
+        note.textContent = secs
+          ? `Solve the checkbox in the visa tab — this carries on by itself in ${secs}s, or press Continue now.`
+          : "Picking up where it left off…";
+        return;
+      }
+
+      bar.classList.remove("is-paused");
+      if (dot) dot.classList.remove("paused");
+      if (resumeBtn) resumeBtn.hidden = true;
+      document.getElementById("sweep-title").textContent = "Checking logins";
+
+      if (sweep.current) {
+        note.textContent = "Leave this tab open — the run advances from here.";
+      } else if (sweep.nextAt && Date.now() < sweep.nextAt) {
+        note.textContent = "Signing out, then straight on to the next client.";
+      } else {
+        note.textContent = "Starting the next client…";
+      }
+      return;
+    }
+
+    bar.hidden = true;
+
+    // Finished (or stopped) and not yet dismissed.
+    if (sweep && sweep.finishedAt && !sweep.dismissed) {
+      const { failed, unsure, ok } = sweepBuckets(sweep, loginHealth);
+      const name = (u) => {
+        const p = (profiles || []).find((x) => x.username === u);
+        return p ? (p.name || deriveProfileName(u)) : u;
+      };
+      const row = (f) => `<li><b>${esc(name(f.u))}</b> <span class="sr-why">${esc(LOGIN_HEALTH_LABELS[f.st] || f.st)}</span></li>`;
+
+      document.getElementById("sweep-report-title").textContent =
+        sweep.stoppedReason ? "Login check stopped" : "Login check finished";
+
+      document.getElementById("sweep-report-body").innerHTML = `
+        ${sweep.stoppedReason ? `<p class="sr-stopped">${esc(sweep.stoppedReason)}</p>` : ""}
+        <div class="sr-tallies">
+          <span class="sr-tally ok"><b>${ok.length}</b> reached the dashboard</span>
+          <span class="sr-tally bad"><b>${failed.length}</b> could not sign in</span>
+          <span class="sr-tally meh"><b>${unsure.length}</b> inconclusive</span>
+        </div>
+        ${failed.length ? `<div class="sr-group"><h4>Could not sign in — these need you</h4><ul>${failed.map(row).join("")}</ul></div>` : ""}
+        ${unsure.length ? `<div class="sr-group"><h4>Inconclusive — worth running again</h4><ul>${unsure.map(row).join("")}</ul></div>` : ""}
+        ${sweep.skipped && sweep.skipped.length ? `<p class="sr-skip">Skipped ${sweep.skipped.length} — mid-session or no saved password.</p>` : ""}
+        ${!failed.length && !unsure.length ? `<p class="sr-allgood">Every client checked signed in and reached the dashboard.</p>` : ""}`;
+      report.hidden = false;
+      return;
+    }
+
+    report.hidden = true;
+  }
+
+  // #76 Verify must NOT reuse openVisaSite(): that one sends `startCycling`
+  // when a tab is already sitting on /ofc-schedule, which would begin hunting
+  // slots as the client we only meant to log in as. Always navigate to the
+  // site root instead, so a check always starts from a clean login.
+  const VERIFY_TAB_URLS = ["https://*.usvisascheduling.com/*", "https://*.b2clogin.com/*"];
+
+  // #76 One tab for the whole run, reused.
+  //
+  // This used to query usvisascheduling.com only — but after a sign-out the tab
+  // is sitting on b2clogin.com, so nothing matched and a BRAND NEW TAB opened
+  // for every client. Those orphans kept running the content script, all read
+  // the same verify key, and raced each other: one would clear the keys while
+  // another was still mid-login, which is what stalled the run a few clients in.
+  function openVisaSiteForVerify() {
+    const url = "https://www.usvisascheduling.com/en-US/";
+    chrome.storage.local.get(["__abVerifyTabId"], (d) => {
+      const known = d.__abVerifyTabId;
+      if (known) {
+        chrome.tabs.update(known, { active: true, url }, () => {
+          if (chrome.runtime.lastError) { claimVerifyTab(url); return; }   // tab was closed
+        });
+        return;
+      }
+      claimVerifyTab(url);
+    });
+  }
+
+  // Take over one existing visa/login tab, close any others so they cannot
+  // interfere, and remember which one we are using.
+  function claimVerifyTab(url) {
+    chrome.tabs.query({ url: VERIFY_TAB_URLS }, (tabs) => {
+      if (tabs && tabs.length) {
+        const keep = tabs[0];
+        tabs.slice(1).forEach((t) => chrome.tabs.remove(t.id, () => void chrome.runtime.lastError));
+        chrome.storage.local.set({ __abVerifyTabId: keep.id }, () => {
+          chrome.tabs.update(keep.id, { active: true, url }, () => void chrome.runtime.lastError);
+        });
+        return;
+      }
+      chrome.tabs.create({ url }, (tab) => {
+        if (tab) chrome.storage.local.set({ __abVerifyTabId: tab.id });
       });
     });
   }
@@ -1213,6 +2023,11 @@
       if (userSel) userSel.value = username;
       switchTab("slots");
       refresh();
+    } else if (btn.classList.contains("btn-check-login")) {
+      // #76 Real login on a live account — spends a page-view, so confirm.
+      if (confirm(`Check the login for ${username}?\n\nThis signs in as them for real, checks the credentials, then signs out. It uses one of their daily page-views.`)) {
+        startLoginCheck(username);
+      }
     }
   });
 
@@ -1717,11 +2532,16 @@
     renderAttentionLane(data.profiles, data.statuses);
     announceNewSlots(data.profiles, data.statuses);
     updateSyncDots();
-    renderUserCards(data.profiles, data.statuses, data.slotHistory);
+    renderUserCards(data.profiles, data.statuses, data.slotHistory, data.loginHealth, data.verifyUser);
     renderActivityLog(data.events);
     renderSlotHistory(data.slotHistory, data.profiles);
     renderStats(data.dailyStats, data.storageStats, data.slotHistory, data.profiles, data.statuses);
     updateLogUserFilter(data.profiles);
+    updateYearFilter(data.profiles);
+    updateViewCounts(data.profiles, data.statuses, data.slotHistory);
+    renderSweep(data.sweep, data.loginHealth, data.profiles);
+    tickSweep(data.profiles, data.statuses, data.verifyUser, data.loginHealth);
+    renderBookedPanel(data.profiles, data.statuses, data.slotHistory);
 
     // #59 Insights — one slotHistory pass shared by the rail and wall mode.
     const insights = buildSlotInsights(data.slotHistory);
@@ -1782,6 +2602,92 @@
   document.getElementById("filter-status").addEventListener("change", refresh);
   document.getElementById("filter-visa")?.addEventListener("change", refresh);
   document.getElementById("filter-month")?.addEventListener("change", refresh);
+  document.getElementById("filter-year")?.addEventListener("change", refresh);
+
+  // #76 One button: check every client, then report who failed.
+  document.getElementById("sweep-start-btn")?.addEventListener("click", () => {
+    chrome.storage.local.get(["userProfilesList", "userStatuses", "activeAutomationUser"], (d) => {
+      if (d.activeAutomationUser) {
+        alert(`Can't run the login check — ${d.activeAutomationUser} is mid-session.\n\nStop that client first.`);
+        return;
+      }
+      startSweep(d.userProfilesList || [], d.userStatuses || {});
+    });
+  });
+
+  document.getElementById("sweep-resume")?.addEventListener("click", async () => {
+    const sweep = await readSweep();
+    if (!sweep) return;
+    sweep.paused = false;
+    sweep.retryAt = 0;
+    sweep.nextAt = 0;
+    await writeSweep(sweep);
+    refresh();
+  });
+
+  document.getElementById("sweep-stop")?.addEventListener("click", () => {
+    if (confirm("Stop the login check?\n\nClients already checked keep their result.")) {
+      stopSweep("Stopped by you");
+    }
+  });
+
+  document.getElementById("sweep-report-close")?.addEventListener("click", async () => {
+    const sweep = await readSweep();
+    if (sweep) { sweep.dismissed = true; await writeSweep(sweep); }
+    refresh();
+  });
+
+  // #75 View switcher. Active is the working list; booked swaps the card grid
+  // for the reconciliation table.
+  document.getElementById("view-switch")?.addEventListener("click", (e) => {
+    const btn = e.target.closest(".view-btn");
+    if (!btn) return;
+    clientView = btn.dataset.view || "active";
+    document.querySelectorAll("#view-switch .view-btn").forEach((b) => {
+      const on = b === btn;
+      b.classList.toggle("is-on", on);
+      b.setAttribute("aria-selected", on ? "true" : "false");
+    });
+    const grid = document.getElementById("user-cards");
+    if (grid) grid.hidden = clientView === "booked";
+    bookedSignature = "";
+    chrome.storage.local.set({ __clientView: clientView });
+    refresh();
+  });
+
+  chrome.storage.local.get(["__clientView"], (d) => {
+    if (!d.__clientView) return;
+    const btn = document.querySelector(`#view-switch .view-btn[data-view="${d.__clientView}"]`);
+    if (btn) btn.click();
+  });
+
+  // #75 Record a payment. Written straight onto the profile, so it survives
+  // and syncs like any other profile field.
+  document.getElementById("booked-rows")?.addEventListener("change", (e) => {
+    const input = e.target.closest(".bk-paid");
+    if (!input) return;
+    const username = input.dataset.user;
+    const value = Math.max(0, Math.round(Number(input.value) || 0));
+
+    chrome.storage.local.get(["userProfilesList"], (d) => {
+      const profiles = d.userProfilesList || [];
+      const idx = profiles.findIndex((p) => p.username === username);
+      if (idx === -1) return;
+      // Never let a recorded payment exceed what was agreed — that is a typo,
+      // and it would make Outstanding go negative.
+      const agreed = agreedOf(profiles[idx]);
+      const capped = agreed > 0 ? Math.min(value, agreed) : value;
+      profiles[idx] = { ...profiles[idx], paidAmount: capped };
+      chrome.storage.local.set({ userProfilesList: profiles }, () => {
+        if (capped !== value) input.value = capped;
+        bookedSignature = "";
+        if (SUPA && SUPA.isReady() && SUPA.pushProfile) {
+          try { SUPA.pushProfile(profiles[idx]); } catch (err) { console.log("paid sync skipped:", err.message); }
+        }
+        refresh();
+      });
+    });
+  });
   document.getElementById("profile-search")?.addEventListener("input", refresh);
   document.getElementById("log-filter-user").addEventListener("change", refresh);
   document.getElementById("log-filter-type").addEventListener("change", refresh);
@@ -1905,6 +2811,8 @@
       document.getElementById("edit-visa-type").value = profile.visaType || "";
       document.getElementById("edit-applicants").value = profile.applicantCount || 1;
       document.getElementById("edit-price").value = profile.pricePerPerson || profile.agreedPrice || "";
+      const paidField = document.getElementById("edit-paid");
+      if (paidField) paidField.value = profile.paidAmount || "";
       calcTotalPrice();
 
       // Automation
@@ -1954,6 +2862,7 @@
       visaType: document.getElementById("edit-visa-type").value.trim(),
       applicantCount: parseInt(document.getElementById("edit-applicants").value) || 1,
       pricePerPerson: document.getElementById("edit-price").value.trim(),
+      paidAmount: Math.max(0, Math.round(Number(document.getElementById("edit-paid")?.value) || 0)),
       agreedPrice: String((parseInt(document.getElementById("edit-price").value) || 0) * (parseInt(document.getElementById("edit-applicants").value) || 1)),
       autoLogin: document.getElementById("edit-auto-login").checked,
       autoDashboard: document.getElementById("edit-auto-dashboard").checked,
@@ -2052,9 +2961,32 @@
     "kol": "Kolkata", "kolkata": "Kolkata", "calcutta": "Kolkata",
   };
 
+  // #74 Year inference. The old code stamped `new Date().getFullYear()` on
+  // every parsed range, so a client asking in September for "January" was
+  // stored as January of the year that had almost finished — a window in the
+  // past that no slot could ever match.
+  //
+  // Rules, in order:
+  //   1. An explicit year in the text wins ("jan 2027", "march 27").
+  //   2. Otherwise roll forward: a month that has already passed this year
+  //      means next year.
+  //   3. A later month that lands before an earlier one has wrapped into the
+  //      following year ("Nov to Feb" = Nov this year → Feb next).
+  function explicitYearIn(text) {
+    const full = text.match(/\b(20\d{2})\b/);
+    if (full) return parseInt(full[1], 10);
+    // "march 27" / "jan '27" — only accept a plausible near-future shorthand,
+    // so a day-of-month like "March 27" is not mistaken for a year.
+    const short = text.match(/\b'(\d{2})\b/);
+    if (short) return 2000 + parseInt(short[1], 10);
+    return null;
+  }
+
   function parseMonthRange(text) {
-    const lower = text.toLowerCase().replace(/[^a-z0-9\s,&-]/g, " ");
-    const year = new Date().getFullYear();
+    const lower = text.toLowerCase().replace(/[^a-z0-9\s,&'-]/g, " ");
+    const now = new Date();
+    const explicit = explicitYearIn(lower);
+    const year = explicit !== null ? explicit : now.getFullYear();
     const monthEntries = [];
     for (const [name, num] of Object.entries(MONTH_MAP)) {
       const idx = lower.indexOf(name);
@@ -2066,28 +2998,36 @@
     if (monthEntries.length === 0) return { startDate: "", endDate: "" };
     monthEntries.sort((a, b) => a.idx - b.idx);
 
-    function weekToDay(monthNum, textAfterMonth) {
+    function weekToDay(monthNum, textAfterMonth, forYear) {
       const wk = textAfterMonth.match(/(\d)\s*(?:st|nd|rd|th)?\s*week/);
       if (wk) {
         const weekNum = parseInt(wk[1]);
-        return Math.min((weekNum - 1) * 7 + 1, new Date(year, monthNum + 1, 0).getDate());
+        return Math.min((weekNum - 1) * 7 + 1, new Date(forYear, monthNum + 1, 0).getDate());
       }
       return null;
     }
 
     const firstEntry = monthEntries[0];
     const lastEntry = monthEntries[monthEntries.length - 1];
-    const startWeekDay = weekToDay(firstEntry.num, lower.substring(firstEntry.idx));
+
+    // Rule 2 — roll forward. With no explicit year, a month that has already
+    // gone by this year is the client asking for next year.
+    let startYear = year;
+    if (explicit === null && firstEntry.num < now.getMonth()) startYear = year + 1;
+
+    // Rule 3 — wrap. "Nov and Feb" means Nov this year to Feb the next, not
+    // an inverted range inside one year.
+    const endYear = lastEntry.num < firstEntry.num ? startYear + 1 : startYear;
+
+    const startWeekDay = weekToDay(firstEntry.num, lower.substring(firstEntry.idx), startYear);
     const startDay = startWeekDay || 1;
-    const startDate = `${year}-${String(firstEntry.num + 1).padStart(2, "0")}-${String(startDay).padStart(2, "0")}`;
-    const endWeekDay = weekToDay(lastEntry.num, lower.substring(lastEntry.idx));
-    let endDay;
-    if (endWeekDay) {
-      endDay = Math.min(endWeekDay + 6, new Date(year, lastEntry.num + 1, 0).getDate());
-    } else {
-      endDay = new Date(year, lastEntry.num + 1, 0).getDate();
-    }
-    const endDate = `${year}-${String(lastEntry.num + 1).padStart(2, "0")}-${String(endDay).padStart(2, "0")}`;
+    const startDate = `${startYear}-${String(firstEntry.num + 1).padStart(2, "0")}-${String(startDay).padStart(2, "0")}`;
+
+    const endWeekDay = weekToDay(lastEntry.num, lower.substring(lastEntry.idx), endYear);
+    const lastDayOfEnd = new Date(endYear, lastEntry.num + 1, 0).getDate();
+    const endDay = endWeekDay ? Math.min(endWeekDay + 6, lastDayOfEnd) : lastDayOfEnd;
+    const endDate = `${endYear}-${String(lastEntry.num + 1).padStart(2, "0")}-${String(endDay).padStart(2, "0")}`;
+
     return { startDate, endDate };
   }
 
@@ -2260,6 +3200,8 @@
     document.getElementById("edit-applicants").value = "1";
     document.getElementById("edit-price").value = "";
     document.getElementById("edit-total-price").value = "";
+    const paidReset = document.getElementById("edit-paid");
+    if (paidReset) paidReset.value = "";
     document.getElementById("edit-auto-login").checked = true;
     document.getElementById("edit-auto-dashboard").checked = true;
     document.getElementById("edit-auto-select").checked = true;
@@ -2921,6 +3863,8 @@
     // form-row order: 0 username, 1 password ... price row is matched by its input
     const pwRow = document.getElementById("edit-password")?.closest(".form-row");
     if (pwRow) pwRow.style.display = staffMode ? "none" : "";
+    // #75 Amount Received sits in this same row, so hiding it here keeps
+    // every money field out of staff view in one move.
     const priceRow = document.getElementById("edit-price")?.closest(".form-row");
     if (priceRow) priceRow.style.display = staffMode ? "none" : "";
     const visaRow = document.getElementById("edit-visa-type")?.closest(".form-row");
@@ -3280,6 +4224,27 @@
       const city = tile.dataset.city || "";
       search.value = search.value.trim().toLowerCase() === city.toLowerCase() ? "" : city;
       refresh();
+    });
+
+    // #74 Heatmap range picker. Delegated, because the stats pane is
+    // re-rendered wholesale whenever its content hash changes.
+    document.getElementById("stats-pane")?.addEventListener("click", (e) => {
+      const btn = e.target.closest(".heat-range");
+      if (!btn) return;
+      heatRangeDays = parseInt(btn.dataset.days, 10) || 0;
+      chrome.storage.local.set({ __heatRangeDays: heatRangeDays });
+      statsSignature = "";                       // force a repaint
+      if (lastRefresh) {
+        renderStats(lastRefresh.dailyStats, lastRefresh.storageStats,
+                    lastRefresh.slotHistory, lastRefresh.profiles, lastRefresh.statuses);
+      }
+    });
+
+    chrome.storage.local.get(["__heatRangeDays"], (d) => {
+      if (typeof d.__heatRangeDays === "number") {
+        heatRangeDays = d.__heatRangeDays;
+        statsSignature = "";
+      }
     });
 
     // Wall mode.

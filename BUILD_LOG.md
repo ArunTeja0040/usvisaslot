@@ -12,6 +12,147 @@ Format:
 
 ---
 
+## 2026-09-18 — Check whether a client's login still works, without booking anything (Issue #76)
+
+**What it does:** Adds a **Check login** button to each client card. It signs in as that client for real, works out how far it got, then signs out — and never goes anywhere near booking.
+
+**Why:** Clients change their password and nobody tells us. Saved security answers drift. Until now the only way to find out was to run a real booking attempt and watch it fail, by which time a slot may already have been missed.
+
+**What it tells you.** Not just yes or no — it reports how far the login got, which is the part that says whose problem it is:
+
+- **Login OK** — got all the way to the dashboard. Shown quietly in the card footer.
+- **Password changed** — the site rejected the credentials. The client changed it; you need to ask them.
+- **Security answers wrong** — the password was fine, but our saved answers no longer match. That is **our** data being stale, not the client's fault, and it is fixable from the edit form.
+- **CAPTCHA failed** / **Blocked** / **No answer** — inconclusive. Nothing is concluded about the client; just try again later.
+
+Anything other than OK shows as a coloured note on the card with the date it was checked, so a stale result never masquerades as a fresh one.
+
+**It cannot start hunting slots.** This was the main thing to get right. The booking engine only ever runs for the client held in one particular setting, and the login check deliberately never writes to it — so the check is not "booking that is switched off", it is a path that has no way to reach booking at all. On top of that, auto-dashboard, auto-select and auto-submit are all forced off for the duration.
+
+**A trap found while building it:** the existing "open the visa site" helper has a shortcut — if a tab happens to already be sitting on the booking page, it tells that tab to **start cycling**. Reusing it would have meant clicking *Check login* could begin hunting slots as that client, which is exactly what the feature must never do. The check now navigates to the site's front page itself instead.
+
+**It refuses to check a client who is mid-session.** Signing in again while that client is live would collide with a running booking. The button says so and stops.
+
+**What changed for you:** nothing runs on its own. You press the button on one client, confirm, and it checks that one. Each check is a real sign-in and uses one of that client's daily page-views, so the confirmation box says so before it starts.
+
+**And the button that does all of them.** **Check all logins** runs the whole client list one at a time: sign in, see how far it got, sign out, and straight on to the next. A bar shows who is being checked. You can stop it whenever you like and keep the results so far. Around forty clients takes roughly half an hour.
+
+**Wrong security answers are now recognised and reported, not retried forever.** When the saved answers do not match, the site says so — *"Answers did not match. New questions have been selected. Please try again."* — and serves a fresh pair of questions. The check was ignoring that message and simply answering the new questions, getting those wrong too, and going round again, which is why it sat on that page. It now reads the site's own message, stops immediately, and records that client as **Security answers wrong** with the site's exact wording. There is also a hard limit of two attempts per client, so even if the site reworded the message it could not loop.
+
+**Two clients no longer start at once.** Clicking the button could begin two logins simultaneously, in two tabs. The run has a lock meant to stop that, but it was being taken a fraction too late — the code checked whether anyone held it, then paused to read from storage, and during that pause a second refresh slipped past the same check. Both then believed they were the only one running. The lock is now taken immediately, before anything that can pause.
+
+**One browser tab for the whole run, not one per client.** The first version opened a fresh tab for every client. The reason was a mistake in how it looked for an existing tab: it only searched for pages on the booking site, but after signing out the tab is sitting on the *login* site — so it never found anything to reuse and opened another one. Those leftover tabs kept running in the background, all watching the same instruction, and after five or six clients they started tripping over each other, which is why the run appeared to freeze on one name and never move on. It now keeps a single tab, reuses it for every client, and closes any stray login tabs before it starts.
+
+**A check that never properly began can no longer freeze the run.** There was a case where a check had a name attached but no start time, and the safety timer only looked at checks that had one — so it waited for something that was never going to finish. That now counts as hung straight away: the client is returned to idle, marked inconclusive, and the run carries on.
+
+**A Cloudflare challenge pauses the run instead of ending it.** The first version treated a challenge as the end of the sweep, so solving the checkbox left it dead and starting again would have gone back to the top of the list — re-spending page-views on clients already done. Now it **pauses**, keeps everything it has, and puts the interrupted client back at the front rather than counting them as checked. Solve the checkbox in the visa tab and it picks up by itself from exactly where it stopped; there is also a **Continue now** button if you do not want to wait. Each further block waits a bit longer before retrying, and after four it gives up and asks you to change IP.
+
+**No IP changing between clients.** The first version rotated the VPN before each login on the theory that a fresh address looks safer. In practice a new exit IP makes the site treat us as a brand-new visitor and put up the "verify you are human" checkbox — which needs a person sitting there, so it defeated the point of an unattended run. It now stays on one address for the whole sweep.
+
+**Each client goes back to idle the moment its check ends.** Signing in necessarily moves a client through "logging in" and "security questions", and both of those count as *running on this machine* — locally and in the shared cloud view. The first version never put them back, so a client whose check had already finished carried on showing as live, the "cycling now" figure counted checks as real runs, and a later sweep would have skipped those clients as busy. Every check now resets the client when it finishes, and stopping a run part-way resets whoever was in progress.
+
+**It waits for the sign-out to finish before starting the next one.** Signing out is itself a page load, so with no pause between clients the next login could begin while the previous session was still closing — landing on a page still signed in as the last client and reporting the wrong person as fine. The run now holds until the sign-out has actually landed.
+
+**At the end you get a report** — on screen and, if Telegram is set up, sent to you — led by the thing you actually want to know: **which clients we could not sign in as**, each with the reason. Below that, the inconclusive ones worth another go, and a count of any skipped because they were mid-session or have no saved password.
+
+**It stops itself if we get blocked.** If Cloudflare or a rate limit appears partway through, the run halts rather than marching through the rest of your clients while blocked, and the report says how far it got. Change IP and run it again.
+
+**Leave the dashboard tab open while it runs.** The queue advances from that page, so closing it stops the run cleanly — which is the safe way round: nothing keeps signing in to accounts with nobody watching.
+
+---
+
+## 2026-09-18 — The bot no longer gives up on a date after one failed grab (Issue #77)
+
+**What was wrong:** When a booking attempt failed, the bot quietly blocked that date for **15 minutes** and refused to try it again. Worse, the Telegram alert never mentioned this — it kept reporting the date as available every round. So you saw "in range slots available" over and over while nothing was ever booked, with no way to tell why. That is the problem you hit today.
+
+The old block existed for a reason — the site sometimes lists a date that cannot actually be clicked, and without a skip the bot would waste ~90 seconds on that phantom every single round and never check your other cities. But it could not tell a phantom from a slot that simply failed once because the page was slow, the site throttled us, or the VPN switched IP mid-attempt. It treated all of them as hopeless.
+
+**What it does now:** A date is **never given up on** while the site still lists it.
+
+- Every cycling round that sees an in-range date **tries to book it** — no skip, no condition
+- If the grab fails, cycling restarts as usual and the **same date is tried again** next round
+- Only after **6 failed rounds in a row** does that one date rest for **2 to 5 minutes**
+- After the rest, the count resets and it gets another 6 rounds
+- This repeats for as long as the site lists the date
+
+"Slot taken" is no longer treated as final either — the site is sometimes wrong, and the date may still hold other times, so it gets retried like anything else.
+
+**Resting affects one date only.** While a date rests, every ticked location is still checked every round at the same speed. If the same city has a *different* date in range, it books it instantly. If *another* city has one, it books that instantly. Only hammering the one date that just failed 6 times is paused.
+
+**What changed for you:** Far more booking attempts on a real slot instead of one attempt and a 15-minute silence. Telegram is now honest: a resting date shows with a ⏸️ next to it in the slots overview, and you get a "DATE RESTING" message saying which date, how many rounds it failed and how long it will rest. You will also see "GRAB GAVE UP THIS ROUND" instead of the old wording, because it is no longer giving up — just moving on and coming back.
+
+## 2026-09-15 — Booked clients move out of the working list, and you can see the money (Issue #75)
+
+**What it does:** Once an appointment is confirmed, that client leaves the list you watch all day and moves into a **Booked** section, where you can record what they have paid and see what is still owed.
+
+**The four views.** Above the client list there are now four buttons with live counts:
+
+- **Active** — the default, and the only one you need open while hunting. It leaves out anyone already booked and anyone whose dates have lapsed, so what is on screen is genuinely still being worked.
+- **Booked** — clients whose OFC and consular are both done.
+- **Expired** — the lapsed ones, from the last build.
+- **All** — everything, as before.
+
+The counts update on their own, so you can see the split without clicking into each one.
+
+**Booked means BOTH appointments are done.** A booking is two separate things — the OFC (biometrics) visit and the consular interview — and the job is only finished when a client has both. Until now the engine marked a client "confirmed" when **either** one went through, so somebody who had only done their OFC looked finished and quietly dropped out of your working list, with their full fee counted as earned.
+
+Now each half is recorded as it happens, and:
+
+- **Both done** → the client moves to **Booked** and their money counts.
+- **Only one done** → they **stay in Active** with a line on their card saying which half is outstanding: *"OFC done — consular interview still to book"*, or the other way round. They stay in front of you until it is actually finished.
+
+The Booked table has a **Booked what** column showing OFC and Consular, so you can see at a glance what a client actually has.
+
+**Your existing bookings were not disturbed.** Clients confirmed before this change have no record of which half was which. So: if the new detail is there it is used; if not, their slot history is checked, which does record OFC and consular separately; and if neither can say, the client is left as booked exactly as before and marked **pre-existing** in the table. Nobody already booked disappears from the list.
+
+**The Booked section is a table, not cards.** Cards are for watching something happen; once it has happened you are checking it off. Each row shows the client, the day they were booked, **the appointment they actually got** (date and consulate, pulled from their slot history), how many applicants, the agreed amount, what they have paid, and what is left. An OFC booking is tagged as such so it is not confused with an interview.
+
+**Recording payments.** There is a **Paid** box on each row — type the amount and it saves straight away. There is also an **Amount Received** field in the client's edit form if you would rather put it in there. Enter more than the agreed price and it quietly trims it back, because that is a typo and it would otherwise make the totals go negative.
+
+**The three numbers at the top:**
+
+- **Collected** — what has actually come in, added up across every booked client.
+- **Outstanding** — what is still owed, with a count of how many people owe it, and a bar showing the split.
+- **Still hunting** — the value of everyone not booked yet, so you can see what is still in play.
+
+**Why "collected" is a real number and not a guess.** The alternative was to treat every booking as paid in full and add up the agreed prices. That reads nicely and is wrong the moment anyone pays an advance — it would tell you money had arrived that has not, and Outstanding would always show zero. A booking and a payment are two different events, so they are recorded separately.
+
+**Staff cannot see any of it.** The money block, the Paid column and the Amount Received field are all hidden in staff view, under exactly the same rule that already hides the price on the card.
+
+**What changed for you:** Your working list gets shorter — booked and lapsed clients are no longer in it. Nothing was edited: every client keeps the status the engine gave them, amounts start at zero until you enter them, and the booking side is untouched.
+
+---
+
+## 2026-09-15 — Filter clients by month AND year, and fix the year they were saved with (Issue #74)
+
+**What it does:** Adds a **year** dropdown next to the month filter, so you can ask for a specific month of a specific year, and fixes the bug that was putting the wrong year on client date ranges in the first place.
+
+**The filter you asked for.** Pick **March** and **2027**, and you get every client whose promised window covers March 2027 — including someone booked for January-to-December 2027, because March falls inside it. Someone whose window is March–April **2026** no longer shows up. The combinations:
+
+- **Any year + March** — March in any year. This is what the filter did before, and it still does it.
+- **2027 + All months** — anyone whose window touches 2027 at all.
+- **2027 + March** — exactly March 2027.
+
+The year list is built from your actual clients, so it grows on its own. The old code had `2026` and `2027` written into it as loop limits and would simply have stopped working in 2028.
+
+**The bigger problem underneath.** When you paste a client's details in, the system worked out their date range from words like "january and february" — and then stamped **the current year** on it, always. So a client who messaged you this September asking for **January** was saved as January **2026**: a window that had already finished nine months ago. No slot could ever match it, and nothing on screen said anything was wrong.
+
+Three fixes:
+
+1. **If the message says a year, it is used.** "jan 2027", "march to june 2027" — all respected.
+2. **If it does not, the date rolls forward.** In September, "January" means next January, not the one that has already gone.
+3. **Ranges that wrap a new year work.** "Nov and Feb" used to produce November 2026 to February **2026** — backwards, and matching nothing. It now means November this year to February next.
+
+**Why you could not see this happening.** The client cards showed dates as "01 Jul — 31 Oct" with **no year at all**. A range saved as 2026 instead of 2027 looked identical to a correct one. Cards now show the year whenever it is not the current one, and on both ends when a range crosses into a new year.
+
+**Finding the ones already saved wrong.** Any client whose window has already ended is flagged in red on their card with the word **expired**, and the year is always shown on those so you can see immediately what went wrong. There is an **Expired only** tick box next to the filters that lists just those clients, so you can work through and correct them. Nothing is changed automatically — these are your client commitments, so the corrections are yours to make.
+
+**The heatmap now says which dates it covers.** It was showing a pattern with no indication of the period, which was misleading, because slot history is capped and older records get pruned — so "everything" silently becomes a moving window. There are now **7d / 30d / All** buttons above it, and a line underneath saying exactly what is on screen, e.g. "last 30 days · 313 of 426 stored slots", or the real first and last dates when you choose All. If the history has hit its storage cap it says so, rather than implying it has the full picture.
+
+**What changed for you:** Filters behave as before until you use the new year dropdown. No client data was edited. The booking engine is untouched.
+
+---
+
 ## 2026-08-28 — IP changing: no limit, and four countries (Issue #73)
 
 **What it does:** Two changes to the automatic IP switching. First, the old "only 3 IP changes per hour" limit is gone — when the site blocks you, the bot now changes IP as many times as it takes. Second, it no longer only uses American servers. It now picks from **25 locations across the US, Canada, Australia and Italy**, and never picks the one it is already on.

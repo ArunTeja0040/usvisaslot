@@ -243,6 +243,17 @@
     }
   }
 
+  // #75 Which half of the booking just completed. OFC (biometrics) and the
+  // consular interview are separate appointments; a client is only finished
+  // when both exist. Returned as `extra` so updateUserStatus merges it and the
+  // half recorded earlier survives.
+  function bookingHalfStamp(outcome) {
+    const now = new Date().toISOString();
+    return outcome === "ofc_submitted"
+      ? { confirmedAt: now, ofcBookedAt: now }
+      : { confirmedAt: now, interviewBookedAt: now };
+  }
+
   function updateUserStatus(username, status, extra) {
     if (!username) return;
     chrome.storage.local.get(["userStatuses"], (data) => {
@@ -519,23 +530,37 @@
 
   // Build + send the per-city in-range / out-of-range availability overview
   // (same format the sequential path uses). dates = array of "YYYY-MM-DD" strings.
-  function sendSlotsOverview(cityName, dates, startDate, endDate) {
+  function sendSlotsOverview(cityName, dates, startDate, endDate, cityValue) {
     if (!dates || !dates.length) return;
     const inRange = dates.filter((d) => isDateInRange(d, startDate, endDate)).sort();
     const outOfRange = dates.filter((d) => !isDateInRange(d, startDate, endDate)).sort();
+    // #77 A resting date is still listed by the site but is not being grabbed
+    // this round. Say so — reporting it as plainly available is what made the
+    // old dead-slot block invisible: the alert claimed a slot was there while
+    // the booker was quietly skipping it.
+    const paused = cityValue
+      ? inRange.filter((ds) => isSlotPaused(cityValue, ds))
+      : [];
+    const pausedSet = new Set(paused);
     const byMonth = (arr) => {
       const m = {};
       arr.forEach((ds) => {
         const date = new Date(ds + "T00:00:00");
         const key = date.toLocaleString("en-US", { month: "long", year: "numeric" });
-        (m[key] = m[key] || []).push(date.getDate());
+        const day = date.getDate();
+        // Keep the number for sorting; the label carries the resting marker.
+        (m[key] = m[key] || []).push({ day, label: pausedSet.has(ds) ? `${day}⏸️` : String(day) });
       });
       return Object.entries(m)
-        .map(([mo, days]) => `${mo}: ${days.sort((a, b) => a - b).join(", ")}`)
+        .map(([mo, days]) =>
+          `${mo}: ${days.sort((a, b) => a.day - b.day).map((x) => x.label).join(", ")}`)
         .join("\n");
     };
     const inText = byMonth(inRange);
     const outText = byMonth(outOfRange);
+    const pausedNote = paused.length
+      ? `\n⏸️ <b>Resting (${paused.length}):</b> failed ${GRAB_ROUNDS_BEFORE_PAUSE} rounds, retried shortly\n`
+      : "";
     chrome.storage.local.get(["loginDetails", "userProfilesList", "__supabase_device_name"], (d) => {
       const u = d.loginDetails?.username || "";
       const profile = (d.userProfilesList || []).find((p) => p.username === u) || {};
@@ -551,7 +576,7 @@
         (visaType ? `🎫 <b>Visa:</b> ${visaType}\n` : "") +
         `🔄 <b>Round:</b> ${cycling.round} (parallel)\n\n` +
         `📅 <b>Available:</b> ${dates.length} dates\n\n` +
-        `✅ <b>IN RANGE (${inRange.length}):</b>\n` + (inText || "None") + `\n` +
+        `✅ <b>IN RANGE (${inRange.length}):</b>\n` + (inText || "None") + `\n` + pausedNote +
         `\n❌ <b>OUT OF RANGE (${outOfRange.length}):</b>\n` + (outText || "None") + `\n`;
       trackEvent(EVENT_TYPES.CYCLING, `Slots overview (parallel) for ${cityName}: ${inRange.length} in range, ${outOfRange.length} out of range`, u);
       sendTelegramNotification("availability", msg);
@@ -2112,6 +2137,253 @@
         }
       }, 500);
     });
+  }
+
+  // ─── VERIFY-ONLY LOGIN (issue #76) ──────────────────────────────────
+  // Tests whether a client's stored credentials still work, without ever
+  // entering the booking flow.
+  //
+  // SAFETY: this deliberately uses its own storage key and NEVER sets
+  // `activeAutomationUser`. Every booking/cycling path in this file is gated
+  // on that key, so a verify run structurally cannot start hunting slots —
+  // it is not a flag that has to be remembered, it is the absence of the
+  // thing that makes booking happen.
+
+  const VERIFY_KEY = "__abVerifyUser";       // username currently being checked
+  const VERIFY_HEALTH_KEY = "__abLoginHealth";
+  const VERIFY_STARTED_KEY = "__abVerifyStartedAt";
+  const VERIFY_PHASE_KEY = "__abVerifyPhase";   // "signing_out" while ending a session
+  const VERIFY_TIMEOUT_MS = 3 * 60 * 1000;   // whole check must finish inside this
+  const SEC_MAX_SUBMITS = 2;                 // never re-answer forever
+
+  const VERIFY_STATE = {
+    HEALTHY: "healthy",                 // reached the dashboard
+    SECURITY_MISMATCH: "security_mismatch", // password ok, our saved answers are not
+    PASSWORD_CHANGED: "password_changed",   // credentials rejected
+    CAPTCHA_FAIL: "captcha_fail",       // OCR could not get through — inconclusive
+    BLOCKED: "blocked",                 // Cloudflare / rate limit — inconclusive
+    TIMEOUT: "timeout",                 // nothing conclusive in time
+  };
+
+  function getVerifyUser() {
+    return new Promise((r) => {
+      chrome.storage.local.get([VERIFY_KEY], (d) => r(d[VERIFY_KEY] || null));
+    });
+  }
+
+  function recordLoginHealth(username, state, detail) {
+    if (!username) return Promise.resolve();
+    return new Promise((resolve) => {
+      chrome.storage.local.get([VERIFY_HEALTH_KEY], (d) => {
+        const all = d[VERIFY_HEALTH_KEY] || {};
+        all[username] = { state, detail: detail || "", checkedAt: new Date().toISOString() };
+        chrome.storage.local.set({ [VERIFY_HEALTH_KEY]: all }, resolve);
+      });
+    });
+  }
+
+  // Ends the check: records the result, clears verify state, signs out so the
+  // Chrome profile is clean for the next client in the sweep.
+  async function finishVerify(username, state, detail) {
+    log(`[verify] ${username} → ${state}${detail ? " (" + detail + ")" : ""}`);
+    // Per-client counter — the sweep reuses one tab, so it must not carry over.
+    sessionStorage.removeItem("__abVerifySecTries");
+    await recordLoginHealth(username, state, detail);
+    trackEvent(EVENT_TYPES.LOGIN, `Login check: ${state}`, username);
+
+    // #76 Put the client back to idle. Getting here means the check is over,
+    // but the login left them on "logging_in"/"security_questions" — both of
+    // which count as ACTIVE locally and in Supabase. Left set, the card keeps
+    // claiming the client is running on this device, the "cycling now" figure
+    // counts checks as live runs, and a later sweep skips them as busy.
+    updateUserStatus(username, "idle");
+
+    // A rejected login has no session to end, so the check is over now.
+    const hasSession = state === VERIFY_STATE.HEALTHY || state === VERIFY_STATE.SECURITY_MISMATCH;
+    if (!hasSession) {
+      await new Promise((r) => chrome.storage.local.remove(
+        [VERIFY_KEY, VERIFY_STARTED_KEY, VERIFY_PHASE_KEY,
+         "loginDetails", "securityQuestions", "is_auto-dashboard"], r));
+      return;
+    }
+
+    // #76 We DO have a session. Hold the verify key until sign-out has actually
+    // landed — the sweep advances on that key disappearing, and with no gap
+    // between clients it would otherwise start the next login while this
+    // sign-out was still in flight, land on a still-authenticated page, and
+    // report the wrong client healthy.
+    await new Promise((r) => chrome.storage.local.set({ [VERIFY_PHASE_KEY]: "signing_out" }, r));
+    await verifySignOut();
+  }
+
+  async function verifySignOut() {
+    const link = document.querySelector(
+      'a[href*="LogOff"], a[href*="sign-out"], a[href*="signout"], a[href*="logout"], a[aria-label="Sign out"]');
+    if (link) {
+      log("[verify] signing out");
+      await sleep(800);
+      link.click();
+      return true;
+    }
+    // #76 No sign-out link on this page. Leaving a live session behind would
+    // collide with the next client in the sweep, so land on the dashboard
+    // where the link does exist and let the router sign out there.
+    log("[verify] no sign-out link here — going to dashboard to sign out");
+    await new Promise((r) => chrome.storage.local.set({ __abVerifySignOut: true }, r));
+    window.location.href = "https://www.usvisascheduling.com/en-US/";
+    return false;
+  }
+
+  function verifyTimedOut(startedAt) {
+    if (!startedAt) return false;
+    return Date.now() - new Date(startedAt).getTime() > VERIFY_TIMEOUT_MS;
+  }
+
+  // Watches the login page after credentials are submitted. The site either
+  // navigates away (success) or keeps us here with an error (rejected).
+  async function watchVerifyLoginOutcome(username) {
+    const deadline = Date.now() + 90000;
+
+    while (Date.now() < deadline) {
+      if (__abortAll) return;
+      await sleep(1000);
+
+      // Navigated off the login form — the next page load routes itself.
+      if (!window.location.hostname.toLowerCase().includes("b2clogin.com")) return;
+      if (isSecurityQuestionsPage()) return;
+
+      const errorEl = document.getElementById("claimVerificationServerError");
+      const errText = (errorEl?.textContent || "").trim();
+      if (!errText) continue;
+
+      // CAPTCHA errors are the OCR retry loop's business, not ours.
+      if (/captcha/i.test(errText)) continue;
+
+      // #76 Anything else surfacing on the credential step means the username
+      // or password was rejected. The exact wording is captured here so the
+      // first real sweep makes this precise rather than inferred.
+      await finishVerify(username, VERIFY_STATE.PASSWORD_CHANGED, errText.slice(0, 200));
+      return;
+    }
+
+    // Still sitting on the login form with nothing conclusive.
+    if (window.location.hostname.toLowerCase().includes("b2clogin.com") && !isSecurityQuestionsPage()) {
+      const stillOnForm = !!document.getElementById("signInName");
+      await finishVerify(
+        username,
+        stillOnForm ? VERIFY_STATE.CAPTCHA_FAIL : VERIFY_STATE.TIMEOUT,
+        stillOnForm ? "never got past the login form" : "no conclusive outcome");
+    }
+  }
+
+  // b2clogin.com while a check is running.
+  // #76 The security-questions page states the outcome itself: "Answers did not
+  // match. New questions have been selected. Please try again." Reading that is
+  // the whole point — without it the check just answers the NEW questions, gets
+  // those wrong too, and ping-pongs between question sets forever.
+  const SEC_MISMATCH_PATTERNS = [
+    /answers?\s+did\s+not\s+match/i,
+    /new\s+questions\s+have\s+been\s+selected/i,
+    /incorrect\s+answer/i,
+  ];
+
+  function securityQuestionsError() {
+    const candidates = [
+      document.getElementById("claimVerificationServerError"),
+      document.querySelector("#attributeVerification .error"),
+      document.querySelector(".error.itemLevel"),
+      document.querySelector("#api .error"),
+    ].filter(Boolean);
+
+    for (const el of candidates) {
+      const txt = (el.textContent || "").trim();
+      if (txt && SEC_MISMATCH_PATTERNS.some((re) => re.test(txt))) return txt;
+    }
+
+    // Fall back to the form region's own text — the markup for this error is
+    // not guaranteed to sit in any of the containers above. Start at the match
+    // itself so surrounding page furniture ("User Details…") stays out of it.
+    const api = document.getElementById("api");
+    const txt = (api ? api.textContent : "").replace(/\s+/g, " ").trim();
+    for (const re of SEC_MISMATCH_PATTERNS) {
+      const m = re.exec(txt);
+      if (!m) continue;
+      const from = txt.slice(m.index);
+      const stop = from.search(/(?<=\.)\s/);          // end of that sentence, if any
+      return (stop > 0 ? from.slice(0, stop) : from).slice(0, 160).trim();
+    }
+    return null;
+  }
+
+  async function handleVerifyLoginPage(username) {
+    const startedAt = await new Promise((r) =>
+      chrome.storage.local.get([VERIFY_STARTED_KEY], (d) => r(d[VERIFY_STARTED_KEY])));
+    if (verifyTimedOut(startedAt)) {
+      await finishVerify(username, VERIFY_STATE.TIMEOUT, "check exceeded its time limit");
+      return;
+    }
+
+    const pageType = await waitForB2CPageReady();
+
+    if (pageType === "security") {
+      // Reaching this page at all proves the password was accepted — the site
+      // only asks these once it is satisfied with the credentials.
+
+      // The site already told us the answers were wrong. Record its own wording
+      // and stop; trying the freshly-served questions would just loop.
+      const stated = securityQuestionsError();
+      if (stated) {
+        await finishVerify(username, VERIFY_STATE.SECURITY_MISMATCH, stated);
+        return;
+      }
+
+      const settings = await getSettings();
+      const saved = settings.securityQuestions || {};
+      const asked = document.querySelectorAll("#attributeList li.Paragraph");
+      let answerable = 0;
+      asked.forEach((item) => {
+        const q = item.querySelector("p.textInParagraph")?.textContent.trim();
+        if (q && findAnswer(saved, q)) answerable++;
+      });
+
+      if (answerable < 2) {
+        await finishVerify(username, VERIFY_STATE.SECURITY_MISMATCH,
+          `password ok; only ${answerable} of ${asked.length} questions had a saved answer`);
+        return;
+      }
+
+      // Belt and braces: even if the wording changes and the check above stops
+      // matching, never submit answers more than twice for one client.
+      const triesKey = "__abVerifySecTries";
+      const tries = parseInt(sessionStorage.getItem(triesKey) || "0", 10);
+      if (tries >= SEC_MAX_SUBMITS) {
+        sessionStorage.removeItem(triesKey);
+        await finishVerify(username, VERIFY_STATE.SECURITY_MISMATCH,
+          `saved answers rejected after ${tries} attempts`);
+        return;
+      }
+      sessionStorage.setItem(triesKey, String(tries + 1));
+
+      log(`[verify] password ok, submitting security answers (attempt ${tries + 1})`);
+      await handleSecurityQuestions(saved);
+      return;   // the dashboard branch finishes the check
+    }
+
+    if (pageType === "unknown") {
+      await finishVerify(username, VERIFY_STATE.TIMEOUT, "login page never loaded");
+      return;
+    }
+
+    const settings = await getSettings();
+    if (!settings.loginDetails?.username || !settings.loginDetails?.password) {
+      await finishVerify(username, VERIFY_STATE.TIMEOUT, "no stored credentials");
+      return;
+    }
+
+    log(`[verify] submitting credentials for ${username}`);
+    updateUserStatus(username, "logging_in");
+    runLogin(settings);              // reuses the proven fill + CAPTCHA path
+    await watchVerifyLoginOutcome(username);
   }
 
   async function handleLoginPage() {
@@ -3839,18 +4111,56 @@
   // site's own data-arrival events (no waits/polls): days → pick date → times → pick time → submit.
   // Dry-run when TEST_FORCE_NO_SUBMIT (stops before final submit, logs WOULD BOOK).
   let __fastGrabbing = false;
-  // Slots tried hard (full retry budget) but un-bookable — skip for a while so we don't
-  // re-grab the same un-clickable date every round. key `${cityValue}|${dateStr}` → expiry ms.
-  const __deadSlots = {};
-  const DEAD_SLOT_TTL_MS = 15 * 60 * 1000; // 15 min
-  function isDeadSlot(cityValue, dateStr) {
-    const k = `${cityValue}|${dateStr}`;
-    const exp = __deadSlots[k];
-    if (!exp) return false;
-    if (Date.now() > exp) { delete __deadSlots[k]; return false; }
+  // #77 An in-range date is NEVER permanently abandoned while the site still
+  // lists it. Every cycling round that finds it attempts a full booking — no
+  // skip, no constraint. Only after GRAB_ROUNDS_BEFORE_PAUSE failed rounds in a
+  // row does that ONE city+date rest briefly, then the count resets and it is
+  // tried again. Repeats for as long as the site keeps listing it.
+  //
+  // This replaces the old 15-minute "dead slot" block, which abandoned a date
+  // after a single failed grab — including failures that were only transient
+  // (throttle, slow calendar, a VPN rotation cutting the tunnel mid-grab) —
+  // while the availability alert kept reporting that same date as bookable.
+  //
+  // Scanning is never affected. During a pause every ticked location is still
+  // swept each round, and any OTHER city, or any other date at the same city,
+  // is booked immediately.
+  const __grabTries = {};                    // `${cityValue}|${dateStr}` → { fails, pausedUntil }
+  const GRAB_ROUNDS_BEFORE_PAUSE = 6;        // failed cycling rounds before this date rests
+  const GRAB_PAUSE_MIN_MS = 2 * 60 * 1000;   // 2 min
+  const GRAB_PAUSE_MAX_MS = 5 * 60 * 1000;   // 5 min
+
+  function grabKey(cityValue, dateStr) { return `${cityValue}|${dateStr}`; }
+
+  // True only while this exact city+date is resting. Booking-only — scanning
+  // and every other city/date are untouched.
+  function isSlotPaused(cityValue, dateStr) {
+    const t = __grabTries[grabKey(cityValue, dateStr)];
+    if (!t || !t.pausedUntil) return false;
+    if (Date.now() >= t.pausedUntil) {
+      t.pausedUntil = 0;   // rest served — start a fresh run of rounds on it
+      t.fails = 0;
+      return false;
+    }
     return true;
   }
-  function markDeadSlot(cityValue, dateStr) { __deadSlots[`${cityValue}|${dateStr}`] = Date.now() + DEAD_SLOT_TTL_MS; }
+
+  // One cycling round ended without booking this city+date.
+  function recordGrabFailure(cityValue, dateStr) {
+    const k = grabKey(cityValue, dateStr);
+    const t = __grabTries[k] || (__grabTries[k] = { fails: 0, pausedUntil: 0 });
+    t.fails++;
+    if (t.fails >= GRAB_ROUNDS_BEFORE_PAUSE) {
+      const ms = GRAB_PAUSE_MIN_MS + Math.random() * (GRAB_PAUSE_MAX_MS - GRAB_PAUSE_MIN_MS);
+      t.pausedUntil = Date.now() + ms;
+      return { fails: t.fails, paused: true, pauseMin: Math.round(ms / 60000) };
+    }
+    return { fails: t.fails, paused: false };
+  }
+
+  // Booked, or the date dropped off the feed — forget it, so a later
+  // reappearance starts again from round 1.
+  function clearGrabHistory(cityValue, dateStr) { delete __grabTries[grabKey(cityValue, dateStr)]; }
 
   // Fast-grab with retry loop (#41): re-poke the same city to reload a slow calendar,
   // up to MAX_ATTEMPTS. Exit to normal scanning when no in-range date is left, slot taken,
@@ -3956,7 +4266,11 @@
         trackEvent(EVENT_TYPES.BOOKING, `Submitted ${cityName} ${targetDate} ${pickedTime} (${ms}ms)`, u);
         const outcome = await waitForBookingOutcome(15000);
         if (outcome === "confirmed" || outcome === "ofc_submitted") {
-          updateUserStatus(u, "confirmed", { confirmedAt: new Date().toISOString() });
+          // #75 A client counts as fully booked only once BOTH halves are done.
+          // The status value stays "confirmed" so nothing downstream changes;
+          // these timestamps are what lets the dashboard tell the halves apart.
+          // updateUserStatus merges `extra`, so the other half is never lost.
+          updateUserStatus(u, "confirmed", bookingHalfStamp(outcome));
           updateSlotHistoryAction(u, cityName, targetDate, outcome === "confirmed" ? "confirmed" : "submitted");
           sendTelegramNotification("confirmed",
             `🎉 <b>VAC BOOKED!</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n🕐 <b>${pickedTime || "first slot"}</b>\n✅ ${outcome === "ofc_submitted" ? "OFC submitted → consular next" : "Confirmed"}\n⏱️ Booked in ${ms}ms`);
@@ -3987,16 +4301,18 @@
           }
 
           if (outcome2 === "confirmed" || outcome2 === "ofc_submitted") {
-            updateUserStatus(u, "confirmed", { confirmedAt: new Date().toISOString() });
+            updateUserStatus(u, "confirmed", bookingHalfStamp(outcome2));   // #75
             updateSlotHistoryAction(u, cityName, targetDate, outcome2 === "confirmed" ? "confirmed" : "submitted");
             sendTelegramNotification("confirmed",
               `🎉 <b>VAC BOOKED (after retry)!</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n🕐 <b>${pickedTime || "slot"}</b>\n✅ ${outcome2 === "ofc_submitted" ? "OFC submitted → consular next" : "Confirmed"}`);
             booked = true; break;
           }
           if (outcome2 === "failed") {
-            log("[fastgrab] slot genuinely taken during retries");
-            markDeadSlot(cityValue, targetDate);
-            sendTelegramNotification("error", `❌ <b>SLOT TAKEN</b>\n\n👤 ${u}\n📍 ${cityName} ${targetDate}\nSomeone booked it first`);
+            // #77 "Taken" is NOT final — the site is sometimes wrong, and the
+            // date may still hold other times. Counted as a failed round like
+            // any other, so the next round tries it again.
+            log("[fastgrab] site reported slot taken during retries");
+            sendTelegramNotification("error", `❌ <b>SLOT TAKEN</b>\n\n👤 ${u}\n📍 ${cityName} ${targetDate}\nSomeone booked it first — will retry next round`);
             resumeScan = true; break;
           }
           // Still throttled (or ambiguous). Do NOT blindly re-submit — but do
@@ -4023,17 +4339,33 @@
         break;
       }
 
-      // Exhausted attempts without booking on a still-listed date → mark dead so we don't
-      // re-grab the same un-clickable slot every round.
+      // #77 Calendar/time never became usable within the attempt budget. Still
+      // not final — the round is counted below and the date is tried again.
       if (!booked && !resumeScan && !__abortAll) {
-        markDeadSlot(cityValue, lastTriedDate);
-        sendTelegramNotification("error", `⚠️ <b>GRAB GAVE UP</b>\n\n👤 ${u}\n${cityName} ${lastTriedDate}\n❌ Couldn't load/click after ${MAX_ATTEMPTS} tries — skipping it ${Math.round(DEAD_SLOT_TTL_MS / 60000)}min, back to scanning`);
+        sendTelegramNotification("error", `⚠️ <b>GRAB GAVE UP THIS ROUND</b>\n\n👤 ${u}\n${cityName} ${lastTriedDate}\n❌ Couldn't load/click after ${MAX_ATTEMPTS} tries — back to scanning, will retry next round`);
       }
     } catch (e) {
       log("[fastgrab] error: " + e.message);
       sendTelegramNotification("error", `⚠️ <b>GRAB ERROR</b>\n\n👤 ${u}\n${cityName} ${dateStr}\n❌ ${e.message}`);
     } finally {
       __fastGrabbing = false;
+    }
+
+    // #77 Exactly one outcome is recorded per round, here rather than at each
+    // break site above, so every non-booking exit counts once and only once.
+    if (booked) {
+      clearGrabHistory(cityValue, lastTriedDate);
+    } else if (!__abortAll) {
+      const st = recordGrabFailure(cityValue, lastTriedDate);
+      if (st.paused) {
+        log(`[fastgrab] ${cityName} ${lastTriedDate} failed ${st.fails} rounds — resting THIS DATE ${st.pauseMin}min; all locations keep cycling`);
+        sendTelegramNotification("rate",
+          `⏸️ <b>DATE RESTING</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${lastTriedDate}</b>\n` +
+          `❌ Failed ${st.fails} rounds in a row\n⏳ Pausing this date ~${st.pauseMin} min, then trying again\n` +
+          `🔄 All other locations and dates keep cycling and booking as normal`);
+      } else {
+        log(`[fastgrab] ${cityName} ${lastTriedDate} failed round ${st.fails}/${GRAB_ROUNDS_BEFORE_PAUSE} — retrying next round`);
+      }
     }
 
     // Resume hunting unless we actually booked (or were aborted).
@@ -4822,10 +5154,10 @@
           } else if (r.dates.length) {
             found.push(`${r.name}(${r.dates.length})`);
             log(`[parallel] ${r.name}: ${r.dates.length} date(s) → ${r.dates.slice(0, 5).join(", ")}`);
-            sendSlotsOverview(r.name, r.dates, startDate, endDate); // availability ping — every parallel round
+            sendSlotsOverview(r.name, r.dates, startDate, endDate, pid); // availability ping — every parallel round
             // First in-range date wins (user choice: grab first detected)
             if (!grabCity) {
-              const inRange = r.dates.filter((d) => isDateInRange(d, startDate, endDate) && !isDeadSlot(pid, d)).sort();
+              const inRange = r.dates.filter((d) => isDateInRange(d, startDate, endDate) && !isSlotPaused(pid, d)).sort();
               if (inRange.length) { grabCity = { value: pid, name: r.name }; grabDate = inRange[0]; }
             }
           } else {
@@ -5171,7 +5503,7 @@
       // pass alreadyOnCity=true to skip the redundant dropdown re-switch.
       // (Replaces the old multi-date retry + grace-period submit block — chosen design
       //  is "grab FIRST in-range, fastest".)
-      const liveInRange = inRange.filter((d) => !isDeadSlot(loc.value, d.Date));
+      const liveInRange = inRange.filter((d) => !isSlotPaused(loc.value, d.Date));
       if (!liveInRange.length) { await sleep(1500); continue; } // all in-range here on cooldown — next location
       const grabDate = liveInRange[0].Date; // first non-dead in-range, sorted ascending
       log(`[unified] sequential in-range at ${loc.name} → fast-grab ${grabDate}`);
@@ -5625,11 +5957,63 @@
       return;
     }
 
+    // #76 A sign-out from a credential check has landed. Any page load at all
+    // after that click means the session is gone, so the check is complete —
+    // clear it here, which is what lets the sweep move to the next client.
+    // MUST run before the verify-login branch below, or we would sign the same
+    // client straight back in and loop.
+    const verifyPhase = await new Promise((r) =>
+      chrome.storage.local.get([VERIFY_PHASE_KEY], (d) => r(d[VERIFY_PHASE_KEY] || null)));
+    if (verifyPhase === "signing_out") {
+      log("[verify] sign-out landed — check complete");
+      await new Promise((r) => chrome.storage.local.remove(
+        [VERIFY_KEY, VERIFY_STARTED_KEY, VERIFY_PHASE_KEY,
+         "loginDetails", "securityQuestions", "is_auto-dashboard"], r));
+      return;
+    }
+
     if (host.includes("b2clogin.com")) {
       sessionStorage.removeItem("__ab401RetryCount");
+      // #76 A credential check is running — verify-only path, never booking.
+      const verifyUser = await getVerifyUser();
+      if (verifyUser) {
+        log(`On b2clogin.com — verify-only check for ${verifyUser}`);
+        await handleVerifyLoginPage(verifyUser);
+        return;
+      }
       log("On b2clogin.com — detecting page type...");
       await handleLoginPage();
       return;
+    }
+
+    // #76 Credential check landed on the site. Getting here at all means the
+    // password was accepted, so the check is done — record it and sign out
+    // WITHOUT touching the booking flow below.
+    if (host.includes("usvisascheduling.com")) {
+      const verifyUser = await getVerifyUser();
+      const pendingSignOut = await new Promise((r) =>
+        chrome.storage.local.get(["__abVerifySignOut"], (d) => r(!!d.__abVerifySignOut)));
+
+      if (pendingSignOut) {
+        await new Promise((r) => chrome.storage.local.remove(["__abVerifySignOut"], r));
+        log("[verify] on site to sign out — doing that now");
+        await verifySignOut();
+        return;
+      }
+
+      if (verifyUser) {
+        if (isCloudflareBlocked()) {
+          await finishVerify(verifyUser, VERIFY_STATE.BLOCKED, "Cloudflare challenge during check");
+          return;
+        }
+        if (isTermsConsentPage()) {
+          // Reaching the terms page still proves the credentials work.
+          await finishVerify(verifyUser, VERIFY_STATE.HEALTHY, "reached terms/consent page");
+          return;
+        }
+        await finishVerify(verifyUser, VERIFY_STATE.HEALTHY, "reached dashboard");
+        return;
+      }
     }
 
     // #59 Terms / Privacy Act consent page. MUST run before the Cloudflare check:

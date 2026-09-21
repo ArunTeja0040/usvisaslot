@@ -597,6 +597,62 @@ header h1 {
   .heat-cell:hover { transform: scale(1.6); position: relative; z-index: 3; }
 }
 
+/* Heatmap range picker + the period it is actually showing (#74) */
+.heat-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.heat-range-picker {
+  display: flex;
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  padding: 2px;
+  gap: 2px;
+}
+
+.heat-range {
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: .04em;
+  padding: 3px 9px;
+  border: none;
+  background: none;
+  color: var(--text-3);
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 160ms ease, color 160ms ease, transform 160ms var(--ease-out);
+}
+
+.heat-range:active { transform: scale(.96); }
+.heat-range.on { background: var(--surface-3); color: var(--text); }
+
+@media (hover: hover) and (pointer: fine) {
+  .heat-range:not(.on):hover { color: var(--text-2); }
+}
+
+.heat-span {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--text-3);
+  margin: -5px 0 11px;
+}
+
+.heat-cap {
+  margin-top: 9px;
+  font-size: 11px;
+  color: var(--text-3);
+  text-wrap: pretty;
+}
+
+/* An already-finished date range — usually a wrong year on intake (#74) */
+.detail-value.date-expired { color: var(--danger); }
+
 .heat-legend {
   display: flex;
   align-items: center;
@@ -804,6 +860,184 @@ textarea { cursor: text; }
 select:focus, input:focus, textarea:focus { border-color: var(--line); }
 ::placeholder { color: var(--text-3); }
 
+/* ── VIEW SWITCHER (#75) ──────────────────────────────────────
+   Active is the working list — it excludes booked and expired, so the
+   grid only holds clients still being hunted. */
+
+.view-switch {
+  display: flex;
+  gap: 2px;
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  padding: 2px;
+  width: max-content;
+  max-width: 100%;
+  margin: 0 0 12px;
+  overflow-x: auto;
+}
+
+.view-btn {
+  font: inherit;
+  font-size: 11.5px;
+  padding: 5px 13px;
+  border: none;
+  background: none;
+  color: var(--text-3);
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: background 160ms ease, color 160ms ease, transform 160ms var(--ease-out);
+}
+
+.view-btn:active { transform: scale(.98); }
+.view-btn.is-on { background: var(--surface-3); color: var(--text); }
+
+@media (hover: hover) and (pointer: fine) {
+  .view-btn:not(.is-on):hover { color: var(--text-2); }
+}
+
+.view-ct {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--text-3);
+  background: var(--bg);
+  padding: 1px 6px;
+  border-radius: 8px;
+}
+
+.view-btn.is-on .view-ct { color: var(--text-2); }
+
+/* ── BOOKED PANEL (#75) ───────────────────────────────────────
+   Once booked you are reconciling, not monitoring — so a table, not
+   cards. Money block is owner-only, same rule as the price row. */
+
+.booked-panel { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+.booked-panel[hidden] { display: none; }
+
+.money-strip {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 13px;
+}
+
+.money-strip[hidden] { display: none; }
+@media (max-width: 860px) { .money-strip { grid-template-columns: 1fr; } }
+
+.money-card {
+  background: var(--surface-1);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-md);
+  padding: 13px 14px;
+}
+
+.money-card .k { font-family: var(--mono); font-size: 9.5px; letter-spacing: .08em; color: var(--text-3); }
+.money-card .v { font-family: var(--mono); font-size: 25px; font-weight: 600; letter-spacing: -.03em; margin-top: 5px; line-height: 1; }
+.money-card .n { font-size: 10.5px; color: var(--text-3); margin-top: 5px; }
+.money-card.got { border-color: rgba(107, 207, 142, .28); }
+.money-card.got .v { color: var(--ok); }
+.money-card.due { border-color: rgba(229, 169, 78, .28); }
+.money-card.due .v { color: var(--accent); }
+.money-card.pipe .v { color: var(--live); }
+
+.money-bar {
+  display: flex;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--surface-3);
+  margin-top: 9px;
+}
+
+.money-bar i { display: block; height: 100%; transition: width 400ms var(--ease-out); }
+#money-bar-got { background: var(--ok); }
+#money-bar-due { background: var(--accent); }
+
+.booked-scroll { overflow: auto; min-height: 0; flex: 1; border: 1px solid var(--line-soft); border-radius: var(--r-md); }
+
+.booked-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+
+.booked-table th {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: .07em;
+  color: var(--text-3);
+  text-align: left;
+  font-weight: 500;
+  padding: 10px;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--line-soft);
+  position: sticky;
+  top: 0;
+  background: var(--surface-1);
+  z-index: 1;
+}
+
+.booked-table th.r, .booked-table td.r { text-align: right; }
+.booked-table td { padding: 9px 10px; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }
+.booked-table tr:last-child td { border-bottom: none; }
+
+@media (hover: hover) and (pointer: fine) {
+  .booked-table tbody tr:hover { background: var(--surface-2); }
+}
+
+.bk-who { font-weight: 600; }
+.bk-sub { font-family: var(--mono); font-size: 9.5px; color: var(--text-3); margin-top: 2px; }
+.bk-mono { font-family: var(--mono); color: var(--text-2); white-space: nowrap; }
+.bk-due { color: var(--accent); }
+.bk-zero { color: var(--text-3); }
+
+.bk-paid {
+  width: 88px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 3px 7px;
+  text-align: right;
+}
+
+.bk-paid:focus { border-color: var(--live); outline: none; }
+
+.pay-pill {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: .05em;
+  padding: 2px 7px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+/* #75 Which halves of the booking are done */
+.bk-halves { white-space: nowrap; }
+
+.half {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: .05em;
+  padding: 2px 6px;
+  border-radius: 3px;
+  margin-right: 4px;
+  background: var(--surface-3);
+  color: var(--text-3);
+  border: 1px solid transparent;
+}
+
+.half.on { background: rgba(107, 207, 142, .14); color: var(--ok); border-color: rgba(107, 207, 142, .24); }
+.half.legacy { background: var(--surface-3); color: var(--text-3); font-style: italic; }
+
+.pay-full { background: rgba(107, 207, 142, .14); color: var(--ok); }
+.pay-part { background: rgba(229, 169, 78, .14); color: var(--accent); }
+.pay-none { background: rgba(241, 111, 111, .13); color: var(--danger); }
+
 /* ── USER CARDS (structure kept; internals are Phase 2) ────── */
 
 .user-cards-grid {
@@ -931,6 +1165,74 @@ select:focus, input:focus, textarea:focus { border-color: var(--line); }
 .note-warn  { background: rgba(229, 169, 78, .09);  border-color: rgba(229, 169, 78, .28);  color: var(--accent); }
 .note-live  { background: rgba(79, 209, 197, .08);  border-color: rgba(79, 209, 197, .22);  color: var(--live); }
 .note-block { background: rgba(241, 111, 111, .11); border-color: rgba(241, 111, 111, .34); color: var(--danger); }
+/* #75 Half-booked — one appointment done, the other still to get. */
+.note-half  { background: rgba(229, 169, 78, .08);  border-color: rgba(229, 169, 78, .26);  color: var(--accent); }
+
+/* ── LOGIN SWEEP (#76) ────────────────────────────────────── */
+
+.sweep-bar, .sweep-report {
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 13px 15px;
+  margin-bottom: 12px;
+}
+
+.sweep-bar[hidden], .sweep-report[hidden] { display: none; }
+
+.sweep-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.sweep-head b { font-size: 12.5px; font-weight: 600; }
+.sweep-head .rule { flex: 1; height: 1px; background: var(--line-soft); min-width: 12px; }
+
+.sweep-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--live); flex: none;
+  animation: sweep-pulse 1.8s ease-in-out infinite;
+}
+@keyframes sweep-pulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+
+.sweep-now { font-family: var(--mono); font-size: 11px; color: var(--live); }
+
+/* Paused by a Cloudflare challenge — waiting on a person, not on us. */
+.sweep-bar.is-paused { border-color: rgba(229, 169, 78, .38); background: linear-gradient(100deg, rgba(229, 169, 78, .07), var(--surface-1)); }
+.sweep-bar.is-paused .sweep-now { color: var(--accent); }
+.sweep-bar.is-paused .sweep-track i { background: var(--accent); }
+.sweep-dot.paused { background: var(--accent); animation: none; }
+.sweep-count { font-family: var(--mono); font-size: 11px; color: var(--text-2); }
+
+.sweep-track { height: 5px; background: var(--surface-3); border-radius: 3px; overflow: hidden; margin-top: 11px; }
+.sweep-track i { display: block; height: 100%; width: 0; background: var(--live); border-radius: 3px; transition: width 400ms var(--ease-out); }
+.sweep-note { font-size: 11px; color: var(--text-3); margin-top: 8px; }
+
+.sr-stopped {
+  font-size: 12px; color: var(--accent); margin: 11px 0 0;
+  background: rgba(229, 169, 78, .08); border: 1px solid rgba(229, 169, 78, .26);
+  border-radius: var(--r-sm); padding: 8px 10px;
+}
+
+.sr-tallies { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.sr-tally {
+  font-family: var(--mono); font-size: 11px; padding: 4px 9px; border-radius: var(--r-sm);
+  background: var(--surface-2); border: 1px solid var(--line-soft); color: var(--text-2);
+}
+.sr-tally b { font-weight: 700; }
+.sr-tally.ok  { color: var(--ok);     border-color: rgba(107, 207, 142, .26); }
+.sr-tally.bad { color: var(--danger); border-color: rgba(241, 111, 111, .3); }
+.sr-tally.meh { color: var(--accent); border-color: rgba(229, 169, 78, .26); }
+
+.sr-group { margin-top: 14px; }
+.sr-group h4 { font-family: var(--mono); font-size: 9.5px; letter-spacing: .08em; color: var(--text-3); margin-bottom: 7px; }
+.sr-group ul { list-style: none; display: flex; flex-direction: column; gap: 5px; }
+.sr-group li { font-size: 12.5px; display: flex; gap: 9px; align-items: baseline; flex-wrap: wrap; }
+.sr-why { font-family: var(--mono); font-size: 10.5px; color: var(--danger); }
+.sr-group:last-of-type .sr-why { color: var(--accent); }
+.sr-skip, .sr-allgood { font-size: 12px; color: var(--text-3); margin-top: 13px; }
+.sr-allgood { color: var(--ok); }
+
+/* #76 Credential check — running, and its result */
+.note-checking { background: rgba(79, 209, 197, .08); border-color: rgba(79, 209, 197, .24); color: var(--live); }
+.note-checking span b { font-weight: 600; }
+.note-when { color: var(--text-3); font-size: 10px; }
+.login-ok { color: var(--ok); }
 
 .status-badge {
   font-family: var(--mono);

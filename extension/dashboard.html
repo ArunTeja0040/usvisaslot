@@ -95,6 +95,7 @@
         <h2>User Profiles</h2>
         <div class="filter-bar">
           <button id="add-user-btn" class="btn btn-small btn-green">+ Add User</button>
+      <button id="sweep-start-btn" class="btn btn-small" title="Sign in to every client one at a time to check their credentials still work, then report which ones failed">Check all logins</button>
           <input id="profile-search" type="search" placeholder="🔍 Search name / username" style="padding:5px 8px;border:1px solid #ccc;border-radius:4px;min-width:170px;">
 
           <select id="filter-status">
@@ -121,7 +122,10 @@
             <option value="Other">Other</option>
             <option value="__unset__">Unspecified</option>
           </select>
-          <select id="filter-month">
+          <select id="filter-year" title="Match clients whose date range covers this year">
+            <option value="all">Any year</option>
+          </select>
+          <select id="filter-month" title="Match clients whose date range covers this month">
             <option value="all">All Months</option>
             <option value="1">January</option>
             <option value="2">February</option>
@@ -138,6 +142,36 @@
           </select>
         </div>
       </div>
+
+      <section id="sweep-bar" class="sweep-bar" hidden>
+        <div class="sweep-head">
+          <span class="sweep-dot"></span>
+          <b id="sweep-title">Checking logins</b>
+          <span class="sweep-now" id="sweep-now"></span>
+          <span class="rule"></span>
+          <span class="sweep-count" id="sweep-count"></span>
+          <button type="button" class="btn btn-small btn-green" id="sweep-resume" hidden>Continue now</button>
+          <button type="button" class="btn btn-small" id="sweep-stop">Stop</button>
+        </div>
+        <div class="sweep-track"><i id="sweep-fill"></i></div>
+        <div class="sweep-note" id="sweep-note"></div>
+      </section>
+
+      <section id="sweep-report" class="sweep-report" hidden>
+        <div class="sweep-head">
+          <b id="sweep-report-title">Login check finished</b>
+          <span class="rule"></span>
+          <button type="button" class="btn btn-small" id="sweep-report-close">Dismiss</button>
+        </div>
+        <div id="sweep-report-body"></div>
+      </section>
+
+      <div class="view-switch" id="view-switch" role="tablist" aria-label="Client view">
+        <button type="button" class="view-btn is-on" data-view="active" role="tab" aria-selected="true">Active <span class="view-ct" id="ct-active">0</span></button>
+        <button type="button" class="view-btn" data-view="booked" role="tab" aria-selected="false">Booked <span class="view-ct" id="ct-booked">0</span></button>
+        <button type="button" class="view-btn" data-view="expired" role="tab" aria-selected="false">Expired <span class="view-ct" id="ct-expired">0</span></button>
+        <button type="button" class="view-btn" data-view="all" role="tab" aria-selected="false">All <span class="view-ct" id="ct-all">0</span></button>
+      </div>
       <div id="staff-mode-banner" style="display:none;margin:0 0 10px;padding:8px 12px;background:#8e44ad22;border:1px solid #8e44ad88;border-radius:6px;font-size:12px;color:#ce93d8;">
         <b>Staff view</b> — You are seeing only the clients assigned to you.
       </div>
@@ -152,6 +186,45 @@
         <button id="bulk-assign-btn" class="btn btn-small btn-green">Apply</button>
         <span id="bulk-status" style="font-size:11px;color:#78909c;"></span>
       </div>
+      <section id="booked-panel" class="booked-panel" hidden>
+        <div class="money-strip" id="money-strip">
+          <div class="money-card got">
+            <div class="k">COLLECTED</div>
+            <div class="v" id="money-collected">₹0</div>
+            <div class="n" id="money-collected-note">—</div>
+          </div>
+          <div class="money-card due">
+            <div class="k">OUTSTANDING</div>
+            <div class="v" id="money-outstanding">₹0</div>
+            <div class="n" id="money-outstanding-note">—</div>
+            <div class="money-bar"><i id="money-bar-got"></i><i id="money-bar-due"></i></div>
+          </div>
+          <div class="money-card pipe">
+            <div class="k">STILL HUNTING</div>
+            <div class="v" id="money-hunting">₹0</div>
+            <div class="n" id="money-hunting-note">—</div>
+          </div>
+        </div>
+        <div class="booked-scroll">
+          <table class="booked-table">
+            <thead>
+              <tr>
+                <th>CLIENT</th>
+                <th>BOOKED</th>
+                <th>APPOINTMENT</th>
+                <th>BOOKED WHAT</th>
+                <th class="r">APPL</th>
+                <th class="r owner-only">AGREED</th>
+                <th class="r owner-only">PAID</th>
+                <th class="r owner-only">BALANCE</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="booked-rows"></tbody>
+          </table>
+        </div>
+      </section>
+
       <div id="user-cards" class="user-cards-grid"></div>
     </div>
 
@@ -408,6 +481,7 @@
         </div>
         <div class="form-row two-col">
           <div><label>Price Per Person</label><input type="text" id="edit-price" placeholder="18000"></div>
+          <div><label>Amount Received</label><input type="number" id="edit-paid" min="0" placeholder="0"></div>
           <div><label>Total Price</label><input type="text" id="edit-total-price" readonly style="background:#1a2332;color:#3ecf8e;font-weight:bold;"></div>
         </div>
         <div class="form-section">Automation</div>
