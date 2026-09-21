@@ -12,6 +12,24 @@ Format:
 
 ---
 
+## 2026-09-21 — Dashboard redesign, booked clients, login health, and the booking-retry fix go live (Issues #59 #74 #75 #76 #77)
+
+**What it does:** Everything that had been built and tested in the test build is now the real thing. Four pieces:
+
+**The booking-retry fix (#77) — the important one.** Until today, if a booking attempt failed, the bot quietly blocked that date for **15 minutes** and refused to try it again, while Telegram kept reporting the date as available. That is exactly the problem you saw: dates found, alerts firing, nothing ever booked. Now a date is **never given up on** while the site still lists it. Every round tries again. Only after **6 failed rounds in a row** does that one date rest for 2-5 minutes, then it gets another 6 rounds, and so on. Resting affects one date only — every other location and date keeps being checked and booked as normal. Telegram now marks a resting date with ⏸️ instead of pretending it is available.
+
+**Dashboard redesign (#59).** New header, live counts, notifications and a cleaner layout.
+
+**Year filter and views (#74).** Filter clients by year, with live counts per view.
+
+**Booked clients and money (#75).** A confirmed client moves out of the working list into a **Booked** section where you record what they paid and see what is still owed.
+
+**Login health sweep (#76).** Checks that client logins still work, and reports which ones are failing before you find out the hard way.
+
+**Why:** All of this had been sitting in the test build only. The machines running real clients were still on the old code — including the 15-minute booking block — so the fixes were not reaching anyone.
+
+**What changed for you:** Reload the extension on every machine, owner and staff. The dashboard looks different and the booking behaviour is materially better. Two smaller fixes rode along: the dashboard logo is correct again, and devices are no longer named "TEST-something" when connecting to cloud sync (a test tag that had leaked into production earlier).
+
 ## 2026-08-28 — IP changing: no limit, and four countries (Issue #73)
 **What it does:** Two changes to the automatic IP switching. First, the old "only 3 IP changes per hour" limit is gone — when the site blocks you, the bot now changes IP as many times as it takes. Second, it no longer uses only American servers: it picks from **25 locations across the US, Canada, Australia and Italy**, and never picks the one it is already on.
 **Why:** If a block covers a whole run of American addresses, having only US servers to move between means nowhere left to go. Three more countries widen the escape route a lot. And the 3-per-hour cap could leave a client stuck waiting for you when the fix was one more switch away.

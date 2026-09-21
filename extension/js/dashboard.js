@@ -37,10 +37,129 @@
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   }
 
+  // ─── DATE RANGE HELPERS (issue #74) ────────────────────────────────
+  // Profile dates are plain "YYYY-MM-DD" from <input type="date">, so they
+  // are parsed by string rather than by Date() — no timezone can shift the
+  // month out from under us.
+
+  const monthIndex = (year, month0) => year * 12 + month0;
+
+  function parseYMD(s) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || "").trim());
+    if (!m) return null;
+    const year = +m[1], month0 = +m[2] - 1, day = +m[3];
+    if (month0 < 0 || month0 > 11 || day < 1 || day > 31) return null;
+    return { year, month0, day };
+  }
+
+  // The client's window as inclusive month indices. A missing end is treated
+  // as open-ended, matching how the old filter behaved.
+  function profileMonthSpan(p) {
+    const s = parseYMD(p.startDate);
+    const e = parseYMD(p.endDate);
+    if (!s && !e) return null;
+
+    let start = s ? monthIndex(s.year, s.month0) : -Infinity;
+    let end = e ? monthIndex(e.year, e.month0) : Infinity;
+    // A reversed range is a data-entry error, not "matches nothing" —
+    // normalise so the client still shows up where they should.
+    if (start > end) { const t = start; start = end; end = t; }
+    return { start, end };
+  }
+
+  // ─── BOOKED / VIEWS (issue #75) ────────────────────────────────────
+  // "Booked" is derived from the status the automation already writes, not a
+  // new status value — auto-booking.js sets `confirmed` + `confirmedAt` when
+  // an appointment goes through, and a second source of truth would only
+  // drift from it.
+
+  let clientView = "active";   // active | booked | expired | all
+
+  // A booking is two separate appointments — OFC (biometrics) and the consular
+  // interview — and is only complete when both exist. The engine used to flatten
+  // both into status "confirmed", so a client who had done only OFC looked
+  // finished and dropped out of the working list.
+  //
+  // Resolved in three steps, because existing clients pre-date the timestamps:
+  //   1. the ofcBookedAt / interviewBookedAt stamps the engine now writes
+  //   2. failing that, slotHistory — "submitted" is OFC, "confirmed" is consular
+  //   3. failing that, a legacy "confirmed" with no evidence is grandfathered,
+  //      so nobody already booked silently falls out of the Booked list
+  function bookingHalves(username, statuses, cloudMap, slotHistory) {
+    const local = statuses[username] || {};
+    const cloud = (cloudMap || {})[username] || {};
+    const confirmedStatus = local.status === "confirmed" || cloud.status === "confirmed";
+
+    let ofc = !!(local.ofcBookedAt || cloud.ofcBookedAt);
+    let interview = !!(local.interviewBookedAt || cloud.interviewBookedAt);
+    let source = (ofc || interview) ? "stamps" : null;
+
+    if (!source && slotHistory) {
+      (slotHistory || []).forEach((s) => {
+        if (s.username !== username) return;
+        if (s.action === "submitted") ofc = true;
+        else if (s.action === "confirmed") interview = true;
+      });
+      if (ofc || interview) source = "history";
+    }
+
+    // Grandfathered: confirmed before the halves were tracked, and slot
+    // history no longer carries the evidence (it is capped and pruned).
+    if (!source && confirmedStatus) {
+      return { ofc: true, interview: true, complete: true, source: "legacy", confirmedStatus };
+    }
+
+    return { ofc, interview, complete: ofc && interview, source: source || "none", confirmedStatus };
+  }
+
+  function isBooked(username, statuses, cloudMap, slotHistory) {
+    return bookingHalves(username, statuses, cloudMap, slotHistory).complete;
+  }
+
+  function bookedAt(username, statuses, cloudMap) {
+    const local = statuses[username] || {};
+    const cloud = (cloudMap || {})[username] || {};
+    return local.confirmedAt || cloud.confirmedAt || null;
+  }
+
+  const paidOf = (p) => Math.max(0, Number(p.paidAmount) || 0);
+  const agreedOf = (p) => Math.max(0, Number(p.agreedPrice) || 0);
+  const balanceOf = (p) => Math.max(0, agreedOf(p) - paidOf(p));
+
+  // True when the promised window has already finished. Almost always a
+  // range that was stored with the wrong year on intake.
+  function isRangeExpired(p) {
+    const e = parseYMD(p.endDate);
+    if (!e) return false;
+    const now = new Date();
+    return monthIndex(e.year, e.month0) < monthIndex(now.getFullYear(), now.getMonth());
+  }
+
   function formatDate(dateStr) {
     if (!dateStr) return "—";
     const d = new Date(dateStr + "T00:00:00");
     return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short" });
+  }
+
+  // #74 Card dates used to omit the year entirely, which is exactly why a
+  // range stored as 2026 instead of 2027 was invisible. The year is shown
+  // whenever it is not the current one, and on both ends of a range that
+  // crosses a year boundary so "Nov — Feb 27" cannot be misread.
+  function formatDateY(dateStr, force) {
+    const p = parseYMD(dateStr);
+    if (!p) return "—";
+    const base = formatDate(dateStr);
+    const show = force || p.year !== new Date().getFullYear();
+    return show ? `${base} ${String(p.year).slice(2)}` : base;
+  }
+
+  // `force` is set for an expired range: the year is the whole reason it is
+  // expired, so hiding it would hide the diagnosis.
+  function formatRange(startStr, endStr, force) {
+    const s = parseYMD(startStr), e = parseYMD(endStr);
+    const crossesYear = !!(s && e && s.year !== e.year);
+    const show = force || crossesYear;
+    return `${formatDateY(startStr, show)} — ${formatDateY(endStr, show)}`;
   }
 
   function timeAgo(isoString) {
@@ -72,7 +191,7 @@
   function loadData() {
     return new Promise((resolve) => {
       chrome.storage.local.get(
-        ["userProfilesList", "userStatuses", "eventLog", "slotHistory", "dailyStats", "__storageStats"],
+        ["userProfilesList", "userStatuses", "eventLog", "slotHistory", "dailyStats", "__storageStats", "__abLoginHealth", "__abVerifyUser", "__abSweep"],
         (data) => resolve({
           profiles: data.userProfilesList || [],
           statuses: data.userStatuses || {},
@@ -80,6 +199,9 @@
           slotHistory: data.slotHistory || [],
           dailyStats: data.dailyStats || {},
           storageStats: data.__storageStats || null,
+          loginHealth: data.__abLoginHealth || {},
+          verifyUser: data.__abVerifyUser || null,
+          sweep: data.__abSweep || null,
         })
       );
     });
@@ -121,17 +243,246 @@
 
   // ─── USER CARDS ────────────────────────────────────────────────────
 
-  function renderUserCards(profiles, statuses, slotHistory) {
-    const container = document.getElementById("user-cards");
+  // ─── BOOKED VIEW + MONEY (issue #75) ───────────────────────────────
 
-    // Cards redraw every 2s. If the owner has an "Assigned to" dropdown open,
-    // redrawing would destroy it mid-choice — so skip this tick.
-    const focused = document.activeElement;
-    if (focused && focused.tagName === "SELECT" && container.contains(focused)) return;
+  let bookedSignature = "";
+
+  function viewCloudMap() {
+    const m = {};
+    cloudProfiles.forEach((cp) => {
+      m[cp.username] = {
+        status: cp.status, confirmedAt: cp.confirmedAt, assignedStaffId: cp.assignedStaffId,
+        ofcBookedAt: cp.ofcBookedAt, interviewBookedAt: cp.interviewBookedAt,
+      };
+    });
+    return m;
+  }
+
+  // Counts for the switcher. Independent of the current view, so you can see
+  // the split without clicking through.
+  function updateViewCounts(profiles, statuses, slotHistory) {
+    const cloudMap = viewCloudMap();
+    let booked = 0, expired = 0, active = 0;
+    (profiles || []).forEach((p) => {
+      const b = isBooked(p.username, statuses, cloudMap, slotHistory);
+      const e = isRangeExpired(p);
+      if (b) booked++;
+      if (e) expired++;
+      if (!b && !e) active++;
+    });
+    const set = (id, n) => { const el = document.getElementById(id); if (el && el.textContent !== String(n)) el.textContent = n; };
+    set("ct-active", active);
+    set("ct-booked", booked);
+    set("ct-expired", expired);
+    set("ct-all", (profiles || []).length);
+  }
+
+  // The appointment a booked client actually got, from slot history.
+  function bookedAppointment(username, slotHistory) {
+    let best = null;
+    (slotHistory || []).forEach((s) => {
+      if (s.username !== username) return;
+      if (s.action !== "confirmed" && s.action !== "submitted") return;
+      const t = slotTime(s);
+      if (!best || t > best.t) best = { t, date: s.date, location: s.location, action: s.action };
+    });
+    return best;
+  }
+
+  function renderBookedPanel(profiles, statuses, slotHistory) {
+    const panel = document.getElementById("booked-panel");
+    const tbody = document.getElementById("booked-rows");
+    if (!panel || !tbody) return;
+
+    panel.hidden = clientView !== "booked";
+    if (panel.hidden) return;
+
+    const cloudMap = viewCloudMap();
+    const booked = (profiles || [])
+      .filter((p) => isBooked(p.username, statuses, cloudMap, slotHistory))
+      .map((p) => ({ p, at: bookedAt(p.username, statuses, cloudMap) }))
+      .sort((a, b) => new Date(b.at || 0) - new Date(a.at || 0));
+
+    // Money. Collected is what has actually been recorded as received, not
+    // the agreed price — an advance must not read as paid in full.
+    let collected = 0, agreedTotal = 0, owing = 0;
+    booked.forEach(({ p }) => {
+      collected += paidOf(p);
+      agreedTotal += agreedOf(p);
+      if (balanceOf(p) > 0) owing++;
+    });
+    const outstanding = Math.max(0, agreedTotal - collected);
+
+    let hunting = 0, huntingN = 0;
+    (profiles || []).forEach((p) => {
+      if (isBooked(p.username, statuses, cloudMap, slotHistory) || isRangeExpired(p)) return;
+      hunting += agreedOf(p);
+      huntingN++;
+    });
+
+    const rows = booked.map(({ p, at }) => {
+      const appt = bookedAppointment(p.username, slotHistory);
+      const bal = balanceOf(p);
+      const paid = paidOf(p);
+      const agreed = agreedOf(p);
+      const state = agreed === 0 ? ["pay-none", "No price"]
+        : bal <= 0 ? ["pay-full", "Paid"]
+        : paid > 0 ? ["pay-part", "Part"]
+        : ["pay-none", "Unpaid"];
+      const safeUser = esc(p.username);
+      return `
+        <tr data-username="${safeUser}">
+          <td>
+            <div class="bk-who">${esc(p.name || deriveProfileName(p.username))}</div>
+            <div class="bk-sub">${safeUser}</div>
+          </td>
+          <td class="bk-mono">${at ? formatDateY(String(at).substring(0, 10), true) : "—"}</td>
+          <td class="bk-mono">${appt
+            ? `${esc(appt.date)}<div class="bk-sub">${esc(appt.location)}</div>`
+            : "—"}</td>
+          <td class="bk-halves">${(() => {
+            const h = bookingHalves(p.username, statuses, cloudMap, slotHistory);
+            if (h.source === "legacy") {
+              return `<span class="half legacy" title="Confirmed before the halves were tracked separately, and slot history no longer carries the detail">pre-existing</span>`;
+            }
+            return `<span class="half${h.ofc ? " on" : ""}">OFC</span><span class="half${h.interview ? " on" : ""}">Consular</span>`;
+          })()}</td>
+          <td class="r bk-mono">${p.applicantCount || 1}</td>
+          ${staffMode ? "" : `
+          <td class="r bk-mono">${agreed ? rupees(agreed) : "—"}</td>
+          <td class="r"><input class="bk-paid" type="number" min="0" inputmode="numeric"
+                 value="${paid || ""}" placeholder="0" data-user="${safeUser}"
+                 aria-label="Amount received from ${esc(p.name || p.username)}"></td>
+          <td class="r bk-mono ${bal > 0 ? "bk-due" : "bk-zero"}">${bal > 0 ? rupees(bal) : "—"}</td>`}
+          <td class="r">${staffMode ? "" : `<span class="pay-pill ${state[0]}">${state[1]}</span>`}</td>
+        </tr>`;
+    }).join("");
+
+    const html = rows || `<tr><td colspan="9"><div class="log-empty">No confirmed bookings yet.</div></td></tr>`;
+
+    // Hash-guarded like the cards: this is inside the 2s loop, and rewriting
+    // it every tick would fight whatever is being typed into a Paid box.
+    const sig = hashString(html + collected + outstanding + hunting);
+    if (sig !== bookedSignature) {
+      const typing = document.activeElement && document.activeElement.classList.contains("bk-paid")
+        ? document.activeElement.dataset.user : null;
+      if (!typing) {
+        bookedSignature = sig;
+        tbody.innerHTML = html;
+      }
+    }
+
+    const strip = document.getElementById("money-strip");
+    if (strip) strip.hidden = staffMode;        // owner-only, same rule as the price row
+    if (!staffMode) {
+      const put = (id, v) => { const el = document.getElementById(id); if (el && el.textContent !== v) el.textContent = v; };
+      put("money-collected", rupees(collected));
+      put("money-collected-note", `${booked.length} booked · ${rupees(agreedTotal)} agreed`);
+      put("money-outstanding", rupees(outstanding));
+      put("money-outstanding-note", owing === 0 ? "nothing owed" : `${owing} client${owing === 1 ? "" : "s"} still owe you`);
+      put("money-hunting", rupees(hunting));
+      put("money-hunting-note", `${huntingN} not booked yet`);
+      const pct = agreedTotal > 0 ? (collected / agreedTotal) * 100 : 0;
+      const g = document.getElementById("money-bar-got"), d = document.getElementById("money-bar-due");
+      if (g) g.style.width = pct.toFixed(1) + "%";
+      if (d) d.style.width = (100 - pct).toFixed(1) + "%";
+    }
+  }
+
+  // ─── CARD RECONCILIATION (issue #59) ───────────────────────────────
+  // The grid used to be rebuilt wholesale every 2s, which threw away hover,
+  // focus, text selection and any running transition on all 40-odd cards.
+  // Now each card's markup is hashed and only cards whose content actually
+  // changed touch the DOM. Idle clients stop being redrawn entirely.
+  //
+  // Kill switch: RECONCILE_CARDS = false restores the old innerHTML rebuild.
+
+  const RECONCILE_CARDS = !window.__SH_NO_RECONCILE;
+
+  const CARD_ICON = {
+    warn: '<svg class="ci" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><path d="M12 4.5L21 20H3z"/><path d="M12 10v4M12 17v.1"/></svg>',
+    block: '<svg class="ci" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M6 6l12 12"/></svg>',
+    device: '<svg class="ci" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="12" rx="1.6"/><path d="M8 20h8"/></svg>',
+  };
+
+  // Event type → severity, so the log reads as one ramp instead of ten hues.
+  const LOG_SEVERITY = {
+    slot_found: "found",
+    booking: "ok", confirmed: "ok", captcha: "ok", security: "ok",
+    error: "err",
+    login: "live", dashboard: "live", cycling: "live",
+    queue: "info", session: "info",
+  };
+
+  // djb2 — fast, ample for change detection. Not a security hash.
+  function hashString(s) {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return (h >>> 0).toString(36);
+  }
+
+  // True while the user is mid-interaction inside this card. Replacing it
+  // now would close an open dropdown or drop a half-typed value.
+  function cardIsBusy(el) {
+    const a = document.activeElement;
+    if (!a || a === document.body || !el.contains(a)) return false;
+    return a.tagName === "SELECT" || a.tagName === "INPUT" || a.tagName === "TEXTAREA";
+  }
+
+  function reconcileCards(container, items) {
+    if (!RECONCILE_CARDS) {
+      container.innerHTML = items.map((i) => i.html).join("");
+      return;
+    }
+
+    // Anything without a data-username (the "no users match" placeholder,
+    // or leftovers from the fallback path) is not ours to keep.
+    const existing = new Map();
+    for (const el of Array.from(container.children)) {
+      const u = el.dataset ? el.dataset.username : null;
+      if (u && !existing.has(u)) existing.set(u, el);
+      else el.remove();
+    }
+
+    let prev = null;
+    for (const item of items) {
+      const hash = hashString(item.html);
+      let el = existing.get(item.user);
+
+      if (el) existing.delete(item.user);
+
+      if (!el || (el.dataset.hash !== hash && !cardIsBusy(el))) {
+        const holder = document.createElement("div");
+        holder.innerHTML = item.html.trim();
+        const fresh = holder.firstElementChild;
+        if (fresh) {
+          fresh.dataset.hash = hash;
+          if (el) el.replaceWith(fresh);
+          el = fresh;
+        }
+      }
+      if (!el) continue;
+
+      // Put it in the right slot only when it is not already there, so a
+      // stable list performs zero DOM moves.
+      const expected = prev ? prev.nextElementSibling : container.firstElementChild;
+      if (expected !== el) {
+        if (prev) prev.after(el);
+        else container.prepend(el);
+      }
+      prev = el;
+    }
+
+    existing.forEach((el) => el.remove());
+  }
+
+  function renderUserCards(profiles, statuses, slotHistory, loginHealth, verifyUser) {
+    const container = document.getElementById("user-cards");
 
     const filterStatus = document.getElementById("filter-status").value;
     const filterVisa = document.getElementById("filter-visa")?.value || "all";
     const filterMonth = document.getElementById("filter-month")?.value || "all";
+    const filterYear = document.getElementById("filter-year")?.value || "all";
     const searchTerm = (document.getElementById("profile-search")?.value || "").trim().toLowerCase();
 
     // Build slot stats per user
@@ -156,10 +507,29 @@
       }
     });
 
+    // Cloud status map: username → { status, activeDeviceId, isActive }.
+    // Built before the filter because the view test below needs it.
+    const cloudStatusMap = {};
+    cloudProfiles.forEach((cp) => {
+      cloudStatusMap[cp.username] = {
+        status: cp.status, activeDeviceId: cp.activeDeviceId, isActive: cp.isActive,
+        rateLimitedAt: cp.rateLimitedAt, assignedStaffId: cp.assignedStaffId,
+        confirmedAt: cp.confirmedAt,
+        ofcBookedAt: cp.ofcBookedAt, interviewBookedAt: cp.interviewBookedAt,
+      };
+    });
+
     const filtered = profiles.filter((p) => {
       // Search by name / username
       if (searchTerm) {
-        const hay = (deriveProfileName(p.username) + " " + p.username).toLowerCase();
+        // #59 Locations included so a consulate name finds every client
+        // hunting there — this is what the consulate rail clicks through to.
+        const hay = (
+          deriveProfileName(p.username) + " " +
+          p.username + " " +
+          (p.name || "") + " " +
+          (p.locations || []).join(" ")
+        ).toLowerCase();
         if (!hay.includes(searchTerm)) return false;
       }
       // Status filter
@@ -180,22 +550,46 @@
           return false;
         }
       }
-      // Month filter — show user if selected month falls within their date range
-      if (filterMonth !== "all") {
-        const m = parseInt(filterMonth);
-        const start = p.startDate ? new Date(p.startDate + "T00:00:00") : null;
-        const end = p.endDate ? new Date(p.endDate + "T00:00:00") : null;
-        if (!start && !end) return false;
-        const startMonth = start ? start.getFullYear() * 12 + start.getMonth() + 1 : 0;
-        const endMonth = end ? end.getFullYear() * 12 + end.getMonth() + 1 : 9999;
-        // Check all possible years the user's range spans
-        let monthInRange = false;
-        for (let y = (start ? start.getFullYear() : 2026); y <= (end ? end.getFullYear() : 2027); y++) {
-          const check = y * 12 + m;
-          if (check >= startMonth && check <= endMonth) { monthInRange = true; break; }
+      // #74 Date-range filter. A client matches when the period you picked
+      // OVERLAPS the window you promised them — so filtering "March 2027"
+      // finds anyone whose range is Jan 2027 – Dec 2027, and correctly
+      // misses someone whose range is Mar 2026 – Apr 2026.
+      if (filterYear !== "all" || filterMonth !== "all") {
+        const span = profileMonthSpan(p);
+        if (!span) return false;                 // no usable dates at all
+
+        const y = filterYear === "all" ? null : parseInt(filterYear, 10);
+        const m = filterMonth === "all" ? null : parseInt(filterMonth, 10) - 1;
+
+        let hit;
+        if (y !== null && m !== null) {
+          // One specific month.
+          const idx = monthIndex(y, m);
+          hit = idx >= span.start && idx <= span.end;
+        } else if (y !== null) {
+          // Any part of that calendar year.
+          hit = monthIndex(y, 11) >= span.start && monthIndex(y, 0) <= span.end;
+        } else {
+          // A month in any year — walk only the years the client actually spans.
+          hit = false;
+          const firstYear = Math.floor(span.start / 12);
+          const lastYear = Math.floor(span.end / 12);
+          for (let yy = firstYear; yy <= lastYear; yy++) {
+            const idx = monthIndex(yy, m);
+            if (idx >= span.start && idx <= span.end) { hit = true; break; }
+          }
         }
-        if (!monthInRange) return false;
+        if (!hit) return false;
       }
+
+      // #75 View. Active is the working list, so it drops anyone already
+      // booked and anyone whose window has lapsed.
+      const booked = isBooked(p.username, statuses, cloudStatusMap, slotHistory);
+      const expired = isRangeExpired(p);
+      if (clientView === "active" && (booked || expired)) return false;
+      if (clientView === "booked" && !booked) return false;
+      if (clientView === "expired" && !expired) return false;
+
       return true;
     });
 
@@ -203,12 +597,6 @@
       container.innerHTML = '<div class="log-empty">No users match the filter</div>';
       return;
     }
-
-    // Build cloud status map: username → { status, activeDeviceId, isActive }
-    const cloudStatusMap = {};
-    cloudProfiles.forEach(cp => {
-      cloudStatusMap[cp.username] = { status: cp.status, activeDeviceId: cp.activeDeviceId, isActive: cp.isActive, rateLimitedAt: cp.rateLimitedAt, assignedStaffId: cp.assignedStaffId };
-    });
 
     const myDeviceId = SUPA ? SUPA.getDeviceId() : null;
 
@@ -239,7 +627,7 @@
       return 0; // active groups: keep stable order
     });
 
-    container.innerHTML = filtered.map((profile) => {
+    const cards = filtered.map((profile) => {
       const status = statuses[profile.username] || {};
       const cloud = cloudStatusMap[profile.username] || {};
       // Use local status if active, otherwise prefer cloud
@@ -276,47 +664,58 @@
 
       const locs = (profile.locations || []).map((l) => `<span class="loc-tag">${esc(l)}</span>`).join("");
       const safeUser = esc(profile.username);
+      const rangeExpired = isRangeExpired(profile);
+      // #75 One appointment done, the other still outstanding. These stay in
+      // the working list precisely because the booking is not finished.
+      const halves = bookingHalves(profile.username, statuses, cloudStatusMap, slotHistory);
+      const halfDone = !halves.complete && (halves.ofc || halves.interview);
+      // #76 Result of the last credential check, and whether one is running now.
+      const health = (loginHealth || {})[profile.username] || null;
+      const checking = verifyUser === profile.username;
 
-      return `
+      const html = `
         <div class="${cardClass}" data-username="${safeUser}">
           <div class="card-header">
-            <div style="display:flex;align-items:flex-start;gap:6px;">
-              ${teamMode ? `<input type="checkbox" class="bulk-tick" data-user="${safeUser}" ${bulkSelected.has(profile.username) ? "checked" : ""} title="Select for bulk assign" style="margin-top:3px;">` : ""}
-              <div>
+            <div class="card-ident">
+              ${teamMode ? `<input type="checkbox" class="bulk-tick" data-user="${safeUser}" ${bulkSelected.has(profile.username) ? "checked" : ""} title="Select for bulk assign">` : ""}
+              <div class="card-ident-text">
                 <div class="card-name">${name}</div>
                 <div class="card-username">${safeUser}</div>
               </div>
             </div>
             <span class="status-badge status-${userStatus}">${statusLabel(userStatus)}</span>
           </div>
-          ${teamMode ? `<div style="display:flex;align-items:center;gap:6px;margin:4px 0;font-size:11px;color:#90a4ae;">
+          ${teamMode ? `<div class="card-assign">
             <span>Assigned to</span>
-            <select class="assign-select" data-user="${safeUser}" style="flex:1;padding:3px 5px;background:#0f1923;color:#e0e0e0;border:1px solid #2d3e50;border-radius:3px;font-size:11px;">
+            <select class="assign-select" data-user="${safeUser}">
               ${staffOptionsHtml(cloud.assignedStaffId)}
             </select>
           </div>` : ""}
-          ${activeOnOtherDevice ? `<div style="background:#e74c3c22;border:1px solid #e74c3c55;border-radius:4px;padding:4px 8px;margin:4px 0;font-size:11px;color:#ef5350;">⚠️ Active on <b>${esc(activeDeviceName || "another device")}</b> ${deviceLastSeen ? `(${deviceLastSeen})` : ""} ${isStaleDevice ? '<span style="color:#f39c12;"> — stale</span>' : ""}</div>` : ""}
-          ${isActive && activeDeviceName && !activeOnOtherDevice ? `<div style="font-size:11px;color:#3ecf8e;margin:2px 0;">📍 Running on <b>${esc(activeDeviceName)}</b> ${deviceLastSeen ? `(${deviceLastSeen})` : ""}</div>` : ""}
-          ${isRateLimited ? `<div style="background:#e74c3c33;border:1px solid #e74c3c88;border-radius:4px;padding:6px 8px;margin:4px 0;font-size:11px;color:#ef5350;font-weight:bold;">🔴 RATE LIMITED — blocked for ~${rateLimitHoursLeft}h. Do NOT login this user from any profile.</div>` : ""}
+          ${activeOnOtherDevice ? `<div class="card-note note-warn">${CARD_ICON.warn}<span>Active on <b>${esc(activeDeviceName || "another device")}</b>${deviceLastSeen ? ` (${deviceLastSeen})` : ""}${isStaleDevice ? ` <span class="note-stale">— stale</span>` : ""}</span></div>` : ""}
+          ${isActive && activeDeviceName && !activeOnOtherDevice ? `<div class="card-note note-live">${CARD_ICON.device}<span>Running on <b>${esc(activeDeviceName)}</b>${deviceLastSeen ? ` (${deviceLastSeen})` : ""}</span></div>` : ""}
+          ${isRateLimited ? `<div class="card-note note-block">${CARD_ICON.block}<span><b>Rate limited</b> — blocked ~${rateLimitHoursLeft}h. Do not log in from any profile.</span></div>` : ""}
+          ${checking ? `<div class="card-note note-checking">${CARD_ICON.device}<span><b>Checking login…</b> signing in to test the credentials.</span></div>` : ""}
+          ${!checking && health && health.state !== "healthy" ? `<div class="card-note note-${health.state === "password_changed" || health.state === "security_mismatch" ? "block" : "half"}">${CARD_ICON.warn}<span><b>${esc(LOGIN_HEALTH_LABELS[health.state] || health.state)}</b>${health.detail ? " — " + esc(health.detail) : ""} <span class="note-when">checked ${timeAgo(health.checkedAt)}</span></span></div>` : ""}
+          ${halfDone ? `<div class="card-note note-half">${CARD_ICON.warn}<span><b>${halves.ofc ? "OFC done" : "Consular done"}</b> — ${halves.ofc ? "consular interview" : "OFC"} still to book.</span></div>` : ""}
           <div class="card-details">
             <div class="card-detail">
-              <span class="detail-label">Dates:</span>
-              <span class="detail-value">${formatDate(profile.startDate)} — ${formatDate(profile.endDate)}</span>
+              <span class="detail-label">DATES</span>
+              <span class="detail-value${rangeExpired ? " date-expired" : ""}"${rangeExpired ? ' title="This window has already ended — check the year is right"' : ""}>${formatRange(profile.startDate, profile.endDate, rangeExpired)}${rangeExpired ? " · expired" : ""}</span>
             </div>
             <div class="card-detail">
-              <span class="detail-label">Visa:</span>
+              <span class="detail-label">VISA</span>
               <span class="detail-value">${esc(profile.visaType) || "—"}</span>
             </div>
             <div class="card-detail">
-              <span class="detail-label">Applicants:</span>
+              <span class="detail-label">APPL</span>
               <span class="detail-value">${profile.applicantCount || 1}</span>
             </div>
             ${staffMode ? "" : `<div class="card-detail">
-              <span class="detail-label">Price:</span>
+              <span class="detail-label">PRICE</span>
               <span class="detail-value">${profile.agreedPrice ? "₹" + Number(profile.agreedPrice).toLocaleString() + (profile.applicantCount > 1 ? " (" + (profile.pricePerPerson || profile.agreedPrice) + "/pp)" : "") : "—"}</span>
             </div>`}
             <div class="card-detail">
-              <span class="detail-label">CAPTCHA:</span>
+              <span class="detail-label">CAPTCHA</span>
               <span class="detail-value">${esc(profile.captchaMode) || "manual"}</span>
             </div>
           </div>
@@ -324,54 +723,60 @@
 
           ${(() => {
             const st = slotStats[profile.username];
-            if (!st) return `<div class="card-slots-summary" style="margin-top:8px;padding:6px 8px;background:#0f1923;border-radius:4px;font-size:11px;color:#78909c;">📜 No slot history yet</div>`;
+            if (!st) return `<div class="card-slots-summary is-empty">No slot history yet</div>`;
             const lastInfo = st.lastFoundAt
-              ? `· Last: <b>${esc(st.lastLocation)}</b> ${esc(st.lastDate)} (${timeAgo(st.lastFoundAt)})`
+              ? `Last: <b>${esc(st.lastLocation)}</b> ${esc(st.lastDate)} · ${timeAgo(st.lastFoundAt)}`
               : "";
             return `
-              <div class="card-slots-summary" style="margin-top:8px;padding:6px 8px;background:#0f1923;border-radius:4px;font-size:11px;color:#cfd8dc;">
-                🎯 <b>${st.total}</b> slots seen
-                · ✅ <b style="color:#27ae60;">${st.inRange}</b> in range
-                · ⚪ ${st.outRange} out
-                ${st.confirmed > 0 ? `· 🎉 <b style="color:#27ae60;">${st.confirmed} confirmed</b>` : ""}
-                ${st.submitted > 0 && st.confirmed === 0 ? `· ⏳ ${st.submitted} submitted` : ""}
-                <div style="margin-top:3px;color:#78909c;">${lastInfo}</div>
+              <div class="card-slots-summary">
+                <span class="ss"><b>${st.total}</b> seen</span>
+                <span class="ss ss-in"><b>${st.inRange}</b> in range</span>
+                <span class="ss ss-out"><b>${st.outRange}</b> out</span>
+                ${st.confirmed > 0 ? `<span class="ss ss-ok"><b>${st.confirmed}</b> confirmed</span>` : ""}
+                ${st.submitted > 0 && st.confirmed === 0 ? `<span class="ss ss-pending"><b>${st.submitted}</b> submitted</span>` : ""}
+                ${lastInfo ? `<div class="ss-last">${lastInfo}</div>` : ""}
               </div>`;
           })()}
 
-          <div class="card-actions">
-            ${activeOnOtherDevice
-              ? `<span style="font-size:11px;color:#ef5350;font-weight:bold;">Running on ${esc(activeDeviceName || "other device")}</span>
-                 <button class="btn btn-small btn-force-start" data-user="${safeUser}" data-device="${esc(activeDeviceName || "other device")}" style="background:#7f8c8d;color:white;font-size:10px;" title="Hold Shift+Click to force start">Force Start</button>`
-              : isActive
-                ? `<button class="btn btn-small btn-red btn-stop" data-user="${safeUser}">Stop</button>
-                   <button class="btn btn-small btn-orange btn-logout" data-user="${safeUser}">Logout</button>`
-                : isRateLimited
-                  ? `<button class="btn btn-small btn-force-rate-limit" data-user="${safeUser}" style="background:#7f8c8d;color:white;" title="Shift+Click to force login despite rate limit">🔴 Blocked (~${rateLimitHoursLeft}h)</button>`
-                  : `<button class="btn btn-small btn-green btn-start" data-user="${safeUser}">Start Now</button>`}
-            <button class="btn btn-small btn-gray btn-edit" data-user="${safeUser}">Edit</button>
-            <button class="btn btn-small btn-blue btn-history" data-user="${safeUser}" style="background:#3498db;color:white;">📜 History</button>
-          </div>
           ${(() => {
             const r = status.roundCount || 0;
             const e = status.errorCount || 0;
             const inR = status.slotsInRangeFound || 0;
             const outR = status.slotsOutOfRangeFound || 0;
-            const last429 = status.last429At ? `· 🟠 429 ${timeAgo(status.last429At)} ` : "";
-            const last401 = status.last401At ? `· 🔴 401 ${timeAgo(status.last401At)} ` : "";
+            const last429 = status.last429At ? `<span class="ct ct-warn">429 ${timeAgo(status.last429At)}</span>` : "";
+            const last401 = status.last401At ? `<span class="ct ct-err">401 ${timeAgo(status.last401At)}</span>` : "";
             // Hide only if user never started cycling AND no errors AND no slots
             const hasAnyData = r > 0 || e > 0 || inR > 0 || outR > 0 || status.cycleStartedAt || isActive;
             if (!hasAnyData) return "";
             return `
-              <div class="card-counters" style="margin-top:6px;padding:5px 8px;background:#0a1119;border-radius:4px;font-size:11px;color:#b0bec5;display:flex;flex-wrap:wrap;gap:8px;">
-                <span>🔁 Round <b>${r}</b></span>
-                <span style="color:${e > 0 ? '#e74c3c' : '#78909c'};">⚠️ <b>${e}</b> errors</span>
-                <span style="color:#27ae60;">✅ <b>${inR}</b> in</span>
-                <span style="color:#90a4ae;">⚪ ${outR} out</span>
+              <div class="card-counters">
+                <span class="ct">Round <b>${r}</b></span>
+                <span class="ct${e > 0 ? " ct-err" : ""}"><b>${e}</b> errors</span>
+                <span class="ct ct-ok"><b>${inR}</b> in</span>
+                <span class="ct"><b>${outR}</b> out</span>
                 ${last429}${last401}
               </div>`;
           })()}
+
+          <div class="card-actions">
+            ${activeOnOtherDevice
+              ? `<span class="card-elsewhere">Running on ${esc(activeDeviceName || "other device")}</span>
+                 <button class="btn btn-small btn-force-start" data-user="${safeUser}" data-device="${esc(activeDeviceName || "other device")}" title="Hold Shift+Click to force start">Force start</button>`
+              : isActive
+                ? `<button class="btn btn-small btn-red btn-stop" data-user="${safeUser}">Stop</button>
+                   <button class="btn btn-small btn-orange btn-logout" data-user="${safeUser}">Logout</button>`
+                : isRateLimited
+                  ? `<button class="btn btn-small btn-red btn-force-rate-limit" data-user="${safeUser}" title="Shift+Click to force login despite rate limit">Blocked ~${rateLimitHoursLeft}h</button>`
+                  : `<button class="btn btn-small btn-green btn-start" data-user="${safeUser}">Start now</button>`}
+            <span class="card-actions-rest">
+              <button class="btn btn-small btn-edit" data-user="${safeUser}">Edit</button>
+              <button class="btn btn-small btn-history" data-user="${safeUser}">History</button>
+              <button class="btn btn-small btn-check-login" data-user="${safeUser}" title="Log in as this client, check the credentials still work, then log out">Check login</button>
+            </span>
+          </div>
+
           <div class="card-footer">
+            ${health && health.state === "healthy" ? `<span class="login-ok">Login OK ${timeAgo(health.checkedAt)}</span> · ` : ""}
             ${status.updatedAt ? "Updated " + timeAgo(status.updatedAt) : "No activity yet"}
             ${status.cycleStartedAt ? " · Started " + timeAgo(status.cycleStartedAt) : ""}
             ${status.foundAt ? " · Slot found " + timeAgo(status.foundAt) : ""}
@@ -379,7 +784,10 @@
           </div>
         </div>
       `;
-    }).join("");
+      return { user: profile.username, html };
+    });
+
+    reconcileCards(container, cards);
   }
 
   // ─── ACTIVITY LOG ──────────────────────────────────────────────────
@@ -396,20 +804,63 @@
     const displayEvents = filtered.slice(0, 200);
 
     if (displayEvents.length === 0) {
-      container.innerHTML = '<div class="log-empty">No events to display</div>';
+      if (container.dataset.hash !== "empty") {
+        container.dataset.hash = "empty";
+        container.innerHTML = '<div class="log-empty">No events to display</div>';
+      }
       return;
     }
 
-    container.innerHTML = displayEvents.map((e) => {
-      const esc = (s) => (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-      return `
-      <div class="log-entry">
+    const esc2 = (s) => (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+    const html = displayEvents.map((e) => `
+      <div class="log-entry sev-${LOG_SEVERITY[e.type] || "info"}">
         <span class="log-time">${formatTime(e.timestamp)}</span>
-        <span class="log-type log-type-${esc(e.type)}">${esc(e.type)}</span>
-        <span class="log-user">${esc(deriveProfileName(e.username))}</span>
-        <span class="log-message">${esc(e.message)}</span>
-      </div>`;
-    }).join("");
+        <span class="log-spine"><i></i></span>
+        <span class="log-type log-type-${esc2(e.type)}">${esc2(e.type)}</span>
+        <span class="log-user">${esc2(deriveProfileName(e.username))}</span>
+        <span class="log-message">${esc2(e.message)}</span>
+      </div>`).join("");
+
+    // Same reason as the cards: this list is rebuilt on the same 2s tick and
+    // wholesale replacement was killing hover and the scroll position. A
+    // single hash comparison skips the write when nothing changed.
+    const hash = hashString(html);
+    if (container.dataset.hash === hash) return;
+    container.dataset.hash = hash;
+
+    const keepScroll = container.scrollTop;
+    container.innerHTML = html;
+    container.scrollTop = keepScroll;
+  }
+
+  // #74 Year options come from the data, not a hardcoded list, so the filter
+  // cannot go stale the way the old `2026..2027` loop bounds did. Always
+  // offers this year and next even when no profile reaches that far.
+  function updateYearFilter(profiles) {
+    const select = document.getElementById("filter-year");
+    if (!select) return;
+
+    const thisYear = new Date().getFullYear();
+    const years = new Set([thisYear, thisYear + 1]);
+    (profiles || []).forEach((p) => {
+      const s = parseYMD(p.startDate);
+      const e = parseYMD(p.endDate);
+      if (s) years.add(s.year);
+      if (e) years.add(e.year);
+    });
+
+    const sorted = [...years].sort((a, b) => a - b);
+    const markup = '<option value="all">Any year</option>' +
+      sorted.map((y) => `<option value="${y}">${y}</option>`).join("");
+
+    // Rebuilding every 2s would reset an open dropdown, so only touch the DOM
+    // when the option list actually changed.
+    if (select.dataset.years === sorted.join(",")) return;
+    const current = select.value;
+    select.dataset.years = sorted.join(",");
+    select.innerHTML = markup;
+    if (current && [...select.options].some((o) => o.value === current)) select.value = current;
   }
 
   function updateLogUserFilter(profiles) {
@@ -443,9 +894,15 @@
     return ist.toISOString().substring(0, 10);
   }
 
-  function renderStats(dailyStats, storageStats) {
+  let statsSignature = "";
+
+  function renderStats(dailyStats, storageStats, slotHistory, profiles, statuses) {
     const container = document.getElementById("stats-pane");
     if (!container) return;
+
+    // This pane sits behind a tab and is rebuilt on the same 2s loop as
+    // everything else. Skip the work entirely while it is hidden.
+    if (container.style.display === "none") return;
 
     const days = [];
     for (let i = 0; i < 14; i++) {
@@ -456,130 +913,201 @@
       days.push({ key, label: i === 0 ? "Today" : i === 1 ? "Yesterday" : key, stats: s });
     }
 
-    const last7 = days.slice(0, 7).map(d => d.stats).filter(Boolean);
-    const weekTotal = {
-      slotsFound: 0, slotsInRange: 0, booked: 0, missed: 0, errors: 0,
-      byLocation: {}, byHour: {},
-    };
-    last7.forEach(s => {
+    const last7 = days.slice(0, 7).map((d) => d.stats).filter(Boolean);
+    const weekTotal = { slotsFound: 0, slotsInRange: 0, booked: 0, missed: 0, errors: 0 };
+    last7.forEach((s) => {
       weekTotal.slotsFound += s.slotsFound || 0;
       weekTotal.slotsInRange += s.slotsInRange || 0;
       weekTotal.booked += s.booked || 0;
       weekTotal.missed += s.missed || 0;
       weekTotal.errors += s.errors || 0;
-      for (const [k, v] of Object.entries(s.byLocation || {})) {
-        weekTotal.byLocation[k] = (weekTotal.byLocation[k] || 0) + v;
-      }
-      for (const [k, v] of Object.entries(s.byHour || {})) {
-        weekTotal.byHour[k] = (weekTotal.byHour[k] || 0) + v;
-      }
     });
 
-    const topLocs = Object.entries(weekTotal.byLocation).sort((a, b) => b[1] - a[1]);
-    const topHours = Object.entries(weekTotal.byHour).sort((a, b) => b[1] - a[1]);
+    const insights = buildSlotInsights(slotHistory);
+    const health = buildHealth(profiles || [], statuses || {});
+    const pipeline = staffMode ? null : buildPipeline(profiles || [], statuses || {});
 
-    // Hour heatmap (24 hours)
-    const maxHour = Math.max(...Object.values(weekTotal.byHour), 1);
-    const hourBars = Array.from({ length: 24 }, (_, h) => {
-      const key = String(h).padStart(2, "0");
-      const v = weekTotal.byHour[key] || 0;
-      const pct = (v / maxHour) * 100;
-      const color = pct > 60 ? "#27ae60" : pct > 30 ? "#f39c12" : pct > 0 ? "#3498db" : "#2d3e50";
-      return `<div style="display:inline-block;width:20px;height:${Math.max(pct * 0.6, 2)}px;background:${color};margin:0 1px;vertical-align:bottom;" title="${key}:00 → ${v}"></div>`;
+    // ── 02 release heatmap: consulate x hour of day, IST ──────────────
+    const heatCells = CONSULATES.map((c) => {
+      const row = insights.grid[c];
+      const cells = row.map((v, h) => {
+        const t = insights.gridMax ? v / insights.gridMax : 0;
+        const bg = v === 0 ? "var(--surface-3)" : `rgba(229,169,78,${(0.16 + t * 0.84).toFixed(2)})`;
+        return `<div class="heat-cell" style="background:${bg}" title="${esc(c)} · ${String(h).padStart(2, "0")}:00 IST — ${v} slot${v === 1 ? "" : "s"} seen"></div>`;
+      }).join("");
+      return `<div class="heat-row-label">${esc(c)}</div>${cells}`;
     }).join("");
 
-    const dayBars = days.slice(0, 14).reverse().map(d => {
+    const hourLabels = Array.from({ length: 24 }, (_, h) =>
+      `<div class="heat-hour">${h % 3 === 0 ? String(h).padStart(2, "0") : ""}</div>`).join("");
+
+    const legend = [0, 0.25, 0.5, 0.75, 1].map((t) =>
+      `<i style="background:${t === 0 ? "var(--surface-3)" : `rgba(229,169,78,${(0.16 + t * 0.84).toFixed(2)})`}"></i>`).join("");
+
+    const rangePicker = HEAT_RANGES.map((r) =>
+      `<button type="button" class="heat-range${r.days === insights.rangeDays ? " on" : ""}" data-days="${r.days}">${r.label}</button>`).join("");
+
+    // Say exactly what period is on screen. Without this the grid looks like a
+    // stable long-run pattern when it may only be the last few days.
+    const spanNote = insights.totalStored === 0 ? "" :
+      insights.rangeDays > 0
+        ? `last ${insights.rangeDays} days · ${insights.totalUsed} of ${insights.totalStored} stored slots`
+        : `${shortDate(insights.oldest)} → ${shortDate(insights.newest)} · all ${insights.totalStored} stored slots`;
+
+    const capNote = insights.atCap
+      ? `<div class="heat-cap">Slot history is at its storage cap, so older records have been pruned. "All" means the surviving window above, not the whole history.</div>`
+      : "";
+
+    const heatPanel = insights.totalStored === 0
+      ? `<div class="ins-empty">No slot history recorded yet. Once clients start finding slots this fills in — it needs nothing but time.</div>`
+      : insights.totalUsed === 0
+        ? `<div class="ins-empty">No slots recorded in the last ${insights.rangeDays} days. Widen the range above.</div>`
+        : `
+        <div class="heat-grid">
+          <div></div>${hourLabels}
+          ${heatCells}
+        </div>
+        <div class="heat-legend"><span>fewer</span><span class="heat-swatch">${legend}</span><span>more slots seen</span></div>
+        ${insights.bestSum > 0 ? `<div class="heat-peak">Densest 3-hour window across all consulates: <b>${String(insights.bestStart).padStart(2, "0")}:00–${String((insights.bestStart + 3) % 24).padStart(2, "0")}:00 IST</b> — that is when it is worth having clients running, and when a page-view is worth spending.</div>` : ""}
+        ${capNote}`;
+
+    // ── 04 client health: error rate per client, worst first ──────────
+    const healthPanel = health.length === 0
+      ? `<div class="ins-empty">No client has enough completed rounds yet to judge.</div>`
+      : health.slice(0, 8).map((h) => {
+        const C = 2 * Math.PI * 19;
+        const off = (C * h.rate).toFixed(1);
+        const tone = h.rate > 0.15 ? "var(--danger)" : h.rate > 0.07 ? "var(--accent)" : "var(--ok)";
+        return `
+          <div class="health-row">
+            <svg class="health-ring" viewBox="0 0 46 46" aria-hidden="true">
+              <circle class="hr-track" cx="23" cy="23" r="19" fill="none" stroke-width="4"/>
+              <circle cx="23" cy="23" r="19" fill="none" stroke="${tone}" stroke-width="4"
+                      stroke-linecap="round" stroke-dasharray="${C.toFixed(1)}" stroke-dashoffset="${off}"/>
+            </svg>
+            <div class="health-text">
+              <div class="health-who">${esc(h.name)}</div>
+              <div class="health-pct${h.rate > 0.15 ? " bad" : ""}">${(h.rate * 100).toFixed(1)}% errors · ${h.errs}/${h.rounds} rounds</div>
+            </div>
+          </div>`;
+      }).join("");
+
+    // ── 03 pipeline value + staff board (owner only) ──────────────────
+    let pipelinePanel = "";
+    if (pipeline) {
+      const totalVal = pipeline.bookedValue + pipeline.flightValue + pipeline.riskValue || 1;
+      const staffRows = Object.entries(pipeline.byStaff)
+        .sort((a, b) => b[1].value - a[1].value)
+        .slice(0, 6)
+        .map(([sid, v]) => {
+          const maxV = Math.max(...Object.values(pipeline.byStaff).map((x) => x.value), 1);
+          const who = sid === "__me" ? "Unassigned / me" : (staffById[sid] ? staffById[sid].name : "Unknown");
+          return `
+            <div class="staff-row">
+              <span class="staff-who">${esc(who)}</span>
+              <span class="staff-bar"><i style="width:${Math.round((v.value / maxV) * 100)}%"></i></span>
+              <span class="staff-val">${v.count} · ${rupees(v.value)}</span>
+            </div>`;
+        }).join("");
+
+      pipelinePanel = `
+        <div class="ins-panel">
+          <div class="ins-head">PIPELINE · owner only</div>
+          <div class="pipe-grid">
+            <div class="pipe-money">
+              <div class="pipe-row booked">
+                <div class="k">CONFIRMED THIS MONTH</div>
+                <div class="v">${rupees(pipeline.bookedValue)}</div>
+                <div class="n">${pipeline.bookedCount} client${pipeline.bookedCount === 1 ? "" : "s"} · ${pipeline.bookedApplicants} applicant${pipeline.bookedApplicants === 1 ? "" : "s"}</div>
+              </div>
+              <div class="pipe-row flight">
+                <div class="k">IN FLIGHT</div>
+                <div class="v">${rupees(pipeline.flightValue)}</div>
+                <div class="n">${pipeline.flightCount} still hunting</div>
+                <div class="pipe-bar">
+                  <i style="width:${(pipeline.bookedValue / totalVal * 100).toFixed(1)}%;background:var(--ok)"></i>
+                  <i style="width:${(pipeline.flightValue / totalVal * 100).toFixed(1)}%;background:var(--live)"></i>
+                  <i style="width:${(pipeline.riskValue / totalVal * 100).toFixed(1)}%;background:var(--danger)"></i>
+                </div>
+              </div>
+              <div class="pipe-row risk">
+                <div class="k">BLOCKED / AT RISK</div>
+                <div class="v">${rupees(pipeline.riskValue)}</div>
+                <div class="n">${pipeline.riskCount} rate-limited or errored</div>
+              </div>
+            </div>
+            <div>
+              <div class="ins-sub">CONFIRMED BY STAFF</div>
+              <div class="staff-board">${staffRows || '<div class="ins-empty">Nothing confirmed yet.</div>'}</div>
+            </div>
+          </div>
+        </div>`;
+    }
+
+    const maxDay = Math.max(...days.map((x) => x.stats?.slotsFound || 0), 1);
+    const dayBars = days.slice(0, 14).reverse().map((d) => {
       const total = d.stats?.slotsFound || 0;
       const inR = d.stats?.slotsInRange || 0;
-      const max = Math.max(...days.map(x => x.stats?.slotsFound || 0), 1);
-      const h = (total / max) * 80;
-      const inH = (inR / max) * 80;
+      const h = (total / maxDay) * 74;
+      const inH = (inR / maxDay) * 74;
       return `
-        <div style="display:inline-block;width:36px;text-align:center;margin:0 2px;vertical-align:bottom;">
-          <div style="position:relative;height:80px;display:flex;flex-direction:column;justify-content:flex-end;">
-            <div style="height:${h - inH}px;background:#90a4ae;border-radius:2px 2px 0 0;"></div>
-            <div style="height:${inH}px;background:#27ae60;"></div>
+        <div class="day-col" title="${esc(d.label)} — ${total} seen, ${inR} in range">
+          <div class="day-stack">
+            <div class="day-out" style="height:${Math.max(h - inH, 0)}px"></div>
+            <div class="day-in" style="height:${inH}px"></div>
           </div>
-          <div style="font-size:9px;color:#78909c;margin-top:2px;">${d.label.substring(5) || d.label.substring(0, 3)}</div>
-          <div style="font-size:10px;color:#cfd8dc;font-weight:bold;">${total}</div>
+          <div class="day-lab">${esc(d.label.substring(5) || d.label.substring(0, 3))}</div>
+          <div class="day-num">${total}</div>
         </div>`;
     }).join("");
 
     const storageBar = storageStats ? `
-      <div style="margin-top:14px;padding:8px;background:#0a1119;border-radius:6px;">
-        <div style="font-size:11px;color:#78909c;margin-bottom:4px;">Storage: ${storageStats.mb} MB / 10 MB</div>
-        <div style="height:6px;background:#1a2733;border-radius:3px;overflow:hidden;">
-          <div style="height:100%;width:${(storageStats.mb / 10) * 100}%;background:${storageStats.mb > 8 ? '#e74c3c' : storageStats.mb > 6 ? '#f39c12' : '#27ae60'};"></div>
-        </div>
-        ${storageStats.lastPrune ? `<div style="font-size:10px;color:#78909c;margin-top:4px;">Last prune: ${timeAgo(storageStats.lastPrune.at)} (${storageStats.lastPrune.pruned.join(", ")})</div>` : ""}
+      <div class="ins-panel">
+        <div class="ins-head">STORAGE</div>
+        <div class="store-line">${storageStats.mb} MB of 10 MB</div>
+        <div class="store-bar"><i style="width:${Math.min((storageStats.mb / 10) * 100, 100)}%;background:${storageStats.mb > 8 ? "var(--danger)" : storageStats.mb > 6 ? "var(--accent)" : "var(--ok)"}"></i></div>
+        ${storageStats.lastPrune ? `<div class="store-note">Last prune ${timeAgo(storageStats.lastPrune.at)} — ${esc(storageStats.lastPrune.pruned.join(", "))}</div>` : ""}
       </div>` : "";
 
-    container.innerHTML = `
-      <div style="padding:14px;color:#cfd8dc;">
-        <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px;">
-          <div style="background:#0a1119;padding:10px;border-radius:6px;text-align:center;">
-            <div style="font-size:22px;font-weight:bold;color:#3498db;">${weekTotal.slotsFound}</div>
-            <div style="font-size:10px;color:#78909c;">Slots (7d)</div>
-          </div>
-          <div style="background:#0a1119;padding:10px;border-radius:6px;text-align:center;">
-            <div style="font-size:22px;font-weight:bold;color:#27ae60;">${weekTotal.slotsInRange}</div>
-            <div style="font-size:10px;color:#78909c;">In Range</div>
-          </div>
-          <div style="background:#0a1119;padding:10px;border-radius:6px;text-align:center;">
-            <div style="font-size:22px;font-weight:bold;color:#27ae60;">${weekTotal.booked}</div>
-            <div style="font-size:10px;color:#78909c;">Booked</div>
-          </div>
-          <div style="background:#0a1119;padding:10px;border-radius:6px;text-align:center;">
-            <div style="font-size:22px;font-weight:bold;color:#e67e22;">${weekTotal.missed}</div>
-            <div style="font-size:10px;color:#78909c;">Missed</div>
-          </div>
-          <div style="background:#0a1119;padding:10px;border-radius:6px;text-align:center;">
-            <div style="font-size:22px;font-weight:bold;color:#e74c3c;">${weekTotal.errors}</div>
-            <div style="font-size:10px;color:#78909c;">Errors</div>
-          </div>
+    const html = `
+      <div class="ins-wrap">
+        <div class="ins-totals">
+          <div class="ins-tile"><div class="n">${weekTotal.slotsFound}</div><div class="l">SEEN 7D</div></div>
+          <div class="ins-tile ok"><div class="n">${weekTotal.slotsInRange}</div><div class="l">IN RANGE</div></div>
+          <div class="ins-tile ok"><div class="n">${weekTotal.booked}</div><div class="l">BOOKED</div></div>
+          <div class="ins-tile warn"><div class="n">${weekTotal.missed}</div><div class="l">MISSED</div></div>
+          <div class="ins-tile bad"><div class="n">${weekTotal.errors}</div><div class="l">ERRORS</div></div>
         </div>
 
-        <div style="background:#0a1119;padding:12px;border-radius:6px;margin-bottom:14px;">
-          <div style="font-size:12px;color:#78909c;margin-bottom:8px;font-weight:bold;">📅 LAST 14 DAYS</div>
-          <div style="display:flex;align-items:flex-end;justify-content:flex-start;flex-wrap:nowrap;overflow-x:auto;">
-            ${dayBars}
+        <div class="ins-panel">
+          <div class="ins-head heat-head">
+            <span>RELEASE HEATMAP · consulate × hour, IST</span>
+            <span class="heat-range-picker">${rangePicker}</span>
           </div>
-          <div style="font-size:10px;color:#78909c;margin-top:6px;">
-            <span style="color:#27ae60;">■</span> In range
-            <span style="color:#90a4ae;margin-left:10px;">■</span> Out of range
-          </div>
+          ${spanNote ? `<div class="heat-span">${esc(spanNote)}</div>` : ""}
+          ${heatPanel}
         </div>
 
-        <div style="background:#0a1119;padding:12px;border-radius:6px;margin-bottom:14px;">
-          <div style="font-size:12px;color:#78909c;margin-bottom:8px;font-weight:bold;">🕐 HOUR HEATMAP (IST, last 7 days)</div>
-          <div style="white-space:nowrap;overflow-x:auto;">${hourBars}</div>
-          <div style="font-size:9px;color:#78909c;margin-top:4px;display:flex;justify-content:space-between;">
-            <span>00</span><span>06</span><span>12</span><span>18</span><span>23</span>
-          </div>
+        ${pipelinePanel}
+
+        <div class="ins-panel">
+          <div class="ins-head">CLIENT HEALTH · worst error rate first</div>
+          <div class="health-list">${healthPanel}</div>
         </div>
 
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-          <div style="background:#0a1119;padding:12px;border-radius:6px;">
-            <div style="font-size:12px;color:#78909c;margin-bottom:8px;font-weight:bold;">📍 TOP LOCATIONS</div>
-            ${topLocs.length === 0 ? '<div style="color:#78909c;font-size:11px;">No data</div>' :
-              topLocs.slice(0, 5).map(([loc, c]) => `
-                <div style="font-size:12px;display:flex;justify-content:space-between;padding:3px 0;">
-                  <span>${loc}</span><b>${c}</b>
-                </div>`).join("")}
-          </div>
-          <div style="background:#0a1119;padding:12px;border-radius:6px;">
-            <div style="font-size:12px;color:#78909c;margin-bottom:8px;font-weight:bold;">🔥 HOT HOURS</div>
-            ${topHours.length === 0 ? '<div style="color:#78909c;font-size:11px;">No data</div>' :
-              topHours.slice(0, 5).map(([h, c]) => `
-                <div style="font-size:12px;display:flex;justify-content:space-between;padding:3px 0;">
-                  <span>${h}:00 IST</span><b>${c}</b>
-                </div>`).join("")}
-          </div>
+        <div class="ins-panel">
+          <div class="ins-head">LAST 14 DAYS</div>
+          <div class="day-bars">${dayBars}</div>
+          <div class="day-key"><span class="sw-in"></span>in range<span class="sw-out"></span>out of range</div>
         </div>
 
         ${storageBar}
-      </div>
-    `;
+      </div>`;
+
+    const sig = hashString(html);
+    if (statsSignature === sig) return;
+    statsSignature = sig;
+    container.innerHTML = html;
   }
 
   // ─── SLOT HISTORY ──────────────────────────────────────────────────
@@ -609,25 +1137,17 @@
 
     const esc = (s) => (s || "").toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-    const actionColor = {
-      detected: "#78909c",
-      selected: "#3498db",
-      submitted: "#f39c12",
-      confirmed: "#27ae60",
-      missed: "#e74c3c",
-    };
-
-    container.innerHTML = display.map((e) => {
-      const color = actionColor[e.action] || "#78909c";
-      const rangeIcon = e.inRange ? "✅" : "⚪";
-      return `
-      <div class="log-entry" style="border-left:3px solid ${color};">
+    // #59 Must emit the same five grid children as the activity log — the
+    // shared .log-entry grid would otherwise shunt every column across.
+    // in-range is carried by the spine dot instead of an emoji.
+    container.innerHTML = display.map((e) => `
+      <div class="log-entry sev-${e.inRange ? "found" : "info"}">
         <span class="log-time">${formatTime(e.foundAt)}</span>
-        <span class="log-type" style="background:${color};color:white;">${esc(e.action)}</span>
+        <span class="log-spine"><i></i></span>
+        <span class="log-type log-slot-${esc(e.action)}">${esc(e.action)}</span>
         <span class="log-user">${esc(deriveProfileName(e.username))}</span>
-        <span class="log-message">${rangeIcon} ${esc(e.location)} → <b>${esc(e.date)}</b></span>
-      </div>`;
-    }).join("");
+        <span class="log-message">${esc(e.location)} → <b>${esc(e.date)}</b>${e.inRange ? '<span class="in-range">in range</span>' : ""}</span>
+      </div>`).join("");
   }
 
   // ─── USER ACTIONS ──────────────────────────────────────────────────
@@ -648,6 +1168,475 @@
         captchaMode: profile.captchaMode || "manual",
       }, () => {
         if (callback) callback(profile);
+      });
+    });
+  }
+
+  // ─── LOGIN HEALTH CHECK (issue #76) ────────────────────────────────
+  // Runs one client's credentials through a real login, records how far they
+  // got, then signs out. Deliberately does NOT set activeAutomationUser —
+  // every booking path is gated on that key, so a check cannot start hunting.
+
+  const LOGIN_HEALTH_LABELS = {
+    healthy: "Login OK",
+    security_mismatch: "Security answers wrong",
+    password_changed: "Password changed",
+    captcha_fail: "CAPTCHA failed",
+    blocked: "Blocked — try later",
+    timeout: "No answer",
+  };
+
+  function startLoginCheck(username) {
+    chrome.storage.local.get(["userProfilesList", "userStatuses", "activeAutomationUser"], (data) => {
+      const profile = (data.userProfilesList || []).find((p) => p.username === username);
+      if (!profile) return;
+
+      // Never check a client that is mid-session — logging in again would
+      // collide with a live run and could cost a real booking.
+      const st = (data.userStatuses || {})[username] || {};
+      const busy = ["cycling", "logging_in", "security_questions", "on_dashboard", "slot_found"];
+      if (busy.includes(st.status) || data.activeAutomationUser) {
+        const who = data.activeAutomationUser || username;
+        alert(`Can't check ${username} right now — ${who} is in the middle of a live session.\n\nStop that first, then check.`);
+        return;
+      }
+
+      chrome.storage.local.set({
+        __abVerifyUser: username,
+        __abVerifyStartedAt: new Date().toISOString(),
+        loginDetails: { username: profile.username, password: profile.password },
+        securityQuestions: profile.securityQuestions || {},
+        "is_auto-login": true,
+        // Hard off: stops the site-side flow clicking through toward booking.
+        "is_auto-dashboard": false,
+        "is_sel-1st-slot": false,
+        "is_auto-submit": false,
+        captchaMode: "auto",
+      }, () => {
+        openVisaSiteForVerify();
+        refresh();
+      });
+    });
+  }
+
+  // ─── LOGIN SWEEP (issue #76 part 2) ────────────────────────────────
+  // One button, every client, one at a time: sign in → see how far it got →
+  // sign out → wait → change IP → next. Ends with a report naming the clients
+  // that could not reach the dashboard.
+  //
+  // The dashboard's own 2s refresh drives the queue. That means the sweep only
+  // advances while this page is open — which is the safe failure mode: close
+  // the tab and it stops cleanly rather than grinding through accounts
+  // unattended with nobody watching.
+
+  const SWEEP_KEY = "__abSweep";
+  // No IP rotation and no long pacing between clients. Changing the exit IP
+  // mid-sweep makes Cloudflare treat us as a brand-new visitor and serve the
+  // "verify you are human" checkbox — which needs a person, so it defeats the
+  // whole unattended run. Observed behaviour, and it beats the theory that a
+  // fresh IP looks safer.
+  //
+  // What remains is a short settle: the previous client's sign-out has to land
+  // before the next one signs in, or the two sessions collide. This is the
+  // handover, not padding.
+  const SWEEP_SETTLE_MIN_MS = 4000;
+  const SWEEP_SETTLE_MAX_MS = 9000;
+  const SWEEP_STUCK_MS = 4 * 60 * 1000;     // a single check should never exceed this
+  // A Cloudflare challenge pauses rather than ends the run: the operator
+  // solves the checkbox and it carries on from the same place. Backoff grows
+  // so a challenge still sitting unsolved is not hammered.
+  const SWEEP_BLOCK_BACKOFF_MS = [60 * 1000, 3 * 60 * 1000, 6 * 60 * 1000];
+  const SWEEP_MAX_BLOCKS = 4;               // then stop and ask for a new IP
+
+  // States that mean "we could not get in" — these are what the report is for.
+  const SWEEP_FAIL_STATES = ["password_changed", "security_mismatch"];
+  const SWEEP_INCONCLUSIVE = ["captcha_fail", "blocked", "timeout"];
+
+  const sweepGap = () => SWEEP_SETTLE_MIN_MS + Math.random() * (SWEEP_SETTLE_MAX_MS - SWEEP_SETTLE_MIN_MS);
+
+  function readSweep() {
+    return new Promise((r) => chrome.storage.local.get([SWEEP_KEY], (d) => r(d[SWEEP_KEY] || null)));
+  }
+
+  function writeSweep(sweep) {
+    return new Promise((r) => chrome.storage.local.set({ [SWEEP_KEY]: sweep }, r));
+  }
+
+  async function startSweep(profiles, statuses) {
+    const cloudMap = viewCloudMap();
+    const skipped = [];
+    const queue = [];
+
+    (profiles || []).forEach((p) => {
+      const st = (statuses || {})[p.username] || {};
+      const busy = ["cycling", "logging_in", "security_questions", "on_dashboard", "slot_found"];
+      if (busy.includes(st.status)) { skipped.push(p.username); return; }
+      if (!p.password) { skipped.push(p.username); return; }
+      queue.push(p.username);
+    });
+
+    if (!queue.length) {
+      alert("Nothing to check — every client is either mid-session or has no saved password.");
+      return;
+    }
+
+    // ~45s per client: sign in, CAPTCHA, security questions, land, sign out.
+    const mins = Math.max(1, Math.round((queue.length * 45000) / 60000));
+    const ok = confirm(
+      `Check the login for ${queue.length} client${queue.length === 1 ? "" : "s"}, one after another?\n\n` +
+      `• Each one is a real sign-in and uses one of that client's daily page-views.\n` +
+      `• The next client starts as soon as the previous one has signed out.\n` +
+      `• Roughly ${mins} minutes in total.\n` +
+      `• Leave this dashboard tab open — closing it stops the run.\n\n` +
+      (skipped.length ? `Skipping ${skipped.length} (mid-session or no saved password).\n\n` : "") +
+      `You get a report at the end naming any client we could not sign in as.`);
+    if (!ok) return;
+
+    // Drop any tab id left from a previous run so the first client claims a
+    // tab cleanly (and closes duplicates) instead of reviving a stale one.
+    await new Promise((r) => chrome.storage.local.remove(["__abVerifyTabId"], r));
+
+    await writeSweep({
+      active: true, queue, total: queue.length, skipped,
+      current: null, nextAt: 0, startedAt: new Date().toISOString(),
+      finishedAt: null, stoppedReason: null, checked: [],
+    });
+    refresh();
+  }
+
+  async function stopSweep(reason) {
+    const sweep = await readSweep();
+    if (!sweep) return;
+    const inFlight = sweep.current;
+    sweep.active = false;
+    sweep.current = null;
+    sweep.finishedAt = new Date().toISOString();
+    sweep.stoppedReason = reason || "Stopped";
+    await writeSweep(sweep);
+    await new Promise((r) => chrome.storage.local.remove(
+      ["__abVerifyUser", "__abVerifyStartedAt", "__abVerifyPhase", "__abVerifyTabId"], r));
+
+    // #76 The client we were part-way through never reached finishVerify, so
+    // it is still sitting on "logging_in"/"security_questions" — which reads
+    // as running on this machine and inflates the cycling count. Put it back.
+    if (inFlight) await clearStuckCheckStatus(inFlight);
+    refresh();
+  }
+
+  // Returns a client left mid-check to idle, locally and in the cloud.
+  function clearStuckCheckStatus(username) {
+    return new Promise((resolve) => {
+      chrome.storage.local.get(["userStatuses"], (d) => {
+        const statuses = d.userStatuses || {};
+        const st = statuses[username];
+        const midCheck = ["logging_in", "security_questions", "on_dashboard"];
+        if (!st || !midCheck.includes(st.status)) return resolve();
+        statuses[username] = { ...st, status: "idle", updatedAt: new Date().toISOString() };
+        chrome.storage.local.set({ userStatuses: statuses }, () => {
+          if (SUPA && SUPA.isReady()) {
+            try { SUPA.updateProfileStatus(username, "idle", false); } catch (e) { /* offline is fine */ }
+          }
+          resolve();
+        });
+      });
+    });
+  }
+
+  // Called once per dashboard refresh. Advances the queue by at most one step.
+  let sweepTicking = false;
+  async function tickSweep(profiles, statuses, verifyUser, loginHealth) {
+    // Claim the guard BEFORE the first await. Checking it and then awaiting
+    // let two refresh ticks both get past the check and both suspend, so each
+    // started a client and each opened a tab.
+    if (sweepTicking) return;
+    sweepTicking = true;
+    try {
+      const sweep = await readSweep();
+      if (!sweep || !sweep.active) return;
+
+      // A check is in flight — let it finish, unless it has clearly hung.
+      if (verifyUser) {
+        const startedAt = await new Promise((r) =>
+          chrome.storage.local.get(["__abVerifyStartedAt"], (d) => r(d.__abVerifyStartedAt)));
+        // A missing start time used to mean "wait forever" — the sweep would sit
+        // on that client and never advance. No start time means nothing is
+        // genuinely running, so treat it as hung straight away.
+        const hung = !startedAt || Date.now() - new Date(startedAt).getTime() > SWEEP_STUCK_MS;
+        if (hung) {
+          await new Promise((r) => chrome.storage.local.remove(["__abVerifyUser", "__abVerifyStartedAt", "__abVerifyPhase"], r));
+          if (verifyUser) await clearStuckCheckStatus(verifyUser);
+          // fall through and let the next tick move on
+        } else {
+          return;
+        }
+      }
+
+      // Paused after a block. Come back by itself once the backoff is up —
+      // the operator solves the checkbox in the visa tab and the run resumes
+      // without them having to find their way back to this dashboard.
+      if (sweep.paused) {
+        if (sweep.retryAt && Date.now() < sweep.retryAt) return;
+        sweep.paused = false;
+        sweep.retryAt = 0;
+        sweep.nextAt = 0;
+        await writeSweep(sweep);
+        return;
+      }
+
+      // The client we just checked has finished — bank the result.
+      if (sweep.current) {
+        // Read health fresh rather than trusting the snapshot this refresh
+        // began with: the content script writes the result somewhere between
+        // the two, and a stale read here would miss a `blocked` and march the
+        // sweep straight on into a rate limit.
+        const fresh = await new Promise((r) =>
+          chrome.storage.local.get(["__abLoginHealth"], (d) => r(d.__abLoginHealth || {})));
+        const result = fresh[sweep.current];
+
+        // A block says nothing about this client — it is about us. Put them
+        // back at the front of the queue rather than counting them as checked,
+        // and PAUSE instead of ending the run, so solving the challenge picks
+        // up exactly where it stopped instead of restarting from the top and
+        // re-spending page-views on clients already done.
+        if (result && result.state === "blocked") {
+          const blockedOn = sweep.current;
+          sweep.queue.unshift(blockedOn);
+          sweep.current = null;
+          sweep.blocks = (sweep.blocks || 0) + 1;
+
+          if (sweep.blocks >= SWEEP_MAX_BLOCKS) {
+            await writeSweep(sweep);
+            // No early release here — `finally` owns the guard. Dropping it
+            // mid-await would let another tick in while this one is still
+            // shutting the run down.
+            await stopSweep(`Blocked ${sweep.blocks} times — stopped so it does not keep trying. Change IP, then run it again.`);
+            sendDashboardTelegram("error",
+              `⏹ <b>LOGIN CHECK STOPPED</b>\n\nBlocked ${sweep.blocks} times.\n` +
+              `✅ Checked ${sweep.checked.length} of ${sweep.total}\n🔧 Change IP, then start it again`);
+            return;
+          }
+
+          // Back off a little further each time, so a challenge that is still
+          // sitting there is not hammered.
+          sweep.paused = true;
+          sweep.retryAt = Date.now() + SWEEP_BLOCK_BACKOFF_MS[Math.min(sweep.blocks - 1, SWEEP_BLOCK_BACKOFF_MS.length - 1)];
+          await writeSweep(sweep);
+          sendDashboardTelegram("error",
+            `⏸ <b>LOGIN CHECK PAUSED</b>\n\nCloudflare challenge on <b>${blockedOn}</b>.\n` +
+            `✅ ${sweep.checked.length} of ${sweep.total} done\n` +
+            `👉 Solve the checkbox in the visa tab — it carries on by itself`);
+          return;
+        }
+
+        sweep.checked.push(sweep.current);
+        sweep.blocks = 0;            // a clean result clears the backoff
+        sweep.current = null;
+        sweep.nextAt = Date.now() + sweepGap();
+        await writeSweep(sweep);
+        return;
+      }
+
+      // Finished everything.
+      if (!sweep.queue.length) {
+        sweep.active = false;
+        sweep.finishedAt = new Date().toISOString();
+        await writeSweep(sweep);
+        await new Promise((r) => chrome.storage.local.remove(["__abVerifyTabId"], r));
+        await sendSweepReport(sweep, profiles, loginHealth);
+        refresh();
+        return;
+      }
+
+      // Still inside the gap between clients.
+      if (sweep.nextAt && Date.now() < sweep.nextAt) return;
+
+      // Start the next client.
+      const next = sweep.queue.shift();
+      const profile = (profiles || []).find((p) => p.username === next);
+      const st = (statuses || {})[next] || {};
+      const busy = ["cycling", "logging_in", "security_questions", "on_dashboard", "slot_found"];
+      if (!profile || busy.includes(st.status)) {
+        sweep.skipped.push(next);       // went live since the sweep began
+        await writeSweep(sweep);
+        return;
+      }
+
+      sweep.current = next;
+      await writeSweep(sweep);
+
+      await new Promise((r) => chrome.storage.local.set({
+        __abVerifyUser: next,
+        __abVerifyStartedAt: new Date().toISOString(),
+        loginDetails: { username: profile.username, password: profile.password },
+        securityQuestions: profile.securityQuestions || {},
+        "is_auto-login": true,
+        "is_auto-dashboard": false,
+        "is_sel-1st-slot": false,
+        "is_auto-submit": false,
+        captchaMode: "auto",
+      }, r));
+      openVisaSiteForVerify();
+    } finally {
+      sweepTicking = false;
+    }
+  }
+
+  function sweepBuckets(sweep, loginHealth) {
+    const failed = [], unsure = [], ok = [];
+    (sweep.checked || []).forEach((u) => {
+      const st = ((loginHealth || {})[u] || {}).state;
+      if (SWEEP_FAIL_STATES.includes(st)) failed.push({ u, st });
+      else if (SWEEP_INCONCLUSIVE.includes(st)) unsure.push({ u, st });
+      else if (st === "healthy") ok.push({ u, st });
+      else unsure.push({ u, st: st || "timeout" });
+    });
+    return { failed, unsure, ok };
+  }
+
+  async function sendSweepReport(sweep, profiles, loginHealth) {
+    const { failed, unsure, ok } = sweepBuckets(sweep, loginHealth);
+    const name = (u) => {
+      const p = (profiles || []).find((x) => x.username === u);
+      return p ? (p.name || deriveProfileName(u)) : u;
+    };
+
+    let msg = `🔑 <b>LOGIN CHECK DONE</b>\n\n` +
+      `✅ <b>${ok.length}</b> reached the dashboard\n` +
+      `🔴 <b>${failed.length}</b> could not sign in\n` +
+      `⚪ <b>${unsure.length}</b> inconclusive\n`;
+    if (failed.length) {
+      msg += `\n<b>Could not sign in:</b>\n` + failed
+        .map((f) => `• ${name(f.u)} — ${LOGIN_HEALTH_LABELS[f.st] || f.st}`).join("\n") + "\n";
+    }
+    if (unsure.length) {
+      msg += `\n<b>Worth retrying:</b>\n` + unsure
+        .map((f) => `• ${name(f.u)} — ${LOGIN_HEALTH_LABELS[f.st] || f.st}`).join("\n") + "\n";
+    }
+    if (sweep.skipped && sweep.skipped.length) {
+      msg += `\n⏭ Skipped ${sweep.skipped.length} (mid-session or no saved password)`;
+    }
+    sendDashboardTelegram("login", msg);
+  }
+
+  function renderSweep(sweep, loginHealth, profiles) {
+    const bar = document.getElementById("sweep-bar");
+    const report = document.getElementById("sweep-report");
+    if (!bar || !report) return;
+
+    if (sweep && sweep.active) {
+      report.hidden = true;
+      bar.hidden = false;
+      const done = (sweep.checked || []).length;
+      const pct = sweep.total ? Math.round((done / sweep.total) * 100) : 0;
+      document.getElementById("sweep-fill").style.width = pct + "%";
+      document.getElementById("sweep-count").textContent = `${done} of ${sweep.total}`;
+      document.getElementById("sweep-now").textContent = sweep.current ? `signing in as ${sweep.current}` : "";
+
+      const note = document.getElementById("sweep-note");
+      const resumeBtn = document.getElementById("sweep-resume");
+      const dot = bar.querySelector(".sweep-dot");
+
+      if (sweep.paused) {
+        bar.classList.add("is-paused");
+        if (dot) dot.classList.add("paused");
+        if (resumeBtn) resumeBtn.hidden = false;
+        document.getElementById("sweep-title").textContent = "Login check paused";
+        document.getElementById("sweep-now").textContent = "blocked by a Cloudflare challenge";
+        const secs = Math.max(0, Math.ceil(((sweep.retryAt || 0) - Date.now()) / 1000));
+        note.textContent = secs
+          ? `Solve the checkbox in the visa tab — this carries on by itself in ${secs}s, or press Continue now.`
+          : "Picking up where it left off…";
+        return;
+      }
+
+      bar.classList.remove("is-paused");
+      if (dot) dot.classList.remove("paused");
+      if (resumeBtn) resumeBtn.hidden = true;
+      document.getElementById("sweep-title").textContent = "Checking logins";
+
+      if (sweep.current) {
+        note.textContent = "Leave this tab open — the run advances from here.";
+      } else if (sweep.nextAt && Date.now() < sweep.nextAt) {
+        note.textContent = "Signing out, then straight on to the next client.";
+      } else {
+        note.textContent = "Starting the next client…";
+      }
+      return;
+    }
+
+    bar.hidden = true;
+
+    // Finished (or stopped) and not yet dismissed.
+    if (sweep && sweep.finishedAt && !sweep.dismissed) {
+      const { failed, unsure, ok } = sweepBuckets(sweep, loginHealth);
+      const name = (u) => {
+        const p = (profiles || []).find((x) => x.username === u);
+        return p ? (p.name || deriveProfileName(u)) : u;
+      };
+      const row = (f) => `<li><b>${esc(name(f.u))}</b> <span class="sr-why">${esc(LOGIN_HEALTH_LABELS[f.st] || f.st)}</span></li>`;
+
+      document.getElementById("sweep-report-title").textContent =
+        sweep.stoppedReason ? "Login check stopped" : "Login check finished";
+
+      document.getElementById("sweep-report-body").innerHTML = `
+        ${sweep.stoppedReason ? `<p class="sr-stopped">${esc(sweep.stoppedReason)}</p>` : ""}
+        <div class="sr-tallies">
+          <span class="sr-tally ok"><b>${ok.length}</b> reached the dashboard</span>
+          <span class="sr-tally bad"><b>${failed.length}</b> could not sign in</span>
+          <span class="sr-tally meh"><b>${unsure.length}</b> inconclusive</span>
+        </div>
+        ${failed.length ? `<div class="sr-group"><h4>Could not sign in — these need you</h4><ul>${failed.map(row).join("")}</ul></div>` : ""}
+        ${unsure.length ? `<div class="sr-group"><h4>Inconclusive — worth running again</h4><ul>${unsure.map(row).join("")}</ul></div>` : ""}
+        ${sweep.skipped && sweep.skipped.length ? `<p class="sr-skip">Skipped ${sweep.skipped.length} — mid-session or no saved password.</p>` : ""}
+        ${!failed.length && !unsure.length ? `<p class="sr-allgood">Every client checked signed in and reached the dashboard.</p>` : ""}`;
+      report.hidden = false;
+      return;
+    }
+
+    report.hidden = true;
+  }
+
+  // #76 Verify must NOT reuse openVisaSite(): that one sends `startCycling`
+  // when a tab is already sitting on /ofc-schedule, which would begin hunting
+  // slots as the client we only meant to log in as. Always navigate to the
+  // site root instead, so a check always starts from a clean login.
+  const VERIFY_TAB_URLS = ["https://*.usvisascheduling.com/*", "https://*.b2clogin.com/*"];
+
+  // #76 One tab for the whole run, reused.
+  //
+  // This used to query usvisascheduling.com only — but after a sign-out the tab
+  // is sitting on b2clogin.com, so nothing matched and a BRAND NEW TAB opened
+  // for every client. Those orphans kept running the content script, all read
+  // the same verify key, and raced each other: one would clear the keys while
+  // another was still mid-login, which is what stalled the run a few clients in.
+  function openVisaSiteForVerify() {
+    const url = "https://www.usvisascheduling.com/en-US/";
+    chrome.storage.local.get(["__abVerifyTabId"], (d) => {
+      const known = d.__abVerifyTabId;
+      if (known) {
+        chrome.tabs.update(known, { active: true, url }, () => {
+          if (chrome.runtime.lastError) { claimVerifyTab(url); return; }   // tab was closed
+        });
+        return;
+      }
+      claimVerifyTab(url);
+    });
+  }
+
+  // Take over one existing visa/login tab, close any others so they cannot
+  // interfere, and remember which one we are using.
+  function claimVerifyTab(url) {
+    chrome.tabs.query({ url: VERIFY_TAB_URLS }, (tabs) => {
+      if (tabs && tabs.length) {
+        const keep = tabs[0];
+        tabs.slice(1).forEach((t) => chrome.tabs.remove(t.id, () => void chrome.runtime.lastError));
+        chrome.storage.local.set({ __abVerifyTabId: keep.id }, () => {
+          chrome.tabs.update(keep.id, { active: true, url }, () => void chrome.runtime.lastError);
+        });
+        return;
+      }
+      chrome.tabs.create({ url }, (tab) => {
+        if (tab) chrome.storage.local.set({ __abVerifyTabId: tab.id });
       });
     });
   }
@@ -768,9 +1757,24 @@
     });
   }
 
-  document.getElementById("clear-log-btn").addEventListener("click", () => {
-    chrome.storage.local.set({ eventLog: [] });
-  });
+  // #59 Clearing the log is destructive and had no confirmation at all — one
+  // stray click wiped every event. With the shell UI on it becomes a press-
+  // and-hold. With the shell off it keeps the original one-click behaviour,
+  // so the kill switch really does restore what shipped before.
+  function clearEventLog() {
+    chrome.storage.local.set({ eventLog: [] }, refresh);
+  }
+
+  {
+    const clearLogBtn = document.getElementById("clear-log-btn");
+    if (window.SHUI && !window.__SH_UI_KIT_OFF) {
+      clearLogBtn.textContent = "Hold to clear";
+      clearLogBtn.title = "Press and hold to clear the activity log";
+      window.SHUI.bindHold(clearLogBtn, clearEventLog);
+    } else {
+      clearLogBtn.addEventListener("click", clearEventLog);
+    }
+  }
 
   // ─── EXPORT / IMPORT ──────────────────────────────────────────────
 
@@ -858,9 +1862,11 @@
     const urlInput = document.getElementById("sheets-url-input");
     try {
       const connected = await SheetsSync.isConnected();
+      // #59 State lives on a class so the header stylesheet stays in charge;
+      // an inline background here would override every token below it.
+      btn.classList.toggle("is-on", connected);
       if (connected) {
-        btn.textContent = "🔄 Sync Sheets";
-        btn.style.background = "#0f9d58";
+        btn.textContent = "Sync sheets";
         // #57b Keep the URL box available for the owner even when connected, so a
         // different sheet can be linked by pasting its URL. Hiding it here was
         // why a pasted URL never reached connect(). Staff never see it.
@@ -872,8 +1878,7 @@
           link.style.display = "inline";
         }
       } else {
-        btn.textContent = "📊 Sheets Sync";
-        btn.style.background = "#4285f4";
+        btn.textContent = "Sheets";
         link.style.display = "none";
         urlInput.style.display = staffMode ? "none" : "inline-block";
       }
@@ -1018,19 +2023,530 @@
       if (userSel) userSel.value = username;
       switchTab("slots");
       refresh();
+    } else if (btn.classList.contains("btn-check-login")) {
+      // #76 Real login on a live account — spends a page-view, so confirm.
+      if (confirm(`Check the login for ${username}?\n\nThis signs in as them for real, checks the credentials, then signs out. It uses one of their daily page-views.`)) {
+        startLoginCheck(username);
+      }
     }
   });
 
   // ─── MAIN REFRESH LOOP ────────────────────────────────────────────
 
+  // ─── INSIGHTS (issue #59) ──────────────────────────────────────────
+  // Consulate rail, release heatmap, pipeline value, client health.
+  // All derived from data the extension already stores — slotHistory,
+  // userStatuses and the profiles themselves. No new collection, no new
+  // permission, no network call.
+
+  const CONSULATES = ["Mumbai", "New Delhi", "Chennai", "Kolkata", "Hyderabad"];
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+  // slotHistory stores whatever the site calls the place — "CHENNAI VAC",
+  // "NEW DELHI VAC", "MUMBAI OFC" and so on (auto-booking.js writes
+  // `location: loc.name` verbatim). Match on the city token so every
+  // spelling folds onto one consulate.
+  const CONSULATE_TOKENS = [
+    ["Mumbai", "MUMBAI"],
+    ["New Delhi", "DELHI"],
+    ["Chennai", "CHENNAI"],
+    ["Kolkata", "KOLKATA"],
+    ["Hyderabad", "HYDERABAD"],
+  ];
+
+  function normaliseConsulate(raw) {
+    if (!raw) return null;
+    const up = String(raw).toUpperCase();
+    for (const [canonical, token] of CONSULATE_TOKENS) {
+      if (up.indexOf(token) !== -1) return canonical;
+    }
+    return null;
+  }
+
+  // Slot records are written with `foundAt`; rows pulled back from Supabase
+  // may carry `detectedAt` or `timestamp` instead.
+  function slotTime(s) {
+    const raw = s.foundAt || s.timestamp || s.detectedAt || null;
+    if (!raw) return 0;
+    const t = new Date(raw).getTime();
+    return isNaN(t) ? 0 : t;
+  }
+
+  // Hour-of-day in IST, which is the only timezone these consulates release in.
+  function istHour(ts) {
+    const t = typeof ts === "number" ? ts : new Date(ts).getTime();
+    if (!t || isNaN(t)) return null;
+    return new Date(t + IST_OFFSET_MS).getUTCHours();
+  }
+
+  function istDayKey(ts) {
+    const t = typeof ts === "number" ? ts : new Date(ts).getTime();
+    if (!t || isNaN(t)) return null;
+    return new Date(t + IST_OFFSET_MS).toISOString().substring(0, 10);
+  }
+
+  // How far back the heatmap looks. 0 = every record still in storage.
+  // slotHistory is capped (1500 by the writer, pruned to 1000 by the service
+  // worker at 8 MB), so "all" is not "forever" — it is however far back the
+  // surviving records reach. renderStats reports the real span either way.
+  const HEAT_RANGES = [
+    { days: 7, label: "7d" },
+    { days: 30, label: "30d" },
+    { days: 0, label: "All" },
+  ];
+  let heatRangeDays = 30;
+
+  // One pass over slotHistory feeds the rail and the heatmap.
+  // sinceMs limits the heatmap grid only — the rail always reports today.
+  function buildSlotInsights(slotHistory, rangeDays) {
+    const days = rangeDays === undefined ? heatRangeDays : rangeDays;
+    const cutoff = days > 0 ? Date.now() - days * 86400000 : 0;
+    const today = istDayKey(Date.now());
+    const perCity = {};
+    const grid = {};            // city → 24 hour buckets
+    let gridMax = 0;
+    let totalUsed = 0;
+    let oldest = 0, newest = 0, totalStored = 0;
+
+    CONSULATES.forEach((c) => {
+      perCity[c] = { todayInRange: 0, todayTotal: 0, lastAt: 0, lastDate: null, allTime: 0 };
+      grid[c] = new Array(24).fill(0);
+    });
+
+    (slotHistory || []).forEach((s) => {
+      const city = normaliseConsulate(s.location);
+      if (!city) return;                            // a place we don't chart
+      const t = slotTime(s);
+      if (!t) return;
+
+      totalStored++;
+      if (!oldest || t < oldest) oldest = t;
+      if (t > newest) newest = t;
+
+      // The rail is always "today", regardless of the heatmap range.
+      perCity[city].allTime++;
+      if (t > perCity[city].lastAt) {
+        perCity[city].lastAt = t;
+        perCity[city].lastDate = s.date || null;
+      }
+      if (istDayKey(t) === today) {
+        perCity[city].todayTotal++;
+        if (s.inRange) perCity[city].todayInRange++;
+      }
+
+      if (cutoff && t < cutoff) return;             // outside the heatmap window
+      totalUsed++;
+
+      const h = istHour(t);
+      if (h !== null) {
+        grid[city][h]++;
+        if (grid[city][h] > gridMax) gridMax = grid[city][h];
+      }
+    });
+
+    // Densest 3-hour window across all consulates — the actionable number.
+    const colTotals = new Array(24).fill(0);
+    CONSULATES.forEach((c) => grid[c].forEach((v, h) => { colTotals[h] += v; }));
+    let bestStart = 0, bestSum = -1;
+    for (let h = 0; h < 24; h++) {
+      const sum = colTotals[h] + colTotals[(h + 1) % 24] + colTotals[(h + 2) % 24];
+      if (sum > bestSum) { bestSum = sum; bestStart = h; }
+    }
+
+    return {
+      perCity, grid, gridMax, colTotals, bestStart, bestSum, totalUsed, today,
+      rangeDays: days, oldest, newest, totalStored,
+      // The writer caps at 1500 and the service worker prunes to 1000, so a
+      // full-looking history is really a moving window. Say so when at the cap.
+      atCap: totalStored >= 995,
+    };
+  }
+
+  function shortDate(ms) {
+    if (!ms) return "—";
+    return new Date(ms + IST_OFFSET_MS).toISOString().substring(0, 10);
+  }
+
+  function shortAgo(ms) {
+    if (!ms) return "never";
+    const d = Date.now() - ms;
+    if (d < 60000) return Math.max(1, Math.round(d / 1000)) + "s ago";
+    if (d < 3600000) return Math.round(d / 60000) + "m ago";
+    if (d < 86400000) return Math.round(d / 3600000) + "h ago";
+    return Math.round(d / 86400000) + "d ago";
+  }
+
+  let railSignature = "";
+
+  // 01 — Consulate rail. Which city is actually releasing, and how stale.
+  function renderConsulateRail(insights) {
+    const wrap = document.getElementById("consulate-rail-wrap");
+    const rail = document.getElementById("consulate-rail");
+    const hint = document.getElementById("rail-hint");
+    if (!wrap || !rail) return;
+
+    if (!insights.totalUsed) {          // nothing recorded yet — stay out of the way
+      wrap.hidden = true;
+      railSignature = "";
+      return;
+    }
+    wrap.hidden = false;
+
+    const rows = CONSULATES.map((c) => {
+      const d = insights.perCity[c];
+      const mins = d.lastAt ? (Date.now() - d.lastAt) / 60000 : Infinity;
+      const heat = d.todayInRange > 0 ? "hot" : mins < 120 ? "warm" : "cold";
+      return { c, d, heat };
+    });
+
+    const signature = rows.map((r) => `${r.c}:${r.d.todayInRange}:${r.d.todayTotal}:${Math.floor(r.d.lastAt / 60000)}`).join("~");
+    if (signature === railSignature) return;
+    railSignature = signature;
+
+    if (hint) {
+      hint.textContent = insights.bestSum > 0
+        ? `busiest ${String(insights.bestStart).padStart(2, "0")}:00–${String((insights.bestStart + 3) % 24).padStart(2, "0")}:00 IST`
+        : "";
+    }
+
+    rail.innerHTML = rows.map(({ c, d, heat }) => `
+      <div class="city ${heat}" data-city="${esc(c)}">
+        <span class="freshdot"></span>
+        <div class="city-name">${esc(c.toUpperCase())}</div>
+        <div class="city-big">${d.todayInRange}</div>
+        <div class="city-sub">in range today<br>${d.todayTotal} seen · last ${shortAgo(d.lastAt)}</div>
+      </div>`).join("");
+  }
+
+  // 04 — Client health. errorCount ÷ roundCount, worst first.
+  function buildHealth(profiles, statuses) {
+    const out = [];
+    for (const p of profiles) {
+      const st = statuses[p.username] || {};
+      const rounds = st.roundCount || 0;
+      const errs = st.errorCount || 0;
+      if (rounds < 10) continue;               // too little data to judge
+      out.push({
+        username: p.username,
+        name: p.name || deriveProfileName(p.username),
+        rounds, errs,
+        rate: errs / rounds,
+      });
+    }
+    out.sort((a, b) => b.rate - a.rate);
+    return out;
+  }
+
+  // 03 — Pipeline value. Owner-only: prices are hidden from staff by the
+  // same rule that hides the price column on the card.
+  function buildPipeline(profiles, statuses) {
+    const cloudMap = {};
+    cloudProfiles.forEach((cp) => { cloudMap[cp.username] = cp; });
+
+    const monthKey = istDayKey(Date.now()).substring(0, 7);
+    const p = {
+      bookedValue: 0, bookedCount: 0, bookedApplicants: 0,
+      flightValue: 0, flightCount: 0,
+      riskValue: 0, riskCount: 0,
+      byStaff: {},
+    };
+
+    for (const prof of profiles) {
+      const a = resolveAttention(prof, statuses, cloudMap);
+      const price = Number(prof.agreedPrice) || 0;
+      const st = statuses[prof.username] || {};
+      const cloud = cloudMap[prof.username] || {};
+
+      if (a.status === "confirmed") {
+        const when = st.confirmedAt || cloud.confirmedAt;
+        if (when && istDayKey(when) && istDayKey(when).substring(0, 7) === monthKey) {
+          p.bookedValue += price;
+          p.bookedCount++;
+          p.bookedApplicants += Number(prof.applicantCount) || 1;
+        }
+        const sid = cloud.assignedStaffId || "__me";
+        if (!p.byStaff[sid]) p.byStaff[sid] = { count: 0, value: 0 };
+        p.byStaff[sid].count++;
+        p.byStaff[sid].value += price;
+      // "at risk" is a money bucket, not the strict 24h rate-limit gate, so a
+      // local rate_limited status counts even without a cloud timestamp.
+      } else if (a.rateLimited || ["error", "session_expired", "rate_limited"].includes(a.status)) {
+        p.riskValue += price;
+        p.riskCount++;
+      } else {
+        p.flightValue += price;
+        p.flightCount++;
+      }
+    }
+    return p;
+  }
+
+  function rupees(n) {
+    return "₹" + Math.round(n || 0).toLocaleString("en-IN");
+  }
+
+  // 05 — Wall mode. A read-only overlay for a second monitor. Purely a
+  // different view of numbers already on screen; it starts nothing and
+  // stops nothing, so it cannot affect a running client.
+  let wallOn = false;
+  let wallSignature = "";
+  let lastRefresh = null;      // last payload, so wall mode can paint at once
+
+  function toggleWallMode(on) {
+    wallOn = on === undefined ? !wallOn : !!on;
+    const el = document.getElementById("wall-mode");
+    if (!el) return;
+    el.hidden = !wallOn;
+    document.body.classList.toggle("wall-open", wallOn);
+    const btn = document.getElementById("wall-mode-btn");
+    if (btn) btn.setAttribute("aria-pressed", wallOn ? "true" : "false");
+
+    if (!wallOn) return;
+    wallSignature = "";
+    // Paint from the cached payload immediately — refresh() is async and
+    // waiting on it would show a blank black screen for up to 2 seconds.
+    if (lastRefresh) {
+      renderWallMode(lastRefresh.profiles, lastRefresh.statuses,
+                     buildSlotInsights(lastRefresh.slotHistory), lastRefresh.events);
+    }
+    refresh();
+  }
+
+  function renderWallMode(profiles, statuses, insights, events) {
+    if (!wallOn) return;
+    const el = document.getElementById("wall-mode");
+    if (!el) return;
+
+    const cloudMap = {};
+    cloudProfiles.forEach((cp) => { cloudMap[cp.username] = cp; });
+
+    let cycling = 0, found = 0, confirmed = 0, blocked = 0;
+    for (const p of profiles) {
+      const a = resolveAttention(p, statuses, cloudMap);
+      if (["cycling", "logging_in", "security_questions", "on_dashboard"].includes(a.status)) cycling++;
+      if (a.status === "slot_found") found++;
+      if (a.status === "confirmed") confirmed++;
+      if (a.rateLimited) blocked++;
+    }
+
+    const todaySeen = CONSULATES.reduce((s, c) => s + insights.perCity[c].todayTotal, 0);
+    const cityLine = CONSULATES
+      .map((c) => ({ c, d: insights.perCity[c] }))
+      .sort((a, b) => b.d.todayInRange - a.d.todayInRange || b.d.todayTotal - a.d.todayTotal)
+      .map(({ c, d }) => `<span class="wall-city${d.todayInRange > 0 ? " hot" : ""}">${esc(c)} <b>${d.todayInRange}</b></span>`)
+      .join("");
+
+    const feed = (events || []).slice(0, 6).map((e) => `
+      <div class="wall-ev${e.type === "slot_found" ? " found" : e.type === "error" ? " err" : ""}">
+        <span class="t">${formatTime(e.timestamp)}</span>
+        <span>${esc(deriveProfileName(e.username))} — ${esc(e.message)}</span>
+      </div>`).join("");
+
+    const html = `
+      <div class="wall-top">
+        <span class="wall-brand">SLOTHUNTER · OPS</span>
+        <span class="wall-clock">${new Date().toLocaleTimeString("en-IN", { hour12: false, timeZone: "Asia/Kolkata" })} IST</span>
+      </div>
+      <div class="wall-stats">
+        <div class="wall-stat a"><div class="k">CYCLING</div><div class="v">${cycling}</div></div>
+        <div class="wall-stat b"><div class="k">SLOTS TODAY</div><div class="v">${todaySeen}</div></div>
+        <div class="wall-stat c"><div class="k">CONFIRMED</div><div class="v">${confirmed}</div></div>
+        <div class="wall-stat d"><div class="k">BLOCKED</div><div class="v">${blocked}</div></div>
+      </div>
+      <div class="wall-cities">${cityLine}</div>
+      <div class="wall-feed">${feed}</div>
+      <div class="wall-exit">Esc to exit</div>`;
+
+    const sig = hashString(html.replace(/\d{2}:\d{2}:\d{2}/, ""));  // ignore the ticking clock
+    if (sig !== wallSignature) {
+      wallSignature = sig;
+      el.innerHTML = html;
+    } else {
+      const clock = el.querySelector(".wall-clock");
+      if (clock) clock.textContent = new Date().toLocaleTimeString("en-IN", { hour12: false, timeZone: "Asia/Kolkata" }) + " IST";
+    }
+  }
+
+  // ─── SHELL UI (issue #59, Phase 1) ─────────────────────────────────
+  // Attention lane, header sync dots, overflow menu, command palette and
+  // the background-tab badge. Everything here is additive: if ui-kit.js
+  // fails to load, or __SH_UI_KIT_OFF is set, UI_SHELL goes false and
+  // every hook below turns into a no-op. Nothing existing depends on it.
+
+  const UI_SHELL = !window.__SH_UI_KIT_OFF && !!window.SHUI;
+
+  const ATTENTION_ACTIVE_STATES = ["cycling", "logging_in", "security_questions", "on_dashboard", "slot_found"];
+  let laneSignature = "";          // skips the DOM write when nothing changed
+  const announcedSlots = new Set(); // usernames already counted in the tab badge
+
+  const LANE_ICONS = {
+    found: '<path d="M12 2.6l2.7 5.9 6.4.8-4.7 4.4 1.2 6.3L12 16.9 6.4 20l1.2-6.3L2.9 9.3l6.4-.8z"/>',
+    blocked: '<circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/>',
+  };
+
+  // Same precedence rules renderUserCards uses, kept in one place so the
+  // lane can never disagree with the card it points at.
+  function resolveAttention(profile, statuses, cloudMap) {
+    const cloud = cloudMap[profile.username] || {};
+    const local = statuses[profile.username] || {};
+    const localSt = local.status || "";
+    const cloudSt = cloud.status || "";
+    const status = ATTENTION_ACTIVE_STATES.includes(localSt)
+      ? localSt
+      : (ATTENTION_ACTIVE_STATES.includes(cloudSt) ? cloudSt : (localSt || cloudSt || "idle"));
+
+    const rlMs = cloud.rateLimitedAt ? new Date(cloud.rateLimitedAt).getTime() : 0;
+    const rateLimited = rlMs > 0 && (Date.now() - rlMs < 24 * 60 * 60 * 1000);
+    const hoursLeft = rateLimited
+      ? Math.max(0, Math.ceil((24 * 60 * 60 * 1000 - (Date.now() - rlMs)) / 3600000))
+      : 0;
+
+    return { status, rateLimited, hoursLeft, local, cloud };
+  }
+
+  function collectAttention(profiles, statuses) {
+    const cloudMap = {};
+    cloudProfiles.forEach((cp) => { cloudMap[cp.username] = cp; });
+
+    const items = [];
+    for (const p of profiles) {
+      const a = resolveAttention(p, statuses, cloudMap);
+      const name = p.name || deriveProfileName(p.username);
+
+      if (a.status === "slot_found") {
+        const st = a.local.foundAt || a.cloud.foundAt || null;
+        items.push({
+          kind: "found",
+          username: p.username,
+          title: `Slot in range — ${name}`,
+          detail: st ? `Found ${timeAgo(st)} · waiting on you` : "Waiting on you",
+        });
+      } else if (a.rateLimited) {
+        items.push({
+          kind: "blocked",
+          username: p.username,
+          title: `Rate limited — ${name}`,
+          detail: `Blocked ~${a.hoursLeft}h more · do not log in from any device`,
+        });
+      }
+    }
+    // Found first: it is time-critical, a block is not.
+    items.sort((x, y) => (x.kind === y.kind ? 0 : x.kind === "found" ? -1 : 1));
+    return items;
+  }
+
+  function renderAttentionLane(profiles, statuses) {
+    if (!UI_SHELL) return;
+    const lane = document.getElementById("attention-lane");
+    const grid = document.getElementById("lane-grid");
+    const count = document.getElementById("lane-count");
+    if (!lane || !grid || !count) return;
+
+    const items = collectAttention(profiles, statuses);
+
+    // The lane redraws on the same 2s tick as everything else. Hashing the
+    // rendered content means an unchanged lane never touches the DOM, so
+    // hover and the breathing animation survive.
+    const signature = items.map((i) => `${i.kind}|${i.username}|${i.detail}`).join("~");
+    if (signature === laneSignature) return;
+    laneSignature = signature;
+
+    if (!items.length) {
+      lane.hidden = true;
+      grid.innerHTML = "";
+      count.textContent = "0";
+      return;
+    }
+
+    lane.hidden = false;
+    count.textContent = String(items.length);
+    grid.innerHTML = items.map((i) => `
+      <div class="lane-item lane-${i.kind}">
+        <svg class="lane-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${LANE_ICONS[i.kind]}</svg>
+        <div class="lane-body">
+          <h4>${SHUI.esc(i.title)}</h4>
+          <p>${SHUI.esc(i.detail)}</p>
+        </div>
+        <button type="button" class="btn btn-small lane-goto" data-user="${SHUI.esc(i.username)}">Show</button>
+      </div>`).join("");
+  }
+
+  // A slot going from not-found to found is the one event worth stealing
+  // the operator's attention for, so it drives both the toast and the badge.
+  function announceNewSlots(profiles, statuses) {
+    if (!UI_SHELL) return;
+    const cloudMap = {};
+    cloudProfiles.forEach((cp) => { cloudMap[cp.username] = cp; });
+
+    const stillFound = new Set();
+    for (const p of profiles) {
+      const a = resolveAttention(p, statuses, cloudMap);
+      if (a.status !== "slot_found") continue;
+      stillFound.add(p.username);
+      if (announcedSlots.has(p.username)) continue;
+      announcedSlots.add(p.username);
+
+      const name = p.name || deriveProfileName(p.username);
+      SHUI.bumpBadge("Slot found");
+      SHUI.toast({
+        kind: "found",
+        title: `Slot in range — ${name}`,
+        body: "Open the client to submit.",
+        actionLabel: "Show",
+        onAction: () => focusProfileCard(p.username),
+      });
+    }
+    // Let a client re-announce if it drops out of slot_found and returns.
+    announcedSlots.forEach((u) => { if (!stillFound.has(u)) announcedSlots.delete(u); });
+  }
+
+  function focusProfileCard(username) {
+    const card = document.querySelector(`#user-cards .user-card[data-username="${CSS.escape(username)}"]`);
+    if (!card) return;
+    card.scrollIntoView({ block: "center", behavior: SHUI.reduceMotion ? "auto" : "smooth" });
+    card.classList.add("sh-flash");
+    setTimeout(() => card.classList.remove("sh-flash"), 1200);
+  }
+
+  // Connection dots on the header sync cluster.
+  function updateSyncDots() {
+    if (!UI_SHELL) return;
+    const cloudOn = !!(typeof SUPA !== "undefined" && SUPA && SUPA.isReady && SUPA.isReady());
+    document.getElementById("cloud-btn")?.classList.toggle("is-on", cloudOn);
+
+    // The sheets dot is owned by updateSheetsUI(), which is the only place
+    // that knows the real connection state. Touching it here too would make
+    // the two fight over the class on every 2s tick.
+
+    chrome.storage.local.get(["telegramBotToken", "telegramChatId"], (d) => {
+      const on = !!(d.telegramBotToken && d.telegramChatId);
+      document.getElementById("telegram-btn")?.classList.toggle("is-on", on);
+    });
+  }
+
   async function refresh() {
     const data = await loadData();
+    lastRefresh = data;
     updateStats(data.profiles, data.statuses, data.events);
-    renderUserCards(data.profiles, data.statuses, data.slotHistory);
+    renderAttentionLane(data.profiles, data.statuses);
+    announceNewSlots(data.profiles, data.statuses);
+    updateSyncDots();
+    renderUserCards(data.profiles, data.statuses, data.slotHistory, data.loginHealth, data.verifyUser);
     renderActivityLog(data.events);
     renderSlotHistory(data.slotHistory, data.profiles);
-    renderStats(data.dailyStats, data.storageStats);
+    renderStats(data.dailyStats, data.storageStats, data.slotHistory, data.profiles, data.statuses);
     updateLogUserFilter(data.profiles);
+    updateYearFilter(data.profiles);
+    updateViewCounts(data.profiles, data.statuses, data.slotHistory);
+    renderSweep(data.sweep, data.loginHealth, data.profiles);
+    tickSweep(data.profiles, data.statuses, data.verifyUser, data.loginHealth);
+    renderBookedPanel(data.profiles, data.statuses, data.slotHistory);
+
+    // #59 Insights — one slotHistory pass shared by the rail and wall mode.
+    const insights = buildSlotInsights(data.slotHistory);
+    renderConsulateRail(insights);
+    renderWallMode(data.profiles, data.statuses, insights, data.events);
 
     // Update header with active user
     const badge = document.getElementById("active-user-status");
@@ -1086,6 +2602,92 @@
   document.getElementById("filter-status").addEventListener("change", refresh);
   document.getElementById("filter-visa")?.addEventListener("change", refresh);
   document.getElementById("filter-month")?.addEventListener("change", refresh);
+  document.getElementById("filter-year")?.addEventListener("change", refresh);
+
+  // #76 One button: check every client, then report who failed.
+  document.getElementById("sweep-start-btn")?.addEventListener("click", () => {
+    chrome.storage.local.get(["userProfilesList", "userStatuses", "activeAutomationUser"], (d) => {
+      if (d.activeAutomationUser) {
+        alert(`Can't run the login check — ${d.activeAutomationUser} is mid-session.\n\nStop that client first.`);
+        return;
+      }
+      startSweep(d.userProfilesList || [], d.userStatuses || {});
+    });
+  });
+
+  document.getElementById("sweep-resume")?.addEventListener("click", async () => {
+    const sweep = await readSweep();
+    if (!sweep) return;
+    sweep.paused = false;
+    sweep.retryAt = 0;
+    sweep.nextAt = 0;
+    await writeSweep(sweep);
+    refresh();
+  });
+
+  document.getElementById("sweep-stop")?.addEventListener("click", () => {
+    if (confirm("Stop the login check?\n\nClients already checked keep their result.")) {
+      stopSweep("Stopped by you");
+    }
+  });
+
+  document.getElementById("sweep-report-close")?.addEventListener("click", async () => {
+    const sweep = await readSweep();
+    if (sweep) { sweep.dismissed = true; await writeSweep(sweep); }
+    refresh();
+  });
+
+  // #75 View switcher. Active is the working list; booked swaps the card grid
+  // for the reconciliation table.
+  document.getElementById("view-switch")?.addEventListener("click", (e) => {
+    const btn = e.target.closest(".view-btn");
+    if (!btn) return;
+    clientView = btn.dataset.view || "active";
+    document.querySelectorAll("#view-switch .view-btn").forEach((b) => {
+      const on = b === btn;
+      b.classList.toggle("is-on", on);
+      b.setAttribute("aria-selected", on ? "true" : "false");
+    });
+    const grid = document.getElementById("user-cards");
+    if (grid) grid.hidden = clientView === "booked";
+    bookedSignature = "";
+    chrome.storage.local.set({ __clientView: clientView });
+    refresh();
+  });
+
+  chrome.storage.local.get(["__clientView"], (d) => {
+    if (!d.__clientView) return;
+    const btn = document.querySelector(`#view-switch .view-btn[data-view="${d.__clientView}"]`);
+    if (btn) btn.click();
+  });
+
+  // #75 Record a payment. Written straight onto the profile, so it survives
+  // and syncs like any other profile field.
+  document.getElementById("booked-rows")?.addEventListener("change", (e) => {
+    const input = e.target.closest(".bk-paid");
+    if (!input) return;
+    const username = input.dataset.user;
+    const value = Math.max(0, Math.round(Number(input.value) || 0));
+
+    chrome.storage.local.get(["userProfilesList"], (d) => {
+      const profiles = d.userProfilesList || [];
+      const idx = profiles.findIndex((p) => p.username === username);
+      if (idx === -1) return;
+      // Never let a recorded payment exceed what was agreed — that is a typo,
+      // and it would make Outstanding go negative.
+      const agreed = agreedOf(profiles[idx]);
+      const capped = agreed > 0 ? Math.min(value, agreed) : value;
+      profiles[idx] = { ...profiles[idx], paidAmount: capped };
+      chrome.storage.local.set({ userProfilesList: profiles }, () => {
+        if (capped !== value) input.value = capped;
+        bookedSignature = "";
+        if (SUPA && SUPA.isReady() && SUPA.pushProfile) {
+          try { SUPA.pushProfile(profiles[idx]); } catch (err) { console.log("paid sync skipped:", err.message); }
+        }
+        refresh();
+      });
+    });
+  });
   document.getElementById("profile-search")?.addEventListener("input", refresh);
   document.getElementById("log-filter-user").addEventListener("change", refresh);
   document.getElementById("log-filter-type").addEventListener("change", refresh);
@@ -1127,6 +2729,13 @@
     } else if (tab === "stats") {
       tabStats.style.opacity = "1";
       paneStats.style.display = "block";
+      // renderStats skips itself while the pane is hidden, so on first reveal
+      // paint straight from the cached payload — otherwise the tab sits empty
+      // until the next 2s tick.
+      if (lastRefresh) {
+        renderStats(lastRefresh.dailyStats, lastRefresh.storageStats,
+                    lastRefresh.slotHistory, lastRefresh.profiles, lastRefresh.statuses);
+      }
     } else {
       tabLog.style.opacity = "1";
       ctrlA.style.display = "flex";
@@ -1202,6 +2811,8 @@
       document.getElementById("edit-visa-type").value = profile.visaType || "";
       document.getElementById("edit-applicants").value = profile.applicantCount || 1;
       document.getElementById("edit-price").value = profile.pricePerPerson || profile.agreedPrice || "";
+      const paidField = document.getElementById("edit-paid");
+      if (paidField) paidField.value = profile.paidAmount || "";
       calcTotalPrice();
 
       // Automation
@@ -1251,6 +2862,7 @@
       visaType: document.getElementById("edit-visa-type").value.trim(),
       applicantCount: parseInt(document.getElementById("edit-applicants").value) || 1,
       pricePerPerson: document.getElementById("edit-price").value.trim(),
+      paidAmount: Math.max(0, Math.round(Number(document.getElementById("edit-paid")?.value) || 0)),
       agreedPrice: String((parseInt(document.getElementById("edit-price").value) || 0) * (parseInt(document.getElementById("edit-applicants").value) || 1)),
       autoLogin: document.getElementById("edit-auto-login").checked,
       autoDashboard: document.getElementById("edit-auto-dashboard").checked,
@@ -1349,9 +2961,32 @@
     "kol": "Kolkata", "kolkata": "Kolkata", "calcutta": "Kolkata",
   };
 
+  // #74 Year inference. The old code stamped `new Date().getFullYear()` on
+  // every parsed range, so a client asking in September for "January" was
+  // stored as January of the year that had almost finished — a window in the
+  // past that no slot could ever match.
+  //
+  // Rules, in order:
+  //   1. An explicit year in the text wins ("jan 2027", "march 27").
+  //   2. Otherwise roll forward: a month that has already passed this year
+  //      means next year.
+  //   3. A later month that lands before an earlier one has wrapped into the
+  //      following year ("Nov to Feb" = Nov this year → Feb next).
+  function explicitYearIn(text) {
+    const full = text.match(/\b(20\d{2})\b/);
+    if (full) return parseInt(full[1], 10);
+    // "march 27" / "jan '27" — only accept a plausible near-future shorthand,
+    // so a day-of-month like "March 27" is not mistaken for a year.
+    const short = text.match(/\b'(\d{2})\b/);
+    if (short) return 2000 + parseInt(short[1], 10);
+    return null;
+  }
+
   function parseMonthRange(text) {
-    const lower = text.toLowerCase().replace(/[^a-z0-9\s,&-]/g, " ");
-    const year = new Date().getFullYear();
+    const lower = text.toLowerCase().replace(/[^a-z0-9\s,&'-]/g, " ");
+    const now = new Date();
+    const explicit = explicitYearIn(lower);
+    const year = explicit !== null ? explicit : now.getFullYear();
     const monthEntries = [];
     for (const [name, num] of Object.entries(MONTH_MAP)) {
       const idx = lower.indexOf(name);
@@ -1363,28 +2998,36 @@
     if (monthEntries.length === 0) return { startDate: "", endDate: "" };
     monthEntries.sort((a, b) => a.idx - b.idx);
 
-    function weekToDay(monthNum, textAfterMonth) {
+    function weekToDay(monthNum, textAfterMonth, forYear) {
       const wk = textAfterMonth.match(/(\d)\s*(?:st|nd|rd|th)?\s*week/);
       if (wk) {
         const weekNum = parseInt(wk[1]);
-        return Math.min((weekNum - 1) * 7 + 1, new Date(year, monthNum + 1, 0).getDate());
+        return Math.min((weekNum - 1) * 7 + 1, new Date(forYear, monthNum + 1, 0).getDate());
       }
       return null;
     }
 
     const firstEntry = monthEntries[0];
     const lastEntry = monthEntries[monthEntries.length - 1];
-    const startWeekDay = weekToDay(firstEntry.num, lower.substring(firstEntry.idx));
+
+    // Rule 2 — roll forward. With no explicit year, a month that has already
+    // gone by this year is the client asking for next year.
+    let startYear = year;
+    if (explicit === null && firstEntry.num < now.getMonth()) startYear = year + 1;
+
+    // Rule 3 — wrap. "Nov and Feb" means Nov this year to Feb the next, not
+    // an inverted range inside one year.
+    const endYear = lastEntry.num < firstEntry.num ? startYear + 1 : startYear;
+
+    const startWeekDay = weekToDay(firstEntry.num, lower.substring(firstEntry.idx), startYear);
     const startDay = startWeekDay || 1;
-    const startDate = `${year}-${String(firstEntry.num + 1).padStart(2, "0")}-${String(startDay).padStart(2, "0")}`;
-    const endWeekDay = weekToDay(lastEntry.num, lower.substring(lastEntry.idx));
-    let endDay;
-    if (endWeekDay) {
-      endDay = Math.min(endWeekDay + 6, new Date(year, lastEntry.num + 1, 0).getDate());
-    } else {
-      endDay = new Date(year, lastEntry.num + 1, 0).getDate();
-    }
-    const endDate = `${year}-${String(lastEntry.num + 1).padStart(2, "0")}-${String(endDay).padStart(2, "0")}`;
+    const startDate = `${startYear}-${String(firstEntry.num + 1).padStart(2, "0")}-${String(startDay).padStart(2, "0")}`;
+
+    const endWeekDay = weekToDay(lastEntry.num, lower.substring(lastEntry.idx), endYear);
+    const lastDayOfEnd = new Date(endYear, lastEntry.num + 1, 0).getDate();
+    const endDay = endWeekDay ? Math.min(endWeekDay + 6, lastDayOfEnd) : lastDayOfEnd;
+    const endDate = `${endYear}-${String(lastEntry.num + 1).padStart(2, "0")}-${String(endDay).padStart(2, "0")}`;
+
     return { startDate, endDate };
   }
 
@@ -1557,6 +3200,8 @@
     document.getElementById("edit-applicants").value = "1";
     document.getElementById("edit-price").value = "";
     document.getElementById("edit-total-price").value = "";
+    const paidReset = document.getElementById("edit-paid");
+    if (paidReset) paidReset.value = "";
     document.getElementById("edit-auto-login").checked = true;
     document.getElementById("edit-auto-dashboard").checked = true;
     document.getElementById("edit-auto-select").checked = true;
@@ -1910,7 +3555,6 @@
       deviceName = prompt("Name this Chrome profile (e.g. Arun-Main, Kavita-Laptop):");
       if (!deviceName || !deviceName.trim()) { statusEl.textContent = "Device name required!"; statusEl.style.color = "#ef5350"; return; }
       deviceName = deviceName.trim();
-      if (!/^TEST-/i.test(deviceName)) deviceName = "TEST-" + deviceName;  // TEST build tag
     }
 
     statusEl.textContent = "Connecting...";
@@ -2062,7 +3706,6 @@
       return;
     }
     deviceName = deviceName.trim();
-    if (!/^TEST-/i.test(deviceName)) deviceName = "TEST-" + deviceName;  // TEST build tag
 
     statusEl.textContent = "Importing...";
     statusEl.style.color = "#f39c12";
@@ -2218,6 +3861,8 @@
     // form-row order: 0 username, 1 password ... price row is matched by its input
     const pwRow = document.getElementById("edit-password")?.closest(".form-row");
     if (pwRow) pwRow.style.display = staffMode ? "none" : "";
+    // #75 Amount Received sits in this same row, so hiding it here keeps
+    // every money field out of staff view in one move.
     const priceRow = document.getElementById("edit-price")?.closest(".form-row");
     if (priceRow) priceRow.style.display = staffMode ? "none" : "";
     const visaRow = document.getElementById("edit-visa-type")?.closest(".form-row");
@@ -2555,6 +4200,126 @@
       setTimeout(refreshStaff, 1500);     // let cloud sync connect first
     }
   });
+
+  // ─── SHELL UI WIRING (issue #59, Phase 1) ──────────────────────────
+  // Every action below re-uses an existing control by clicking it, so the
+  // palette and the overflow menu cannot drift from the buttons they
+  // stand in for, and no logic is duplicated.
+
+  if (UI_SHELL) {
+    // Attention lane → jump to the card.
+    document.getElementById("lane-grid")?.addEventListener("click", (e) => {
+      const btn = e.target.closest(".lane-goto");
+      if (btn) focusProfileCard(btn.dataset.user);
+    });
+
+    // Consulate rail → filter the grid to that city's clients.
+    document.getElementById("consulate-rail")?.addEventListener("click", (e) => {
+      const tile = e.target.closest(".city");
+      if (!tile) return;
+      const search = document.getElementById("profile-search");
+      if (!search) return;
+      const city = tile.dataset.city || "";
+      search.value = search.value.trim().toLowerCase() === city.toLowerCase() ? "" : city;
+      refresh();
+    });
+
+    // #74 Heatmap range picker. Delegated, because the stats pane is
+    // re-rendered wholesale whenever its content hash changes.
+    document.getElementById("stats-pane")?.addEventListener("click", (e) => {
+      const btn = e.target.closest(".heat-range");
+      if (!btn) return;
+      heatRangeDays = parseInt(btn.dataset.days, 10) || 0;
+      chrome.storage.local.set({ __heatRangeDays: heatRangeDays });
+      statsSignature = "";                       // force a repaint
+      if (lastRefresh) {
+        renderStats(lastRefresh.dailyStats, lastRefresh.storageStats,
+                    lastRefresh.slotHistory, lastRefresh.profiles, lastRefresh.statuses);
+      }
+    });
+
+    chrome.storage.local.get(["__heatRangeDays"], (d) => {
+      if (typeof d.__heatRangeDays === "number") {
+        heatRangeDays = d.__heatRangeDays;
+        statsSignature = "";
+      }
+    });
+
+    // Wall mode.
+    document.getElementById("wall-mode-btn")?.addEventListener("click", () => toggleWallMode());
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && wallOn) { e.preventDefault(); toggleWallMode(false); }
+    });
+
+    // Header overflow menu.
+    const moreBtn = document.getElementById("hdr-more-btn");
+    const morePanel = document.getElementById("hdr-more-panel");
+    if (moreBtn && morePanel) {
+      const setMenu = (open) => {
+        morePanel.setAttribute("data-open", open ? "1" : "0");
+        moreBtn.setAttribute("aria-expanded", open ? "true" : "false");
+      };
+      moreBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        setMenu(morePanel.getAttribute("data-open") !== "1");
+      });
+      // Import opens a file dialog, so the menu must not eat the click.
+      morePanel.addEventListener("click", (e) => {
+        if (e.target.closest("input")) return;
+        if (e.target.closest("button, a")) setMenu(false);
+      });
+      document.addEventListener("click", (e) => {
+        if (!e.target.closest(".hdr-more")) setMenu(false);
+      });
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") setMenu(false);
+      });
+    }
+
+    const clickById = (id) => document.getElementById(id)?.click();
+
+    SHUI.setPaletteProvider(() => {
+      const items = [];
+
+      document.querySelectorAll("#user-cards .user-card").forEach((card) => {
+        const username = card.dataset.username;
+        if (!username) return;
+        const badge = card.querySelector(".status-badge");
+        const statusText = badge ? badge.textContent.trim() : "";
+        const tone = card.classList.contains("slot-found") ? "found"
+          : card.classList.contains("error") ? "error"
+          : card.classList.contains("active") ? "live"
+          : card.classList.contains("confirmed") ? "ok" : "idle";
+        items.push({
+          group: "Clients",
+          label: card.querySelector(".card-name")?.textContent.trim() || username,
+          meta: statusText,
+          tone,
+          run: () => focusProfileCard(username),
+        });
+      });
+
+      const cmd = (label, id) => {
+        const el = document.getElementById(id);
+        // Skip anything hidden — staff mode hides owner-only controls, and
+        // the palette must not offer what the page will not honour.
+        if (!el || el.style.display === "none") return;
+        items.push({ group: "Commands", label, tone: "cmd", run: () => clickById(id) });
+      };
+
+      cmd("Add client", "add-user-btn");
+      cmd("Open Cloud Sync", "cloud-btn");
+      cmd("Open Telegram settings", "telegram-btn");
+      cmd("Open Google Sheets sync", "sheets-sync-btn");
+      cmd("Open Staff", "staff-btn");
+      cmd("Export JSON", "export-btn");
+      cmd("Export CSV", "export-csv-btn");
+      cmd("Import JSON", "import-btn");
+      cmd("Toggle activity log panel", "toggle-logs-btn");
+
+      return items;
+    });
+  }
 
   refresh();
   setInterval(refresh, REFRESH_INTERVAL);
