@@ -40,14 +40,9 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
   );
 });
 
-chrome.runtime.onMessageExternal.addListener((e, t, s) => {
-  if (e) {
-    if (e.message && "version" === e.message)
-      s({ version: chrome.runtime.getManifest().version });
-    else if (e.apiKey) chrome.storage.local.set({ apiKey: e.apiKey });
-  }
-  return true;
-});
+// #78 onMessageExternal removed. It let any page allowed by
+// externally_connectable (checkvisaslots.com) write our apiKey into storage
+// and probe whether the extension was installed.
 
 chrome.action.onClicked.addListener((tab) => {
   chrome.tabs.create({ url: chrome.runtime.getURL("dashboard.html") });
@@ -90,20 +85,8 @@ function getAppointmentConfirmation() {
     .then((e) => e);
 }
 
-function randomFileName(len = 5) {
-  return (
-    Array.from({ length: len }, () =>
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".charAt(
-        Math.floor(62 * Math.random())
-      )
-    ).join("") + ".png"
-  );
-}
-
-function flattenScheduleDays(e) {
-  return e.length ? e.reduce((acc, t) => ((acc[t.ID] = t.Date), acc), {}) : {};
-}
-
+// #78 randomFileName/flattenScheduleDays removed — only the CheckVisaSlots
+// upload blocks used them.
 // ─── TELEGRAM BOT COMMANDS (2-way communication) ─────────────────
 
 const TG_POLL_ALARM = "telegram-poll";
@@ -1030,116 +1013,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // Appointment confirmation push
-  if (msg.resource === "/push/appointment-confirmation") {
-    chrome.storage.local.get(["apiKey", "extVersion"], function (settings) {
-      const formData = new FormData();
-      ["apntDetails", "userDetails", "capturedAt"].forEach((key) => {
-        if (msg.hasOwnProperty(key)) {
-          const val = msg[key];
-          formData.append(
-            key,
-            typeof val === "object" && val !== null ? JSON.stringify(val) : val
-          );
-        }
-      });
-
-      fetch("https://app.checkvisaslots.com" + msg.resource, {
-        headers: {
-          "x-api-key": settings.apiKey,
-          extVersion: settings.extVersion,
-        },
-        method: "POST",
-        body: formData,
-      })
-        .then(() => sendResponse({ success: true }))
-        .catch((e) => {
-          console.log("Error sending appointment confirmation:", e);
-          sendResponse({ success: false, error: e });
-        });
-    });
-    return true;
-  }
-
-  // Slot data push (existing functionality)
-  if (msg.resource && msg.imgUri && msg.portal_id) {
-    const queryString = sender?.tab?.url?.split("?")[1] ?? null;
-    chrome.storage.local.get(
-      ["apiKey", "userProfiles", "extVersion", "sn_uid_valid"],
-      function (settings) {
-        try {
-          let slotPage = msg.slot_page;
-          let profile = JSON.parse(settings.userProfiles)[msg.portal_id];
-          let [header, b64data] = msg.imgUri.split(",");
-          let decoded = atob(b64data);
-          let bytes = Array.from({ length: decoded.length }).map((_, i) =>
-            decoded.charCodeAt(i)
-          );
-          let filename = randomFileName();
-          let formData = new FormData();
-
-          formData.append(
-            "input",
-            new Blob([new Uint8Array(bytes)], { type: "image/png" }),
-            filename
-          );
-
-          if (profile.hasOwnProperty("VisaClass")) {
-            let visaDets = { VisaClass: profile.VisaClass };
-            if (profile.VisaClassID) visaDets.VisaClassID = profile.VisaClassID;
-            if (profile.visaPriority)
-              visaDets.visaPriority = profile.visaPriority;
-            formData.append("visaDetails", JSON.stringify(visaDets));
-          } else {
-            formData.append("visaDetails", profile.visaDetails);
-          }
-
-          formData.append("userDetails", profile.userDetails);
-          formData.append(
-            "apntDetails",
-            JSON.stringify(profile.apntDetails)
-          );
-          formData.append("applicants", profile.applicantsCount);
-          formData.append(
-            "slotDetails",
-            JSON.stringify(slotPage.slotDetails)
-          );
-          formData.append(
-            "appointmentTimes",
-            JSON.stringify(slotPage.appointmentTimes)
-          );
-          formData.append("visaCountry", profile?.visaCountry);
-          formData.append("slotLocationVal", slotPage.slotLocationVal);
-          if (queryString) formData.append("pageUri", queryString);
-          if (
-            slotPage.hasOwnProperty("slotdetails") &&
-            settings.sn_uid_valid
-          ) {
-            formData.append(
-              "slotdetails",
-              btoa(
-                JSON.stringify(flattenScheduleDays(slotPage.slotdetails)).replaceAll(
-                  "T00:00:00",
-                  ""
-                )
-              )
-            );
-          }
-
-          fetch("https://app.checkvisaslots.com" + msg.resource, {
-            headers: {
-              "x-api-key": settings.apiKey,
-              extVersion: settings.extVersion,
-            },
-            method: "POST",
-            body: formData,
-          }).catch((e) => console.log(e));
-        } catch (e) {
-          console.log("Slot push error:", e);
-        }
-      }
-    );
-  }
+  // #78 CheckVisaSlots upload endpoints removed: they POSTed client
+  // appointment/user details and page screenshots to app.checkvisaslots.com.
+  // Dead since content.js went in #69 — this was its service-worker half.
 
   return true;
 });

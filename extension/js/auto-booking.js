@@ -666,7 +666,11 @@
     trackEvent(EVENT_TYPES.CAPTCHA, "Auto-solving CAPTCHA", activeUser);
 
     let attempt = 0;
-    while (true) {
+    // #78 Bounded. This loop used to be unbounded while CAPTCHA_MAX_RETRIES sat
+    // unused, so with no OCR server reachable it refreshed the CAPTCHA every
+    // ~3s forever — a textbook bot signature, and a fast route to a block.
+    // Now it gives up, tells the operator, and leaves the field for a human.
+    while (attempt < CAPTCHA_MAX_RETRIES) {
       attempt++;
       if (__abortAll) { log("CAPTCHA aborted"); return; }
       await sleep(1000);
@@ -710,6 +714,17 @@
       log("CAPTCHA appears solved or page navigated");
       return;
     }
+
+    // #78 Budget spent. Stop rather than keep refreshing — the field is left
+    // filled-in and focused so a human can finish it from a remote session.
+    log(`CAPTCHA: gave up after ${CAPTCHA_MAX_RETRIES} attempts`);
+    trackEvent(EVENT_TYPES.CAPTCHA, `Gave up after ${CAPTCHA_MAX_RETRIES} attempts`, activeUser);
+    captchaInput.focus();
+    sendTelegramNotification("error",
+      `🔤 <b>CAPTCHA NEEDS A HUMAN</b>\n\n👤 <b>User:</b> ${activeUser}\n` +
+      `❌ Could not read it after ${CAPTCHA_MAX_RETRIES} tries\n` +
+      `✋ Stopped — solve it on this machine, then the login continues\n` +
+      `ℹ️ If this keeps happening the site has re-enabled CAPTCHAs and the OCR server needs starting`);
   }
 
   // ─── SECURITY QUESTIONS ─────────────────────────────────────────────

@@ -12,6 +12,22 @@ Format:
 
 ---
 
+## 2026-09-22 — Ready for the Chrome Web Store, and the last of the competitor's code is gone (Issue #78)
+
+**What it does:** Three things, so the extension can be published to the Chrome Web Store and installed by your team from a link.
+
+**The competitor's leftover code is removed.** When we deleted their tracking file back in #69, half of it survived in the background script. That half could send a client's **appointment details, personal details and screenshots of the page** to CheckVisaSlots' own server, and their website was allowed to write the key those uploads used. It had no way of running any more — the part that triggered it was already deleted — but it was still sitting in the extension, and anyone reviewing the code would rightly refuse it. It is now gone completely, along with the setting that let their website talk to your extension at all.
+
+**The CAPTCHA loop can no longer spin forever.** If the site ever shows a CAPTCHA again and the reader program is not running, the extension used to refresh that CAPTCHA every three seconds indefinitely — behaviour that looks exactly like a bot and invites a block. It now stops after 5 tries and sends you a Telegram message asking a person to type it in.
+
+**Store paperwork is written.** A privacy policy page, a plain-English reason for every permission the extension asks for, and the full listing text — all ready to paste, in the new `store/` folder.
+
+**Why:** Loading the extension by hand on each machine needs developer mode, shows a warning on every Chrome start, and has to be redone by hand for every update. Publishing it privately means your staff install from a link and updates arrive on their own.
+
+**What changed for you:** Nothing in how the bot behaves — everything removed was already dead code. One small tidy-up: a permission the extension asked for but never used has been dropped.
+
+**What you need to do:** Follow `store/README.md`. It is four steps: put the privacy policy on a free GitHub page, pay Google's one-time $5 developer fee, upload the package, and paste in the text from `store/LISTING.md`. **The one step you must not skip is the last one** — after Google approves it, the extension gets a new permanent ID, and Google Sheets sync will quietly stop working until you register that ID. The instructions spell out exactly where.
+
 ## 2026-09-18 — Check whether a client's login still works, without booking anything (Issue #76)
 
 **What it does:** Adds a **Check login** button to each client card. It signs in as that client for real, works out how far it got, then signs out — and never goes anywhere near booking.
