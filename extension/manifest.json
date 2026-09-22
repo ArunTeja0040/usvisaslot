@@ -3,7 +3,6 @@
     "description": "Automated US visa appointment hunter — auto-login, CAPTCHA solving, slot detection, and auto-booking.",
     "manifest_version": 3,
     "version": "5.0.0",
-    "homepage_url": "https://checkvisaslots.com/",
     "background": {"service_worker": "js/sw-enhanced.js"},
     "action": {
         "default_icon": { "32": "img/32.png" }
@@ -39,7 +38,7 @@
             "run_at": "document_start"
         }
     ],
-    "permissions": ["storage", "activeTab", "scripting", "tabs", "alarms", "identity"],
+    "permissions": ["storage", "scripting", "tabs", "alarms", "identity"],
     "host_permissions": [
         "https://*.usvisascheduling.com/*",
         "https://atlasauth.b2clogin.com/*",
@@ -52,8 +51,5 @@
     "oauth2": {
         "client_id": "245548528538-lsok9hd7ons1tt97v4e7ftlrpqnqgec1.apps.googleusercontent.com",
         "scopes": ["https://www.googleapis.com/auth/spreadsheets"]
-    },
-    "externally_connectable": {
-        "matches": ["https://*.checkvisaslots.com/*"]
     }
 }

@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SlotHunter — Privacy Policy</title>
+<style>
+  :root { --ink:#1a1d21; --muted:#5b6570; --rule:#e3e7eb; --bg:#fff; --accent:#1e4d8c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink:#e8eaed; --muted:#9aa4af; --rule:#2b3138; --bg:#15181c; --accent:#7fb0ef; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  main { max-width:44rem; margin:0 auto; padding:3rem 1.25rem 5rem; }
+  h1 { font-size:2rem; line-height:1.2; margin:0 0 .35rem; letter-spacing:-.02em; }
+  h2 { font-size:1.2rem; margin:2.5rem 0 .6rem; letter-spacing:-.01em; }
+  .updated { color:var(--muted); font-size:.9rem; margin:0 0 2.5rem;
+             padding-bottom:1.5rem; border-bottom:1px solid var(--rule); }
+  table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:.95rem; }
+  th,td { text-align:left; padding:.6rem .7rem; border-bottom:1px solid var(--rule); vertical-align:top; }
+  th { font-weight:600; }
+  code { background:color-mix(in srgb, var(--ink) 8%, transparent);
+         padding:.12em .4em; border-radius:4px; font-size:.9em; }
+  .callout { border:1px solid var(--rule); padding:1rem 1.15rem;
+             border-radius:6px; margin:1.5rem 0; }
+  a { color:var(--accent); text-underline-offset:2px; }
+  ul { padding-left:1.25rem; }
+  li { margin:.35rem 0; }
+  footer { margin-top:3.5rem; padding-top:1.5rem; border-top:1px solid var(--rule);
+           color:var(--muted); font-size:.9rem; }
+  .wrap { overflow-x:auto; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>SlotHunter — Privacy Policy</h1>
+<p class="updated">Last updated: 22 September 2026</p>
+
+<p>SlotHunter is a private, invitation-only Chrome extension used by a single visa-appointment
+booking business and its own staff. It is not offered to the general public.</p>
+
+<p>This policy explains what the extension stores, where it sends it, and what it deliberately
+does not do.</p>
+
+<h2>What the extension handles</h2>
+
+<p>To book an appointment on the user's behalf, the extension handles data belonging to the
+operator's clients:</p>
+
+<ul>
+  <li>Client login credentials for the US visa scheduling website (username and password)</li>
+  <li>Security question answers required by that website</li>
+  <li>Appointment preferences — wanted date range, consulate locations, number of applicants, visa category</li>
+  <li>Booking activity — which slots were seen, attempted and confirmed</li>
+</ul>
+
+<div class="callout">
+  <strong>Credentials are encrypted before they leave the device.</strong> Passwords and security
+  answers are encrypted with AES-GCM using a key derived from a master password that only the
+  operator knows. That master password is never transmitted and is not recoverable by anyone else.
+</div>
+
+<h2>Where data is sent</h2>
+
+<div class="wrap">
+<table>
+  <tr><th>Destination</th><th>What is sent</th><th>Why</th></tr>
+  <tr>
+    <td><code>usvisascheduling.com</code><br><code>atlasauth.b2clogin.com</code></td>
+    <td>Client credentials and appointment selections</td>
+    <td>The booking website itself. This is the appointment being made.</td>
+  </tr>
+  <tr>
+    <td>Supabase<br>(operator's own database)</td>
+    <td>Encrypted client records, booking events, device status</td>
+    <td>Lets the operator's machines share one client list and see booking activity.</td>
+  </tr>
+  <tr>
+    <td>Telegram<br>(operator's own bot)</td>
+    <td>Status alerts — slot found, booking confirmed, errors</td>
+    <td>Notifies the operator when something needs attention.</td>
+  </tr>
+  <tr>
+    <td>Google Sheets<br>(operator's own spreadsheet)</td>
+    <td>Client list, at the operator's request</td>
+    <td>Optional backup. Only runs when the operator connects a sheet and presses sync.</td>
+  </tr>
+  <tr>
+    <td><code>localhost</code></td>
+    <td>VPN rotation commands</td>
+    <td>Controls a VPN client on the same machine. Never leaves the computer.</td>
+  </tr>
+</table>
+</div>
+
+<h2>What the extension does not do</h2>
+
+<ul>
+  <li>No analytics, telemetry, tracking pixels or advertising</li>
+  <li>No data sold, rented or shared with any third party</li>
+  <li>No browsing history collected — it acts only on the visa scheduling site and its login page</li>
+  <li>No remote code execution; all code ships inside the extension package</li>
+  <li>No data used for anything other than booking appointments for the operator's own clients</li>
+</ul>
+
+<h2>Who can see what</h2>
+
+<p>The operator sees all client records. Staff accounts are scoped: a staff member sees only the
+clients assigned to them, and pricing information is withheld from staff entirely.</p>
+
+<h2>Retention and deletion</h2>
+
+<p>Client records persist until the operator deletes them. Deleting a client in the dashboard
+removes it from the shared database and from every connected device on the next sync. Uninstalling
+the extension clears everything held locally on that machine.</p>
+
+<h2>Google user data</h2>
+
+<p>The extension requests the <code>spreadsheets</code> scope solely to write the operator's
+client list into a spreadsheet that the operator chooses. It reads no other spreadsheet, and
+Google user data is never transferred to anyone. Use of information received from Google APIs
+adheres to the
+<a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services
+User Data Policy</a>, including the Limited Use requirements.</p>
+
+<h2>Contact</h2>
+
+<p>Questions about this policy or about data held by the extension: <strong>tharunteja.gannu2110@gmail.com</strong></p>
+
+<footer>
+  SlotHunter is an independent tool. It is not affiliated with, endorsed by, or connected to the
+  U.S. Department of State, any U.S. consulate or embassy, or the operators of
+  usvisascheduling.com.
+</footer>
+
+</main>
+</body>
+</html>
