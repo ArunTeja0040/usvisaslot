@@ -4190,6 +4190,74 @@
     return !!(sd || ed);
   }
 
+  // ─── #80 PORTAL FAST PATH ──────────────────────────────────────────
+  // page.js (MAIN world) can call the portal's own scheduling functions, which
+  // skips every render wait the DOM path needs — no datepicker poll, no hunting
+  // for a[data-date], no waiting for time radios. Only the server round-trip is
+  // left. Anything that fails here falls back to the DOM path, which stays the
+  // safety net until this has proven itself on real bookings.
+  const PORTAL_READ_MS = 30000;   // the portal is slow under load; the DOM path waited 10-12s
+  let __portalSeq = 0;
+  let __portalReady = null;       // probe result, cached per page
+
+  function portalCmd(type, params = {}, timeoutMs = PORTAL_READ_MS) {
+    return new Promise((resolve) => {
+      const id = `p${++__portalSeq}-${Date.now()}`;
+      let settled = false;
+      const finish = (v) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        removeEventListener("abPortalResult", onResult);
+        resolve(v);
+      };
+      const onResult = (ev) => {
+        const d = ev && ev.detail;
+        if (!d || d.id !== id) return;
+        finish(d.ok ? { ok: true, data: d.data } : { ok: false, why: d.error });
+      };
+      const timer = setTimeout(() => finish({ ok: false, why: "timeout" }), timeoutMs);
+      addEventListener("abPortalResult", onResult);
+      try {
+        dispatchEvent(new CustomEvent("abPortalCmd", { detail: { id, type, ...params } }));
+      } catch (e) {
+        finish({ ok: false, why: e.message });
+      }
+    });
+  }
+
+  async function portalAvailable() {
+    if (__portalReady !== null) return __portalReady;
+    const r = await portalCmd("probe", {}, 3000);
+    const d = (r.ok && r.data) || {};
+    __portalReady = !!d.available;
+    log(`[portal] fast path ${__portalReady ? "AVAILABLE" : "unavailable"}` +
+        (d.missing && d.missing.length ? ` — missing ${d.missing.join(",")}` : "") +
+        (r.ok ? "" : ` — ${r.why}`));
+    return __portalReady;
+  }
+
+  // Loads the city's days, confirms the date is still listed, loads its times
+  // and picks one. Returns the ordinal the submit call needs.
+  async function portalSelect(cityValue, dateStr) {
+    if (!(await portalAvailable())) return { ok: false, why: "fast path unavailable" };
+
+    const d = await portalCmd("days", { postId: cityValue });
+    if (!d.ok) return { ok: false, why: `days: ${d.why}` };
+    const dates = (d.data.days || []).map((x) => x.date);
+    if (!dates.includes(dateStr)) return { ok: false, why: `${dateStr} no longer listed` };
+
+    const e = await portalCmd("entries", { date: dateStr });
+    if (!e.ok) return { ok: false, why: `entries: ${e.why}` };
+    const entries = e.data.entries || [];
+    if (!entries.length) return { ok: false, why: "no times on that date" };
+
+    // #58 Random time, not the first — every competing bot takes the first, so
+    // contention concentrates there. The DATE is still the earliest in range.
+    const pick = entries[Math.floor(Math.random() * entries.length)];
+    return { ok: true, num: pick.num, time: pick.time, seats: pick.seats, count: entries.length };
+  }
+
   async function fastGrabBooking(cityValue, cityName, dateStr, alreadyOnCity = false) {
     if (!hasDateRange()) {
       const who = await new Promise((r) => chrome.storage.local.get(["loginDetails"], (d) => r(d.loginDetails?.username || "")));
@@ -4254,14 +4322,30 @@
         }
         lastTriedDate = targetDate;
 
-        // Wait (up to 10s) for the calendar + click the date.
-        const picked = await selectDateInCalendar(new Date(targetDate + "T00:00:00"), CAL_WAIT_MS);
-        if (!picked) { log(`[fastgrab] calendar/date not ready (attempt ${attempt}) — retrying`); continue; }
+        // #80 Fast path first: ask the portal's own functions for the days and
+        // times, which skips the datepicker and radio render waits entirely.
+        // Any failure drops through to the DOM path below.
+        let pickedTime = "";
+        let portalNum = null;
+        const fp = await portalSelect(cityValue, targetDate);
+        if (fp.ok) {
+          portalNum = fp.num;
+          pickedTime = fp.time || "";
+          log(`[fastgrab] portal fast path — ${targetDate} ${pickedTime} ` +
+              `(slot ${fp.num}, ${fp.count} time(s)` +
+              `${fp.seats != null ? `, ${fp.seats} seat(s)` : ""}) in ${Date.now() - t0}ms`);
+        } else {
+          log(`[fastgrab] portal fast path unusable (${fp.why}) — using the DOM path`);
 
-        // Wait (up to 12s) for time slots + select first; submit must be enabled.
-        const timeReady = await waitForTimeSlotAndSelect(TIME_WAIT_MS);
-        if (!timeReady) { log(`[fastgrab] time slots not ready (attempt ${attempt}) — retrying`); continue; }
-        const pickedTime = getSelectedTimeText();
+          // Wait (up to 10s) for the calendar + click the date.
+          const picked = await selectDateInCalendar(new Date(targetDate + "T00:00:00"), CAL_WAIT_MS);
+          if (!picked) { log(`[fastgrab] calendar/date not ready (attempt ${attempt}) — retrying`); continue; }
+
+          // Wait (up to 12s) for time slots + select first; submit must be enabled.
+          const timeReady = await waitForTimeSlotAndSelect(TIME_WAIT_MS);
+          if (!timeReady) { log(`[fastgrab] time slots not ready (attempt ${attempt}) — retrying`); continue; }
+          pickedTime = getSelectedTimeText();
+        }
 
         // Dry-run stop.
         if (TEST_MODE && TEST_FORCE_NO_SUBMIT) {
@@ -4273,10 +4357,16 @@
           booked = true; break;
         }
 
-        // Live submit.
-        const submitBtn = document.getElementById("submitbtn");
-        if (!submitBtn || submitBtn.disabled) { log(`[fastgrab] submit not ready (attempt ${attempt}) — retrying`); continue; }
-        submitBtn.click();
+        // Live submit. The fast path commits through the portal's own submit
+        // function; the DOM path clicks the button as before.
+        if (portalNum !== null) {
+          const sub = await portalCmd("submit", { num: portalNum }, 15000);
+          if (!sub.ok) { log(`[fastgrab] portal submit failed (${sub.why}) (attempt ${attempt}) — retrying`); continue; }
+        } else {
+          const submitBtn = document.getElementById("submitbtn");
+          if (!submitBtn || submitBtn.disabled) { log(`[fastgrab] submit not ready (attempt ${attempt}) — retrying`); continue; }
+          submitBtn.click();
+        }
         const ms = Date.now() - t0;
         trackEvent(EVENT_TYPES.BOOKING, `Submitted ${cityName} ${targetDate} ${pickedTime} (${ms}ms)`, u);
         const outcome = await waitForBookingOutcome(15000);
@@ -4309,9 +4399,15 @@
             log(`[fastgrab] submit retry ${r}/${SUBMIT_RETRIES} in ${Math.round(waitMs)}ms`);
             await sleep(waitMs);
             if (__abortAll || await checkStopSignal()) { log("[fastgrab] stop requested — aborting submit retries"); break; }
-            const btn2 = document.getElementById("submitbtn");
-            if (!btn2 || btn2.disabled) { log("[fastgrab] submit no longer clickable — stopping retries"); break; }
-            btn2.click();
+            // #80 Retry through whichever route committed the first attempt.
+            if (portalNum !== null) {
+              const r2 = await portalCmd("submit", { num: portalNum }, 15000);
+              if (!r2.ok) { log(`[fastgrab] portal re-submit failed (${r2.why}) — stopping retries`); break; }
+            } else {
+              const btn2 = document.getElementById("submitbtn");
+              if (!btn2 || btn2.disabled) { log("[fastgrab] submit no longer clickable — stopping retries"); break; }
+              btn2.click();
+            }
             outcome2 = await waitForBookingOutcome(8000);
           }
 

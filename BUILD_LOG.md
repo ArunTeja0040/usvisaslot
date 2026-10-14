@@ -12,6 +12,42 @@ Format:
 
 ---
 
+## 2026-10-09 — Ops Platform, Phase 1: the database foundation (Issue #79)
+
+**What it does:** Builds the "filing cabinet" behind the new dashboard. There are new drawers for WhatsApp leads and messages, payments, expenses, bookings, files (screenshots, PDFs, receipts), the bot queue and the audit log. It also sets the rules for who can open which drawer:
+- **Staff** see client cards, but never prices, payments, expenses, passwords or the audit log. They can record a payment, but they can't read it back afterwards.
+- **No hunting before the advance is paid.** A client moves along a fixed path: approved → advance paid → hunting → booked → delivered → closed. Only the founder can override, a reason is required, and the override is recorded.
+- **The audit log records every change** (who, what, when, before and after, with passwords removed). Nobody can edit or delete it, including the founder and the database itself.
+- **Nothing is ever deleted.** "Delete" means archived.
+- **The bot queue** is ready: each bot takes one client at a time, takes turns every 45 minutes, and is put back in the queue automatically if it stops responding for 10 minutes.
+- **Money automation:** booking a client adds the assigned staff member's per-booking pay automatically. Monthly costs like salaries repeat themselves.
+
+**Why:** Everything in Phases 2–5 (dashboard, WhatsApp, bot link) is built on this. Getting the access rules right first means staff can never see money or passwords, however the screens are built later.
+
+**What changed for you:** Nothing visible yet, and the current extension keeps working exactly as before, because everything was added on top and nothing existing was changed. Existing clients were given a stage based on their current status (confirmed → booked, running → hunting, otherwise approved). Their payment status shows as "not recorded" until you enter payments.
+
+**Tested:** 50 automated checks on a private local copy of the database (`supabase/tests/run_local.py`), acting as a bot, as you and as a staff member. All passed.
+
+**What you need to do:** Run the four files on the **test** Supabase project (steps in `supabase/migrations/README.md`), then check that the extension still works against it.
+
+---
+
+## 2026-10-15 — Booking goes straight to the portal instead of clicking through the page (Issue #80)
+
+**What it does:** Changes how the bot books, to make it much faster at the moment that matters.
+
+Until now the bot booked the way a person does: pick the city, **wait for the calendar to draw**, find the date square, click it, **wait for the time buttons to appear**, click one, wait for Submit to light up, click it. Most of that waiting is not the website thinking — it is the bot sitting there waiting for pictures to appear on screen so it has something to click.
+
+It turns out the booking website has its own built-in commands for "give me the open days", "give me the times on this day" and "book this one". The bot now calls those directly. **No calendar drawing, no waiting for buttons.** Only the website's own response time is left, and nothing can remove that.
+
+**Why:** Slots are won or lost in seconds. We were spending a large part of every attempt waiting for the page to draw itself rather than racing. This came out of studying a competitor's extension, which has been doing it this way.
+
+**What changed for you:** Nothing to set up, and nothing looks different. In the logs you will see either `portal fast path` (the new quick route) or `portal fast path unusable ... using the DOM path`.
+
+**The old method is still there.** If the quick route is not available on a page for any reason, the bot silently falls back to the old clicking method and books exactly as before. Nothing is lost — this can only be faster or the same.
+
+**What to watch when testing:** the log line now prints how long it took to pick a date and time. Compare it with what you saw before — that difference is the gain. Also confirm a real booking still completes end to end.
+
 ## 2026-09-22 — Ready for the Chrome Web Store, and the last of the competitor's code is gone (Issue #78)
 
 **What it does:** Three things, so the extension can be published to the Chrome Web Store and installed by your team from a link.
