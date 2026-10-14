@@ -310,36 +310,36 @@
   // abPortalRead("HYDERABAD VAC", "2026-11-14") → plus that date's times
   window.abPortalRead = async function (city, date) {
     var probe = await send("probe", {}, 3000);
-    console.log("[test] portal functions:", probe.ok ? probe.data : probe.why);
+    console.log("[AutoBook-TEST] [test] portal functions:", probe.ok ? probe.data : probe.why);
     if (!probe.ok || !probe.data.available) {
-      console.warn("[test] fast path NOT available here — booking would use the old clicking method");
+      console.warn("[AutoBook-TEST] [test] fast path NOT available here — booking would use the old clicking method");
       return;
     }
 
     var c = resolveCity(city);
-    if (c.error) { console.warn("[test] " + c.error); return; }
+    if (c.error) { console.warn("[AutoBook-TEST] [test] " + c.error); return; }
 
     var t0 = performance.now();
     var d = await send("days", { postId: c.value });
     var daysMs = Math.round(performance.now() - t0);
-    if (!d.ok) { console.warn("[test] days failed: " + d.why); return; }
+    if (!d.ok) { console.warn("[AutoBook-TEST] [test] days failed: " + d.why); return; }
     var dates = (d.data.days || []).map(function (x) { return x.date; });
-    console.log("[test] " + c.name + " — " + dates.length + " open date(s) in " + daysMs + "ms",
+    console.log("[AutoBook-TEST] [test] " + c.name + " — " + dates.length + " open date(s) in " + daysMs + "ms",
                 dates.length ? dates : "(none — portal answered, list is empty)");
 
     if (!date) return;
     if (dates.indexOf(date) === -1) {
-      console.warn("[test] " + date + " is not in that list — times would fail");
+      console.warn("[AutoBook-TEST] [test] " + date + " is not in that list — times would fail");
       return;
     }
     var t1 = performance.now();
     var e = await send("entries", { date: date });
     var entMs = Math.round(performance.now() - t1);
-    if (!e.ok) { console.warn("[test] times failed: " + e.why); return; }
+    if (!e.ok) { console.warn("[AutoBook-TEST] [test] times failed: " + e.why); return; }
     var entries = e.data.entries || [];
-    console.log("[test] " + date + " — " + entries.length + " time(s) in " + entMs + "ms");
+    console.log("[AutoBook-TEST] [test] " + date + " — " + entries.length + " time(s) in " + entMs + "ms");
     if (entries.length && console.table) console.table(entries);
-    console.log("[test] TOTAL " + (daysMs + entMs) + "ms (dates + times, nothing booked)");
+    console.log("[AutoBook-TEST] [test] TOTAL " + (daysMs + entMs) + "ms (dates + times, nothing booked)");
   };
 
   // abPortalBench("HYDERABAD VAC", "2026-11-14")
@@ -347,14 +347,14 @@
   // and date, and prints both timings. Selects but never submits.
   window.abPortalBench = function (city, date) {
     var c = resolveCity(city);
-    if (c.error) { console.warn("[test] " + c.error); return; }
+    if (c.error) { console.warn("[AutoBook-TEST] [test] " + c.error); return; }
     if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
       console.warn('[test] give a date as "YYYY-MM-DD" — run abPortalRead("' + c.name + '") first to see which dates are open');
       return;
     }
-    console.log("[test] benchmarking " + c.name + " " + date + " — this selects but never books");
+    console.log("[AutoBook-TEST] [test] benchmarking " + c.name + " " + date + " — this selects but never books");
     dispatchEvent(new CustomEvent("abBenchCmd", { detail: { cityValue: c.value, cityName: c.name, date: date } }));
   };
 
-  console.log("[test] helpers ready: abPortalRead(city[, date]) · abPortalBench(city, date)");
+  console.log("[AutoBook-TEST] [test] helpers ready: abPortalRead(city[, date]) · abPortalBench(city, date)");
 })();
