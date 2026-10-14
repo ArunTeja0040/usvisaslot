@@ -197,6 +197,68 @@
     return function () { if (done) return; done = true; try { fn.apply(null, arguments); } catch (e) {} };
   }
 
+  // ── #81 Booking verdict, read from the portal's own reply ──────────
+  // The DOM path decides success by regex-matching visible page text, which
+  // already misread a throttle ("please try again") as a lost slot. The portal
+  // states the outcome outright in its JSON response; read that instead.
+  //
+  // Only responses arriving while OUR submit is in flight are considered, and
+  // only ones that actually parse as a booking reply — anything else is
+  // ignored so an unrelated response can never be mistaken for a verdict.
+  var pendingSubmit = null;   // function(verdictObj) | null
+
+  var ERR_CODE_RE = /^[A-Za-z]{2,6}\d{2,6}$/;
+
+  function errorCode(d) {
+    try {
+      var raw = d && d.Errors && d.Errors.m_StringValue;
+      if (typeof raw !== "string") return null;
+      var t = raw.trim();
+      return ERR_CODE_RE.test(t) ? t : null;
+    } catch (e) { return null; }
+  }
+
+  // Returns null when the body is not a booking reply at all.
+  function readVerdict(text) {
+    var d;
+    try { d = JSON.parse(text); } catch (e) { return null; }
+    if (!d || typeof d !== "object" || Array.isArray(d)) return null;
+    if (d.HasError === true) return { verdict: "rejected", code: errorCode(d) };
+    if (d.AllScheduled === true) return { verdict: "booked" };
+    if (d.HasError === false) return { verdict: "unconfirmed" };
+    return null;
+  }
+
+  // Chains onto whatever hook is already installed (the abHttpStatus one
+  // above), so both keep working.
+  (function hookForVerdicts() {
+    var oOpen = XMLHttpRequest.prototype.open;
+    var oSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function (method, url) {
+      try { this.__abPortalUrl = String(url || ""); } catch (e) {}
+      return oOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function () {
+      var xhr = this;
+      try {
+        xhr.addEventListener("load", function () {
+          if (!pendingSubmit) return;                       // no submit in flight
+          var u = String(xhr.__abPortalUrl || "");
+          // The reads we issue ourselves are not booking replies.
+          if (/schedule-days|schedule-entries|query-family-members/i.test(u)) return;
+          var v = readVerdict(xhr.responseText);
+          if (!v) return;                                   // not a booking reply
+          var settle = pendingSubmit;
+          pendingSubmit = null;
+          settle(v);
+        });
+      } catch (e) {}
+      return oSend.apply(this, arguments);
+    };
+  })();
+
   addEventListener("abPortalCmd", function (ev) {
     var cmd = ev && ev.detail;
     if (!cmd || typeof cmd.id !== "string") return;
@@ -235,10 +297,36 @@
       if (cmd.type === "submit") {
         var num = Number(cmd.num);
         if (!Number.isSafeInteger(num) || num <= 0) { reply(id, false, "submit: bad num"); return; }
+
+        // #81 Arm the watcher BEFORE submitting — the reply can arrive fast.
+        var done = false;
+        var waitMs = Number(cmd.waitMs) > 0 ? Number(cmd.waitMs) : 15000;
+        var timer = setTimeout(function () {
+          if (done) return;
+          done = true;
+          pendingSubmit = null;
+          // No readable verdict. The caller falls back to watching the page.
+          reply(id, true, { submitted: true, num: num, verdict: "unknown" });
+        }, waitMs);
+
+        pendingSubmit = function (v) {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          reply(id, true, { submitted: true, num: num, verdict: v.verdict, code: v.code || null });
+        };
+
         seed({ Num: num });
-        asFn(N.onClickSubmit).call(window);
-        // Fired, not confirmed. Outcome detection stays with waitForBookingOutcome().
-        reply(id, true, { submitted: true, num: num });
+        try {
+          asFn(N.onClickSubmit).call(window);
+        } catch (e) {
+          if (!done) {
+            done = true;
+            clearTimeout(timer);
+            pendingSubmit = null;
+            reply(id, false, "submit threw: " + ((e && e.message) || "unknown"));
+          }
+        }
         return;
       }
 

@@ -4400,9 +4400,17 @@
 
         // Live submit. The fast path commits through the portal's own submit
         // function; the DOM path clicks the button as before.
+        let portalVerdict = null;
         if (portalNum !== null) {
-          const sub = await portalCmd("submit", { num: portalNum }, 15000);
+          // #81 The adapter waits for the portal's own reply and returns its
+          // verdict, so the clear cases skip the 15s page-watching entirely.
+          const sub = await portalCmd("submit", { num: portalNum, waitMs: 15000 }, 20000);
           if (!sub.ok) { log(`[fastgrab] portal submit failed (${sub.why}) (attempt ${attempt}) — retrying`); continue; }
+          portalVerdict = sub.data && sub.data.verdict ? sub.data : null;
+          if (portalVerdict) {
+            log(`[fastgrab] portal verdict: ${portalVerdict.verdict}` +
+                (portalVerdict.code ? ` (code ${portalVerdict.code})` : ""));
+          }
         } else {
           const submitBtn = document.getElementById("submitbtn");
           if (!submitBtn || submitBtn.disabled) { log(`[fastgrab] submit not ready (attempt ${attempt}) — retrying`); continue; }
@@ -4410,7 +4418,21 @@
         }
         const ms = Date.now() - t0;
         trackEvent(EVENT_TYPES.BOOKING, `Submitted ${cityName} ${targetDate} ${pickedTime} (${ms}ms)`, u);
-        const outcome = await waitForBookingOutcome(15000);
+
+        // #81 Trust the portal only where it is unambiguous. "unconfirmed" and
+        // "unknown" still go through the page-watching path, which can tell
+        // confirmed from ofc_submitted and recognises a throttle.
+        let outcome;
+        if (portalVerdict && portalVerdict.verdict === "rejected") {
+          outcome = "failed";
+        } else if (portalVerdict && portalVerdict.verdict === "booked") {
+          // Same rule the page-watcher uses: on the OFC page a success means
+          // the OFC half is done and the interview is next.
+          outcome = window.location.pathname.toLowerCase().includes("ofc-schedule")
+            ? "ofc_submitted" : "confirmed";
+        } else {
+          outcome = await waitForBookingOutcome(15000);
+        }
         if (outcome === "confirmed" || outcome === "ofc_submitted") {
           // #75 A client counts as fully booked only once BOTH halves are done.
           // The status value stays "confirmed" so nothing downstream changes;

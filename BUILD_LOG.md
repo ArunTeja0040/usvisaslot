@@ -32,6 +32,24 @@ Format:
 
 ---
 
+## 2026-10-15 — The bot now reads the booking result instead of guessing from the screen (Issue #81)
+
+**What it does:** Changes how the bot decides whether a booking worked.
+
+Until now it watched the page for up to 15 seconds and read the words on screen, looking for phrases like "no longer available" or "already booked". That is guesswork, and it has bitten us before: when the site is busy it says *"too many requests… please try again"*, and because that contains "try again", the bot read it as **"someone took the slot"** and walked away from a slot nobody had taken.
+
+The website actually tells us the answer outright in its reply — it just does so in data we were ignoring rather than in words on the screen. The bot now reads that directly:
+
+- **Booked** — confirmed
+- **Rejected** — plus the site's own error code, so we know *why*
+- **Anything unclear** — falls back to watching the page exactly as before
+
+**Why:** Reading the real answer cannot be confused by wording, by a message arriving late, or by the site rephrasing something. It is also faster: a rejection is known immediately instead of after a 15-second wait.
+
+**What changed for you:** Telegram messages should be more accurate — fewer "slot taken" reports that were really the site being busy. In the log you will see a new line such as `portal verdict: booked` or `portal verdict: rejected (code ABC123)`.
+
+**Deliberately cautious:** the bot only trusts this where the answer is unmistakable. If the reply is ambiguous it still watches the page the old way, so nothing is lost. The old clicking method keeps its original detection untouched.
+
 ## 2026-10-15 — You can now test the new booking route without waiting for a slot (Issue #80)
 
 **What it does:** Adds three things so you can check the new fast booking route on any ordinary day, instead of only at the moment a real slot appears.
