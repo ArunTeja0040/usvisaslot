@@ -319,10 +319,12 @@
     var c = resolveCity(city);
     if (c.error) { console.warn("[AutoBook-TEST] [test] " + c.error); return; }
 
+    console.log("[AutoBook-TEST] [test] asking the portal for " + c.name + " dates… (up to 30s)");
     var t0 = performance.now();
     var d = await send("days", { postId: c.value });
     var daysMs = Math.round(performance.now() - t0);
-    if (!d.ok) { console.warn("[AutoBook-TEST] [test] days failed: " + d.why); return; }
+    if (!d.ok) { console.warn("[AutoBook-TEST] [test] days failed: " + d.why +
+      (d.why === "timeout" ? " — the portal never answered. Stop the bot (STOP on the panel) and try again; its cycling competes with this call." : "")); return; }
     var dates = (d.data.days || []).map(function (x) { return x.date; });
     console.log("[AutoBook-TEST] [test] " + c.name + " — " + dates.length + " open date(s) in " + daysMs + "ms",
                 dates.length ? dates : "(none — portal answered, list is empty)");
@@ -332,10 +334,12 @@
       console.warn("[AutoBook-TEST] [test] " + date + " is not in that list — times would fail");
       return;
     }
+    console.log("[AutoBook-TEST] [test] asking the portal for times on " + date + "… (up to 30s)");
     var t1 = performance.now();
     var e = await send("entries", { date: date });
     var entMs = Math.round(performance.now() - t1);
-    if (!e.ok) { console.warn("[AutoBook-TEST] [test] times failed: " + e.why); return; }
+    if (!e.ok) { console.warn("[AutoBook-TEST] [test] times failed: " + e.why +
+      (e.why === "timeout" ? " — the portal never answered. Stop the bot and try again." : "")); return; }
     var entries = e.data.entries || [];
     console.log("[AutoBook-TEST] [test] " + date + " — " + entries.length + " time(s) in " + entMs + "ms");
     if (entries.length && console.table) console.table(entries);
