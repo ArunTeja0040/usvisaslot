@@ -32,6 +32,20 @@ Format:
 
 ---
 
+## 2026-10-15 — Picks the roomier time slot, waits as long as the site asks, and refuses to book blind (Issue #82)
+
+**What it does:** Three small improvements to booking.
+
+**1. It now picks the time with the most places left.** The website tells us how many places each time slot still has — we were reading that number, printing it, and then ignoring it, choosing at random instead. A slot with 4 places left is plainly a better bet than one with 1. The bot now prefers the roomiest time. If several are tied it still picks among them at random, so our machines don't all pile onto the same one.
+
+**2. It now listens when the site says "wait this long".** When the site refuses us it often states exactly how long to wait before trying again. We were writing that into the log and then ignoring it, using our own 2-5 minute guess. The bot now uses the site's own number, within sensible bounds — never under 30 seconds, never over an hour, so a strange value can't park a client for a day. Telegram will say "(the site asked for this wait)" when that happens.
+
+**3. It refuses to book if the page works differently than expected.** The booking page identifies a time slot by its number. Some versions of the site identify it by a long unique code instead. If we ever land on one of those, sending a number would be meaningless — so the bot now checks first and falls back to the old clicking method rather than submitting something the site won't understand.
+
+**Why:** The first two were information the site was already giving us for free, which we were throwing away. The third is insurance: if the site changes how it works, the bot notices instead of silently booking nonsense.
+
+**What changed for you:** Slightly better odds on a contested slot, and more accurate waiting when the site pushes back. In the log you'll see "most seats, 2 tied" on the time it picked.
+
 ## 2026-10-15 — The bot now reads the booking result instead of guessing from the screen (Issue #81)
 
 **What it does:** Changes how the bot decides whether a booking worked.

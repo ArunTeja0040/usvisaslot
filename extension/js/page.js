@@ -168,6 +168,29 @@
     return out;
   }
 
+  // #82 We commit by the ordinal `Num`. Some portal variants commit by a
+  // per-slot GUID (`scheduleEntryId`) instead — submitting a Num there would
+  // send a meaningless value. Work out which this page uses by reading the
+  // validation gate's own source, falling back to the shape of jsdata.
+  function commitIdentity() {
+    try {
+      var gate = asFn("validateEntrySelected");
+      if (gate) {
+        var src = Function.prototype.toString.call(gate);
+        if (src.indexOf("scheduleEntryId") !== -1) return "guid";
+        if (/\bNum\b/.test(src)) return "ordinal";
+      }
+    } catch (e) {}
+    try {
+      var d = g(N.jsdata);
+      if (d && typeof d === "object") {
+        if ("scheduleEntryId" in d) return "guid";
+        if ("Num" in d) return "ordinal";
+      }
+    } catch (e) {}
+    return "unknown";   // unproven either way — treated as usable
+  }
+
   function probe() {
     var days = asFn(N.getScheduleDays);
     var entries = asFn(N.getScheduleEntries);
@@ -176,9 +199,12 @@
     if (!days) missing.push(N.getScheduleDays);
     if (!entries) missing.push(N.getScheduleEntries);
     if (!submit) missing.push(N.onClickSubmit);
+    var identity = commitIdentity();
     return {
-      available: missing.length === 0,
+      // A GUID-commit page cannot be driven by our ordinal submit.
+      available: missing.length === 0 && identity !== "guid",
       missing: missing,
+      commitIdentity: identity,
       hasApplications: hasApplications(),
       daysToken: daysToken() !== undefined,
     };
@@ -400,7 +426,9 @@
     var probe = await send("probe", {}, 3000);
     console.log("[AutoBook-TEST] [test] portal functions:", probe.ok ? probe.data : probe.why);
     if (!probe.ok || !probe.data.available) {
-      console.warn("[AutoBook-TEST] [test] fast path NOT available here — booking would use the old clicking method");
+      console.warn("[AutoBook-TEST] [test] fast path NOT available here — booking would use the old clicking method" +
+        (probe.ok && probe.data.commitIdentity === "guid"
+          ? " (this page books by a per-slot ID, not the slot number our fast path uses)" : ""));
       return;
     }
 

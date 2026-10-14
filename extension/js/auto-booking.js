@@ -3509,6 +3509,7 @@
                   : (d.msBurst || d.msTime) ? "platform throttle"
                   : "site/app limiter";
         log(`429 detected (page.js) — source=${src} retryAfter=${d.retryAfter || "none"} url=${d.url}`);
+        noteRetryAfter(d.retryAfter);   // #82 act on it, not just log it
         if (d.body) log(`[429 diag] body: ${String(d.body).substring(0, 200)}`);
         chrome.storage.local.get(["loginDetails"], (dd) => {
           const u = dd.loginDetails?.username || "";
@@ -4161,14 +4162,57 @@
   }
 
   // One cycling round ended without booking this city+date.
+  // #82 The site sometimes states exactly how long to wait. Accept seconds or
+  // an HTTP date, clamp to [30s, 1h] so a malformed or hostile value cannot
+  // stall a client for a day, and expire it so it is only used while fresh.
+  let __retryAfterMs = 0;
+  let __retryAfterAt = 0;
+  const RETRY_AFTER_MIN_MS = 30 * 1000;
+  const RETRY_AFTER_MAX_MS = 60 * 60 * 1000;
+  const RETRY_AFTER_FRESH_MS = 2 * 60 * 1000;
+
+  function parseRetryAfter(raw) {
+    if (raw == null) return 0;
+    const txt = String(raw).trim();
+    if (!txt) return 0;
+    let ms = 0;
+    if (/^\d+$/.test(txt)) {
+      ms = Number(txt) * 1000;
+    } else {
+      const when = Date.parse(txt);
+      if (!Number.isFinite(when)) return 0;
+      ms = when - Date.now();
+    }
+    if (!Number.isFinite(ms) || ms <= 0) return 0;
+    return Math.min(Math.max(ms, RETRY_AFTER_MIN_MS), RETRY_AFTER_MAX_MS);
+  }
+
+  function noteRetryAfter(raw) {
+    const ms = parseRetryAfter(raw);
+    if (!ms) return;
+    __retryAfterMs = ms;
+    __retryAfterAt = Date.now();
+    log(`[retry-after] site asked for ${Math.round(ms / 1000)}s`);
+  }
+
+  function takeRetryAfter() {
+    if (!__retryAfterMs) return 0;
+    if (Date.now() - __retryAfterAt > RETRY_AFTER_FRESH_MS) { __retryAfterMs = 0; return 0; }
+    const ms = __retryAfterMs;
+    __retryAfterMs = 0;
+    return ms;
+  }
+
   function recordGrabFailure(cityValue, dateStr) {
     const k = grabKey(cityValue, dateStr);
     const t = __grabTries[k] || (__grabTries[k] = { fails: 0, pausedUntil: 0 });
     t.fails++;
     if (t.fails >= GRAB_ROUNDS_BEFORE_PAUSE) {
-      const ms = GRAB_PAUSE_MIN_MS + Math.random() * (GRAB_PAUSE_MAX_MS - GRAB_PAUSE_MIN_MS);
+      // Honour an explicit Retry-After over our own guess.
+      const asked = takeRetryAfter();
+      const ms = asked || (GRAB_PAUSE_MIN_MS + Math.random() * (GRAB_PAUSE_MAX_MS - GRAB_PAUSE_MIN_MS));
       t.pausedUntil = Date.now() + ms;
-      return { fails: t.fails, paused: true, pauseMin: Math.round(ms / 60000) };
+      return { fails: t.fails, paused: true, pauseMin: Math.round(ms / 60000), askedBySite: asked > 0 };
     }
     return { fails: t.fails, paused: false };
   }
@@ -4252,10 +4296,23 @@
     const entries = e.data.entries || [];
     if (!entries.length) return { ok: false, why: "no times on that date" };
 
-    // #58 Random time, not the first — every competing bot takes the first, so
+    // #58 Never the first — every competing bot takes the first radio, so
     // contention concentrates there. The DATE is still the earliest in range.
-    const pick = entries[Math.floor(Math.random() * entries.length)];
-    return { ok: true, num: pick.num, time: pick.time, seats: pick.seats, count: entries.length };
+    // #82 Among the rest, prefer the time with the most seats left
+    // (EntriesAvailable): a slot with 4 places is a better bet than one with 1.
+    // Ties break at random so we still don't all land on the same slot, and a
+    // feed without seat counts falls back to the original random pick.
+    const withSeats = entries.filter((e) => typeof e.seats === "number" && e.seats > 0);
+    let pool = entries;
+    if (withSeats.length) {
+      const most = Math.max(...withSeats.map((e) => e.seats));
+      pool = withSeats.filter((e) => e.seats === most);
+    }
+    const pick = pool[Math.floor(Math.random() * pool.length)];
+    return {
+      ok: true, num: pick.num, time: pick.time, seats: pick.seats,
+      count: entries.length, tiedAtBest: pool.length, seatAware: withSeats.length > 0,
+    };
   }
 
   // #80b Side-by-side timing, driven from the console by abPortalBench() in
@@ -4374,7 +4431,8 @@
           pickedTime = fp.time || "";
           log(`[fastgrab] portal fast path — ${targetDate} ${pickedTime} ` +
               `(slot ${fp.num}, ${fp.count} time(s)` +
-              `${fp.seats != null ? `, ${fp.seats} seat(s)` : ""}) in ${Date.now() - t0}ms`);
+              `${fp.seats != null ? `, ${fp.seats} seat(s)` : ""})` +
+              `${fp.seatAware ? ` — most seats, ${fp.tiedAtBest} tied` : ""} in ${Date.now() - t0}ms`);
         } else {
           log(`[fastgrab] portal fast path unusable (${fp.why}) — using the DOM path`);
 
@@ -4535,7 +4593,8 @@
         log(`[fastgrab] ${cityName} ${lastTriedDate} failed ${st.fails} rounds — resting THIS DATE ${st.pauseMin}min; all locations keep cycling`);
         sendTelegramNotification("rate",
           `⏸️ <b>DATE RESTING</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${lastTriedDate}</b>\n` +
-          `❌ Failed ${st.fails} rounds in a row\n⏳ Pausing this date ~${st.pauseMin} min, then trying again\n` +
+          `❌ Failed ${st.fails} rounds in a row\n⏳ Pausing this date ~${st.pauseMin} min, then trying again` +
+          `${st.askedBySite ? " (the site asked for this wait)" : ""}\n` +
           `🔄 All other locations and dates keep cycling and booking as normal`);
       } else {
         log(`[fastgrab] ${cityName} ${lastTriedDate} failed round ${st.fails}/${GRAB_ROUNDS_BEFORE_PAUSE} — retrying next round`);
