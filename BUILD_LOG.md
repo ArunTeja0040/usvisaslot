@@ -32,6 +32,32 @@ Format:
 
 ---
 
+## 2026-10-15 — You can now test the new booking route without waiting for a slot (Issue #80)
+
+**What it does:** Adds three things so you can check the new fast booking route on any ordinary day, instead of only at the moment a real slot appears.
+
+**1. It now tells you on every page load.** When the booking page opens you will see either `[portal] fast path AVAILABLE` or a line saying why it is not. Before this, that check only happened at the instant a slot was found — so a normal run with no slots showed nothing at all, and you had no way of knowing whether the new route even worked. This check costs nothing and sends no request to the website.
+
+**2. A command to read dates and times by hand.** In the browser console, type:
+
+    abPortalRead("HYDERABAD VAC")
+
+It asks the website directly for that city's open dates and prints them, along with how long it took. Add a date to also get its times:
+
+    abPortalRead("HYDERABAD VAC", "2026-11-14")
+
+It books nothing. Type the city name as it appears in the dropdown — no codes needed. Useful even when there are no slots: an empty answer still proves the connection works, which is different from an error.
+
+**3. A command to compare old versus new.** In the console:
+
+    abPortalBench("HYDERABAD VAC", "2026-11-14")
+
+This runs the old clicking method and the new direct method for the same city and date, then prints both timings and the difference. It selects a date and time but **never books**.
+
+**Why:** The first version of this work could only be judged during a live slot race — the worst possible moment to be measuring anything, and you might wait days for the chance.
+
+**What changed for you:** Nothing in how booking behaves. Note that commands 2 and 3 do send real requests to the website, so use them deliberately rather than repeatedly. Both exist only in the TEST build; the production extension does not have them.
+
 ## 2026-10-15 — Booking goes straight to the portal instead of clicking through the page (Issue #80)
 
 **What it does:** Changes how the bot books, to make it much faster at the moment that matters.

@@ -4258,6 +4258,47 @@
     return { ok: true, num: pick.num, time: pick.time, seats: pick.seats, count: entries.length };
   }
 
+  // #80b Side-by-side timing, driven from the console by abPortalBench() in
+  // page.js. TEST build only — the listener is never registered in production.
+  // Selects a date and time by both routes; never submits.
+  if (TEST_MODE) {
+    addEventListener("abBenchCmd", async (ev) => {
+      const d = (ev && ev.detail) || {};
+      if (!d.cityValue || !d.date) return;
+      try {
+        // ── New route ──
+        const t0 = Date.now();
+        const fp = await portalSelect(d.cityValue, d.date);
+        const fastMs = Date.now() - t0;
+        log(fp.ok
+          ? `[bench] NEW route: ${fastMs}ms — ${d.date} ${fp.time} (slot ${fp.num}, ${fp.count} time(s))`
+          : `[bench] NEW route FAILED after ${fastMs}ms — ${fp.why}`);
+
+        // ── Old route: switch city, wait for the calendar, click through ──
+        const t1 = Date.now();
+        const select = document.getElementById("post_select");
+        if (!select) { log("[bench] OLD route: city dropdown missing"); return; }
+        select.value = d.cityValue;
+        const daysPromise = waitForScheduleData(15000);
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+        await daysPromise;
+        const picked = await selectDateInCalendar(new Date(d.date + "T00:00:00"), 10000);
+        if (!picked) { log(`[bench] OLD route: date never became clickable (${Date.now() - t1}ms)`); return; }
+        const timeOk = await waitForTimeSlotAndSelect(12000);
+        const slowMs = Date.now() - t1;
+        if (!timeOk) { log(`[bench] OLD route: times never appeared (${slowMs}ms)`); return; }
+        log(`[bench] OLD route: ${slowMs}ms — ${d.date} ${getSelectedTimeText()}`);
+
+        if (fp.ok) {
+          const saved = slowMs - fastMs;
+          log(`[bench] RESULT: new route is ${saved}ms faster (${(saved / 1000).toFixed(1)}s). Nothing was booked.`);
+        }
+      } catch (e) {
+        log("[bench] failed: " + e.message);
+      }
+    });
+  }
+
   async function fastGrabBooking(cityValue, cityName, dateStr, alreadyOnCity = false) {
     if (!hasDateRange()) {
       const who = await new Promise((r) => chrome.storage.local.get(["loginDetails"], (d) => r(d.loginDetails?.username || "")));
@@ -6420,6 +6461,10 @@
 
     if (path.includes("/ofc-schedule") || path.includes("/schedule")) {
       log("On booking page: " + path);
+      // #80b Report up-front whether the portal fast path is usable here, so
+      // this is visible on every page load instead of only when a slot appears
+      // and fastGrabBooking() happens to run. Pure feature-detect, no request.
+      portalAvailable().catch(() => {});
       await handleBookingPage(settings);
       return;
     }

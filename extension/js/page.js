@@ -248,3 +248,113 @@
     }
   });
 })();
+
+// ─── #80b MANUAL TEST HELPERS ────────────────────────────────────────
+// Console-callable so the fast path can be exercised on an ordinary day
+// instead of only when a real slot appears. Defined in the MAIN world so they
+// work in the console's default context with no context switching.
+//
+// These send REAL requests to the portal. Manual use only — nothing calls them
+// automatically, and they never submit a booking.
+(function () {
+  "use strict";
+
+  function send(type, params, timeoutMs) {
+    return new Promise(function (resolve) {
+      var id = "t" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
+      var settled = false;
+      function finish(v) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        removeEventListener("abPortalResult", onResult);
+        resolve(v);
+      }
+      function onResult(ev) {
+        var d = ev && ev.detail;
+        if (!d || d.id !== id) return;
+        finish(d.ok ? { ok: true, data: d.data } : { ok: false, why: d.error });
+      }
+      var timer = setTimeout(function () { finish({ ok: false, why: "timeout" }); }, timeoutMs || 30000);
+      addEventListener("abPortalResult", onResult);
+      var detail = { id: id, type: type };
+      for (var k in params) if (Object.prototype.hasOwnProperty.call(params, k)) detail[k] = params[k];
+      dispatchEvent(new CustomEvent("abPortalCmd", { detail: detail }));
+    });
+  }
+
+  // Accept either the dropdown's value or the city name as shown on screen,
+  // so the operator can type "HYDERABAD VAC" rather than hunt for a GUID.
+  function resolveCity(input) {
+    var sel = document.getElementById("post_select");
+    if (!sel) return { error: "city dropdown (#post_select) not on this page" };
+    var opts = Array.prototype.slice.call(sel.querySelectorAll("option"));
+    var wanted = String(input == null ? "" : input).trim().toLowerCase();
+    if (!wanted) {
+      return { error: "name a city. Available: " +
+        opts.map(function (o) { return (o.textContent || "").trim(); }).filter(Boolean).join(" | ") };
+    }
+    for (var i = 0; i < opts.length; i++) {
+      var val = (opts[i].getAttribute("value") || "").trim();
+      var txt = (opts[i].textContent || "").trim();
+      if (!val || !txt) continue;
+      if (val.toLowerCase() === wanted || txt.toLowerCase() === wanted || txt.toLowerCase().indexOf(wanted) !== -1) {
+        return { value: val, name: txt };
+      }
+    }
+    return { error: 'no city matching "' + input + '". Available: ' +
+      opts.map(function (o) { return (o.textContent || "").trim(); }).filter(Boolean).join(" | ") };
+  }
+
+  // abPortalRead("HYDERABAD VAC")              → that city's open dates
+  // abPortalRead("HYDERABAD VAC", "2026-11-14") → plus that date's times
+  window.abPortalRead = async function (city, date) {
+    var probe = await send("probe", {}, 3000);
+    console.log("[test] portal functions:", probe.ok ? probe.data : probe.why);
+    if (!probe.ok || !probe.data.available) {
+      console.warn("[test] fast path NOT available here — booking would use the old clicking method");
+      return;
+    }
+
+    var c = resolveCity(city);
+    if (c.error) { console.warn("[test] " + c.error); return; }
+
+    var t0 = performance.now();
+    var d = await send("days", { postId: c.value });
+    var daysMs = Math.round(performance.now() - t0);
+    if (!d.ok) { console.warn("[test] days failed: " + d.why); return; }
+    var dates = (d.data.days || []).map(function (x) { return x.date; });
+    console.log("[test] " + c.name + " — " + dates.length + " open date(s) in " + daysMs + "ms",
+                dates.length ? dates : "(none — portal answered, list is empty)");
+
+    if (!date) return;
+    if (dates.indexOf(date) === -1) {
+      console.warn("[test] " + date + " is not in that list — times would fail");
+      return;
+    }
+    var t1 = performance.now();
+    var e = await send("entries", { date: date });
+    var entMs = Math.round(performance.now() - t1);
+    if (!e.ok) { console.warn("[test] times failed: " + e.why); return; }
+    var entries = e.data.entries || [];
+    console.log("[test] " + date + " — " + entries.length + " time(s) in " + entMs + "ms");
+    if (entries.length && console.table) console.table(entries);
+    console.log("[test] TOTAL " + (daysMs + entMs) + "ms (dates + times, nothing booked)");
+  };
+
+  // abPortalBench("HYDERABAD VAC", "2026-11-14")
+  // Runs the old clicking method and the new direct method for the same city
+  // and date, and prints both timings. Selects but never submits.
+  window.abPortalBench = function (city, date) {
+    var c = resolveCity(city);
+    if (c.error) { console.warn("[test] " + c.error); return; }
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
+      console.warn('[test] give a date as "YYYY-MM-DD" — run abPortalRead("' + c.name + '") first to see which dates are open');
+      return;
+    }
+    console.log("[test] benchmarking " + c.name + " " + date + " — this selects but never books");
+    dispatchEvent(new CustomEvent("abBenchCmd", { detail: { cityValue: c.value, cityName: c.name, date: date } }));
+  };
+
+  console.log("[test] helpers ready: abPortalRead(city[, date]) · abPortalBench(city, date)");
+})();
