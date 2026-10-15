@@ -255,6 +255,36 @@
     return null;
   }
 
+  // #83 The portal submits via fetch, not XHR — hooking only XHR meant the
+  // reply was never seen and every submit burned the full verdict timeout.
+  (function hookFetchForVerdicts() {
+    if (typeof window.fetch !== "function") return;
+    var oFetch = window.fetch;
+    window.fetch = function (input, init) {
+      var out = oFetch.apply(this, arguments);
+      try {
+        if (!pendingSubmit) return out;
+        var u = "";
+        try { u = typeof input === "string" ? input : (input && input.url) || ""; } catch (e) {}
+        if (/schedule-days|schedule-entries|query-family-members/i.test(u)) return out;
+        out.then(function (resp) {
+          try {
+            if (!pendingSubmit) return;
+            resp.clone().text().then(function (txt) {
+              if (!pendingSubmit) return;
+              var v = readVerdict(txt);
+              if (!v) return;
+              var settle = pendingSubmit;
+              pendingSubmit = null;
+              settle(v);
+            }).catch(function () {});
+          } catch (e) {}
+        }).catch(function () {});
+      } catch (e) {}
+      return out;
+    };
+  })();
+
   // Chains onto whatever hook is already installed (the abHttpStatus one
   // above), so both keep working.
   (function hookForVerdicts() {

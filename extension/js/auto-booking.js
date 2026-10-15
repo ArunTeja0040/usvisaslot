@@ -4462,7 +4462,11 @@
         if (portalNum !== null) {
           // #81 The adapter waits for the portal's own reply and returns its
           // verdict, so the clear cases skip the 15s page-watching entirely.
-          const sub = await portalCmd("submit", { num: portalNum, waitMs: 15000 }, 20000);
+          // #83 Short. A missed verdict must cost almost nothing — the page
+          // watcher below is the real detector and answers within seconds.
+          // The old 15s wait added ~15s to EVERY attempt, which is what drove
+          // the site to start replying "too many requests".
+          const sub = await portalCmd("submit", { num: portalNum, waitMs: 2500 }, 6000);
           if (!sub.ok) { log(`[fastgrab] portal submit failed (${sub.why}) (attempt ${attempt}) — retrying`); continue; }
           portalVerdict = sub.data && sub.data.verdict ? sub.data : null;
           if (portalVerdict) {
@@ -4522,7 +4526,7 @@
             if (__abortAll || await checkStopSignal()) { log("[fastgrab] stop requested — aborting submit retries"); break; }
             // #80 Retry through whichever route committed the first attempt.
             if (portalNum !== null) {
-              const r2 = await portalCmd("submit", { num: portalNum }, 15000);
+              const r2 = await portalCmd("submit", { num: portalNum, waitMs: 2500 }, 6000);
               if (!r2.ok) { log(`[fastgrab] portal re-submit failed (${r2.why}) — stopping retries`); break; }
             } else {
               const btn2 = document.getElementById("submitbtn");
