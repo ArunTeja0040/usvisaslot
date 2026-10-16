@@ -4926,9 +4926,25 @@
         ? `<b>${inCount}</b> in range &nbsp;·&nbsp; green = inside ${startDate || "…"} → ${endDate || "…"}`
         : `<b style="color:#ffd2cc;">No date range set for this client — booking is blocked</b>`;
 
+      // #87 Show how many places each time still has (EntriesAvailable). The
+      // feed has carried it all along and we were dropping it. A 1-seat slot
+      // and a 14-seat slot look identical otherwise, and they are not remotely
+      // the same bet. Green = roomy, amber = tight, red = last place.
+      const seatHtml = (t) => {
+        const time = esc(t.Time);
+        const n = (typeof t.EntriesAvailable === "number" && isFinite(t.EntriesAvailable))
+          ? t.EntriesAvailable : null;
+        if (n === null) return `<b>${time}</b>`;
+        const colour = n >= 5 ? "#1e8449" : (n >= 2 ? "#b9770e" : "#c0392b");
+        return `<b>${time}</b> <span style="color:${colour};">(${n})</span>`;
+      };
+      const totalSeats = (times || []).reduce(
+        (sum, t) => sum + ((typeof t.EntriesAvailable === "number" && isFinite(t.EntriesAvailable)) ? t.EntriesAvailable : 0), 0);
       const timeRow = (times && times.length)
         ? `<div style="margin-top:6px;font-size:12px;">🕐 <b>Times on the open date:</b> ${
-             esc(times.map((t) => t.Time).filter(Boolean).slice(0, 24).join(", "))}</div>`
+             times.filter((t) => t.Time).slice(0, 24).map(seatHtml).join(", ")}` +
+          `${totalSeats > 0 ? ` &nbsp;·&nbsp; <b>${totalSeats}</b> seat(s) in total` : ""}` +
+          `<br><span style="color:#7f8c8d;">( ) = places left on that time</span></div>`
         : "";
 
       const stamp = new Date().toLocaleString("en-IN", {

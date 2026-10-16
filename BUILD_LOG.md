@@ -46,6 +46,16 @@ Format:
 
 **What changed for you:** Slightly better odds on a contested slot, and more accurate waiting when the site pushes back. In the log you'll see "most seats, 2 tied" on the time it picked.
 
+## 2026-10-16 — The overview panel now shows how many places each time has (Issue #87)
+
+**What it does:** In the slots panel under the calendar, each time now shows the number of places still free on it — for example **09:30 (1)** or **14:00 (12)**.
+
+Colour tells you at a glance how tight it is: **green** means 5 or more places, **amber** means 2 to 4, **red** means it is the last one. The total across all times is shown at the end.
+
+**Why:** The website has been sending us this number all along and we were throwing it away. A time with 1 place left and a time with 14 are completely different bets, and until now they looked identical on screen. When the bot loses a slot with one place, that is simply arithmetic — lots of people, one place. When it loses one with fourteen, something is wrong and worth investigating. You could not tell those apart before.
+
+**What changed for you:** Nothing to set up. The panel shows the numbers wherever the website provides them; times without a number simply show as before.
+
 ## 2026-10-15 — The bot now reads the booking result instead of guessing from the screen (Issue #81)
 
 **What it does:** Changes how the bot decides whether a booking worked.
