@@ -4384,6 +4384,9 @@
     // #86 Seats are filled in by the fast path a moment later; declared here so
     // the outcome messages below can report how contested the slot actually was.
     let fpSeats = null;
+    // #89 Set when we backed off because the PORTAL was busy. That is not a
+    // failed attempt on our part and must not burn the #77 round budget.
+    let throttledOut = false;
 
     const MAX_ATTEMPTS = 5;
     const CAL_WAIT_MS = 10000;  // wait for calendar to render
@@ -4503,9 +4506,25 @@
 
         let outcome;
         if (refusedByThrottle) {
-          log(`[fastgrab] refusal was a THROTTLE, not a lost slot — the booking never ran, retrying`);
-          __lastThrottleText = portalVerdict.message;
-          outcome = "throttled";
+          // #89 Measured: retrying a throttle 0.9s later made things worse —
+          // reads went from 2.4s to 100s after three submits in two minutes.
+          // "The system is processing too many requests" is an instruction to
+          // back off, and we were answering it with more requests.
+          //
+          // So: back out to scanning, which is a natural ~60s backoff, and do
+          // NOT count this as a failed round — the slot was never contested
+          // and the date must not be rested over it. Persistent without
+          // hammering.
+          log(`[fastgrab] THROTTLED — the booking never ran. Backing off to scanning; ` +
+              `this does not count against the date's retry budget.`);
+          sendTelegramNotification("rate",
+            `⏳ <b>PORTAL BUSY</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n` +
+            `${fpSeats != null ? `🪑 ${fpSeats} seat(s) still free\n` : ""}` +
+            `\n💬 "${portalVerdict.message}"\n\n` +
+            `↩️ Nobody could book it either — backing off and trying again shortly`);
+          throttledOut = true;
+          resumeScan = true;
+          break;
         } else if (portalVerdict && portalVerdict.verdict === "rejected") {
           // #84 The portal names its own reason. Record it — "slot taken" and
           // "you are rate limited" are very different and we were guessing.
@@ -4648,6 +4667,8 @@
     // break site above, so every non-booking exit counts once and only once.
     if (booked) {
       clearGrabHistory(cityValue, lastTriedDate);
+    } else if (throttledOut) {
+      log(`[fastgrab] ${cityName} ${lastTriedDate} — portal was busy, not counted as a failed round`);
     } else if (!__abortAll) {
       const st = recordGrabFailure(cityValue, lastTriedDate);
       if (st.paused) {
