@@ -6644,6 +6644,8 @@
       // this is visible on every page load instead of only when a slot appears
       // and fastGrabBooking() happens to run. Pure feature-detect, no request.
       portalAvailable().catch(() => {});
+      // #90 Arm the console test helpers in page.js — TEST build only.
+      if (TEST_MODE) { try { dispatchEvent(new CustomEvent("abEnableTestHelpers")); } catch (e) {} }
       await handleBookingPage(settings);
       return;
     }

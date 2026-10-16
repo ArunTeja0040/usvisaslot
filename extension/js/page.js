@@ -472,6 +472,11 @@
       opts.map(function (o) { return (o.textContent || "").trim(); }).filter(Boolean).join(" | ") };
   }
 
+  // #90 Only arm these in the TEST build. page.js runs in the MAIN world and
+  // cannot see TEST_MODE, so auto-booking.js (which can) announces it. On
+  // production nothing is installed and nothing is logged.
+  function installHelpers() {
+
   // abPortalRead("HYDERABAD VAC")              → that city's open dates
   // abPortalRead("HYDERABAD VAC", "2026-11-14") → plus that date's times
   window.abPortalRead = async function (city, date) {
@@ -528,5 +533,13 @@
     dispatchEvent(new CustomEvent("abBenchCmd", { detail: { cityValue: c.value, cityName: c.name, date: date } }));
   };
 
-  console.log("[AutoBook-TEST] [test] helpers ready: abPortalRead(city[, date]) · abPortalBench(city, date)");
+    console.log("[AutoBook-TEST] [test] helpers ready: abPortalRead(city[, date]) · abPortalBench(city, date)");
+  }
+
+  var armed = false;
+  addEventListener("abEnableTestHelpers", function () {
+    if (armed) return;
+    armed = true;
+    try { installHelpers(); } catch (e) {}
+  });
 })();
