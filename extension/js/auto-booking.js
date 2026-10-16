@@ -50,12 +50,15 @@
 
   // #58 Bounded submit retries on a throttle. Small on purpose: the site meters
   // daily actions and a long burst triggers a 24-72h lockout.
-  const SUBMIT_RETRIES = 3;
+  const SUBMIT_RETRIES = 2;   // #88 each retry now waits ~35s for a real answer
   // #58b Hard ceiling on one grab. "Keep retrying while the slot is still
   // listed" is right for a stampede (slots stay unclaimed ~20-30s), but each
   // calendar reload spends one of the client's metered daily actions — running
   // away would trigger a 24-72h lockout and cost us the NEXT release too.
-  const GRAB_MAX_MS = 90 * 1000;
+  // #88 Raised from 90s. Measured: a single submit takes ~35s to answer under
+  // load, so one submit plus retries never fitted in 90s and the grab was cut
+  // off part-way through its own retry sequence.
+  const GRAB_MAX_MS = 240 * 1000;
 
   const MAX_PARALLEL_STRIKES = 3;          // #46b after this many timeout rounds in a row, bench parallel
   const PARALLEL_BENCH_MS = 5 * 60 * 1000;  // #46b run pure-sequential this long before re-testing parallel
@@ -4490,8 +4493,20 @@
         // #81 Trust the portal only where it is unambiguous. "unconfirmed" and
         // "unknown" still go through the page-watching path, which can tell
         // confirmed from ofc_submitted and recognises a throttle.
+        // #88 A refusal is not one thing. "The system is processing too many
+        // requests" means the booking was never processed — safe and correct to
+        // retry. "No longer available" means we lost it. We were collapsing
+        // both to "failed", so every throttle burned a round of the #77 budget
+        // and rested a date that was never actually contested.
+        const refusedByThrottle = !!(portalVerdict && portalVerdict.verdict === "rejected" &&
+          portalVerdict.message && /too\s+many\s+requests|processing\s+too\s+many|server\s+is\s+busy|try\s+again\s+later|please\s+wait/i.test(portalVerdict.message));
+
         let outcome;
-        if (portalVerdict && portalVerdict.verdict === "rejected") {
+        if (refusedByThrottle) {
+          log(`[fastgrab] refusal was a THROTTLE, not a lost slot — the booking never ran, retrying`);
+          __lastThrottleText = portalVerdict.message;
+          outcome = "throttled";
+        } else if (portalVerdict && portalVerdict.verdict === "rejected") {
           // #84 The portal names its own reason. Record it — "slot taken" and
           // "you are rate limited" are very different and we were guessing.
           log(`[fastgrab] portal REFUSED the booking` +
@@ -4553,7 +4568,9 @@
             if (__abortAll || await checkStopSignal()) { log("[fastgrab] stop requested — aborting submit retries"); break; }
             // #80 Retry through whichever route committed the first attempt.
             if (portalNum !== null) {
-              const r2 = await portalCmd("submit", { num: portalNum, waitMs: 2500 }, 6000);
+              // #88 Same wait as the first submit. A short wait here would
+              // leave the retry blind and we would be guessing again.
+              const r2 = await portalCmd("submit", { num: portalNum, waitMs: 45000 }, 50000);
               if (!r2.ok) { log(`[fastgrab] portal re-submit failed (${r2.why}) — stopping retries`); break; }
             } else {
               const btn2 = document.getElementById("submitbtn");
