@@ -4462,11 +4462,13 @@
         if (portalNum !== null) {
           // #81 The adapter waits for the portal's own reply and returns its
           // verdict, so the clear cases skip the 15s page-watching entirely.
-          // #83 Short. A missed verdict must cost almost nothing — the page
-          // watcher below is the real detector and answers within seconds.
-          // The old 15s wait added ~15s to EVERY attempt, which is what drove
-          // the site to start replying "too many requests".
-          const sub = await portalCmd("submit", { num: portalNum, waitMs: 2500 }, 6000);
+          // #84 Measured on a live slot: the portal takes ~32s to answer a
+          // submit under contention. Both earlier values (15s, then 2.5s) gave
+          // up long before the reply, so we never learned the outcome AND
+          // fired retries while the first submit was still in flight — four
+          // bookings in five seconds. That IS the "too many requests" the site
+          // then complained about. Wait for the real answer instead.
+          const sub = await portalCmd("submit", { num: portalNum, waitMs: 45000 }, 50000);
           if (!sub.ok) { log(`[fastgrab] portal submit failed (${sub.why}) (attempt ${attempt}) — retrying`); continue; }
           portalVerdict = sub.data && sub.data.verdict ? sub.data : null;
           if (portalVerdict) {
@@ -4486,6 +4488,9 @@
         // confirmed from ofc_submitted and recognises a throttle.
         let outcome;
         if (portalVerdict && portalVerdict.verdict === "rejected") {
+          // #84 The portal names its own reason. Record it — "slot taken" and
+          // "you are rate limited" are very different and we were guessing.
+          log(`[fastgrab] portal REFUSED the booking${portalVerdict.code ? ` — code ${portalVerdict.code}` : " (no code given)"}`);
           outcome = "failed";
         } else if (portalVerdict && portalVerdict.verdict === "booked") {
           // Same rule the page-watcher uses: on the OFC page a success means
@@ -4510,6 +4515,18 @@
         // anything, so the slot was not booked by anyone on this attempt.
         // Phase 1: classify + report correctly and let the attempt loop try
         // again (instead of declaring "slot taken" and abandoning it).
+        // #84 Only retry a submit we KNOW was refused. Retrying on an unknown
+        // outcome stacks concurrent bookings on a portal that answers in ~32s,
+        // which manufactures the throttle it then reports — and risks
+        // double-booking if the first one actually succeeded.
+        if (outcome === "throttled" && portalNum !== null && !portalVerdict) {
+          log("[fastgrab] throttle read from the page but no portal verdict — not re-submitting blind");
+          sendTelegramNotification("error",
+            `❓ <b>BOOKING UNCERTAIN</b>\n\n👤 ${u}\n📍 ${cityName} ${targetDate}\n` +
+            `The portal did not answer this booking. Check the portal before trying again.`);
+          break;
+        }
+
         if (outcome === "throttled") {
           log(`[fastgrab] THROTTLED on submit — "${__lastThrottleText}"`);
           trackEvent(EVENT_TYPES.ERROR, `Submit throttled: ${__lastThrottleText}`, u);
