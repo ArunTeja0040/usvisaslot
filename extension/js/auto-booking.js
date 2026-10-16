@@ -4490,7 +4490,12 @@
         if (portalVerdict && portalVerdict.verdict === "rejected") {
           // #84 The portal names its own reason. Record it — "slot taken" and
           // "you are rate limited" are very different and we were guessing.
-          log(`[fastgrab] portal REFUSED the booking${portalVerdict.code ? ` — code ${portalVerdict.code}` : " (no code given)"}`);
+          log(`[fastgrab] portal REFUSED the booking` +
+              `${portalVerdict.code ? ` — code ${portalVerdict.code}` : ""}` +
+              `${portalVerdict.message ? ` — "${portalVerdict.message}"` : " (portal gave no reason)"}`);
+          if (portalVerdict.message) {
+            trackEvent(EVENT_TYPES.ERROR, `Portal refused booking: ${portalVerdict.message}`, u);
+          }
           outcome = "failed";
         } else if (portalVerdict && portalVerdict.verdict === "booked") {
           // Same rule the page-watcher uses: on the OFC page a success means

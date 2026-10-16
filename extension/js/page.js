@@ -235,13 +235,31 @@
 
   var ERR_CODE_RE = /^[A-Za-z]{2,6}\d{2,6}$/;
 
-  function errorCode(d) {
+  // #85 Keep the portal's whole message, not just a short code. A refusal
+  // that reads "you have used all your reschedules" is a permanent condition
+  // and must not be retried; one that reads "slot taken" is a lost race. We
+  // were collapsing both to "no code given" and could not tell them apart.
+  function errorDetail(d) {
+    var out = { code: null, message: null };
     try {
-      var raw = d && d.Errors && d.Errors.m_StringValue;
-      if (typeof raw !== "string") return null;
+      var errs = d && d.Errors;
+      var raw = errs && (errs.m_StringValue != null ? errs.m_StringValue : errs.Value);
+      if (typeof raw !== "string") {
+        // Some payloads nest the text; fall back to the generic field.
+        raw = d && d.LocalizedGenericErrorMessage;
+      }
+      if (typeof raw !== "string") return out;
       var t = raw.trim();
-      return ERR_CODE_RE.test(t) ? t : null;
-    } catch (e) { return null; }
+      if (!t) return out;
+      out.message = t.slice(0, 400);
+      if (ERR_CODE_RE.test(t)) out.code = t;
+      else {
+        // Codes are often embedded in a sentence, e.g. "... (PSE0601)".
+        var m = t.match(/\b([A-Za-z]{2,6}\d{2,6})\b/);
+        if (m) out.code = m[1];
+      }
+    } catch (e) {}
+    return out;
   }
 
   // Returns null when the body is not a booking reply at all.
@@ -249,7 +267,10 @@
     var d;
     try { d = JSON.parse(text); } catch (e) { return null; }
     if (!d || typeof d !== "object" || Array.isArray(d)) return null;
-    if (d.HasError === true) return { verdict: "rejected", code: errorCode(d) };
+    if (d.HasError === true) {
+      var det = errorDetail(d);
+      return { verdict: "rejected", code: det.code, message: det.message };
+    }
     if (d.AllScheduled === true) return { verdict: "booked" };
     if (d.HasError === false) return { verdict: "unconfirmed" };
     return null;
@@ -369,7 +390,8 @@
           if (done) return;
           done = true;
           clearTimeout(timer);
-          reply(id, true, { submitted: true, num: num, verdict: v.verdict, code: v.code || null });
+          reply(id, true, { submitted: true, num: num, verdict: v.verdict,
+                            code: v.code || null, message: v.message || null });
         };
 
         seed({ Num: num });
