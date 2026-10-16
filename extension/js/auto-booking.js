@@ -4378,6 +4378,9 @@
     trackEvent(EVENT_TYPES.SLOT_FOUND, `Slot in range: ${cityName} ${dateStr} — fast-grab started`, u);
     sendTelegramNotification("slot",
       `🎯 <b>SLOT FOUND — GRABBING</b>\n\n👤 <b>User:</b> ${u}\n📍 <b>${cityName}</b>\n📅 <b>${dateStr}</b>\n⚡ Booking now...`);
+    // #86 Seats are filled in by the fast path a moment later; declared here so
+    // the outcome messages below can report how contested the slot actually was.
+    let fpSeats = null;
 
     const MAX_ATTEMPTS = 5;
     const CAL_WAIT_MS = 10000;  // wait for calendar to render
@@ -4429,6 +4432,7 @@
         if (fp.ok) {
           portalNum = fp.num;
           pickedTime = fp.time || "";
+          fpSeats = fp.seats != null ? fp.seats : null;
           log(`[fastgrab] portal fast path — ${targetDate} ${pickedTime} ` +
               `(slot ${fp.num}, ${fp.count} time(s)` +
               `${fp.seats != null ? `, ${fp.seats} seat(s)` : ""})` +
@@ -4513,7 +4517,8 @@
           updateUserStatus(u, "confirmed", bookingHalfStamp(outcome));
           updateSlotHistoryAction(u, cityName, targetDate, outcome === "confirmed" ? "confirmed" : "submitted");
           sendTelegramNotification("confirmed",
-            `🎉 <b>VAC BOOKED!</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n🕐 <b>${pickedTime || "first slot"}</b>\n✅ ${outcome === "ofc_submitted" ? "OFC submitted → consular next" : "Confirmed"}\n⏱️ Booked in ${ms}ms`);
+            `🎉 <b>VAC BOOKED!</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n🕐 <b>${pickedTime || "first slot"}</b>\n✅ ${outcome === "ofc_submitted" ? "OFC submitted → consular next" : "Confirmed"}` +
+            `${fpSeats != null ? `\n🪑 Won a slot with ${fpSeats} seat(s) left` : ""}\n⏱️ Booked in ${(ms / 1000).toFixed(1)}s`);
           booked = true; break;
         }
         // #58 A throttle is NOT a lost race — the server refused us before doing
@@ -4570,7 +4575,9 @@
             // date may still hold other times. Counted as a failed round like
             // any other, so the next round tries it again.
             log("[fastgrab] site reported slot taken during retries");
-            sendTelegramNotification("error", `❌ <b>SLOT TAKEN</b>\n\n👤 ${u}\n📍 ${cityName} ${targetDate}\nSomeone booked it first — will retry next round`);
+            sendTelegramNotification("error",
+              `❌ <b>SLOT TAKEN</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n` +
+              `Someone booked it first — will retry next round`);
             resumeScan = true; break;
           }
           // Still throttled (or ambiguous). Do NOT blindly re-submit — but do
@@ -4589,7 +4596,18 @@
         }
 
         if (outcome === "failed") {
-          sendTelegramNotification("error", `⚠️ <b>BOOKING FAILED (slot taken)</b>\n\n👤 ${u}\n${cityName} ${targetDate}\n❌ Someone grabbed it first`);
+          // #86 Say what the portal actually said. "Someone grabbed it first"
+          // was always an assumption; when the portal gives a reason, that
+          // reason is the message.
+          sendTelegramNotification("error",
+            portalVerdict && portalVerdict.message
+              ? `❌ <b>BOOKING REFUSED</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n` +
+                `🕐 ${pickedTime || "—"}${fpSeats != null ? ` · ${fpSeats} seat(s)` : ""}\n\n` +
+                `💬 <i>The portal said:</i>\n"${portalVerdict.message}"` +
+                `${portalVerdict.code ? `\n🔖 Code: ${portalVerdict.code}` : ""}\n\n` +
+                `🔁 Will retry next round`
+              : `⚠️ <b>BOOKING FAILED</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n` +
+                `❌ Refused, and the portal gave no reason\n🔁 Will retry next round`);
           resumeScan = true; break;
         }
         // uncertain/timeout — ambiguous; alert + stop (don't blindly re-submit a maybe-booking).
