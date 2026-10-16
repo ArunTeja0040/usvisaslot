@@ -12,6 +12,26 @@ Format:
 
 ---
 
+## 2026-10-16 — Booking rebuilt around what the website actually does (Issues #80-#90)
+
+**What it does:** A week of work on the moment a slot is found. Four parts.
+
+**1. It books through the website's own commands.** The bot used to click its way through: pick the city, wait for the calendar to draw, click the date, wait for the time buttons to appear, click one, press Submit. Most of that was the bot sitting still waiting for pictures to appear so it had something to click. It now asks the website directly, which cuts those waits out entirely. Picking a date and time went from several seconds to **about 2-3 seconds**. If the quick route is ever unavailable the bot silently falls back to the old clicking method, so nothing can be lost.
+
+**2. It reads the real answer instead of guessing.** Before, it watched the screen for 15 seconds and read the words to decide whether a booking worked. That is how **"too many requests... please try again"** got read as **"someone took the slot"** — because it contains "try again". The website states the outcome plainly in its reply, and the bot now reads that. Telegram quotes the website's exact words when a booking is refused.
+
+**3. It knows the difference between losing and being told to wait.** This was the big discovery. When the website says it is too busy, the booking **never happened** — nobody got it. The bot used to treat that as a lost race, give up on the date, and eventually rest it for five minutes while seats sat unbooked. It now recognises a busy signal, steps back to normal scanning, and does **not** count it against that date.
+
+**4. It stops making things worse.** We measured this directly. Retrying straight after a busy signal made the website progressively slower for us — page reads went from 2 seconds, to 100, to 200. Backing off instead returned everything to normal within minutes. The bot no longer retries into a busy website.
+
+**Also:** it now prefers the time slot with the most places free, shows those numbers on the overview panel, and waits as long as the website asks when the website says how long.
+
+**Why:** Slots are won in seconds. But we discovered the bot was often not losing races at all — it was mishandling a busy website and then punishing itself for it.
+
+**What changed for you:** Reload the extension on every machine. Telegram messages are more accurate: a refusal now quotes the website, and a busy website says "PORTAL BUSY - nobody could book it either" instead of implying the slot was lost.
+
+**Being straight with you:** this has **not yet completed a real booking**. Everything up to the final step is proven on live slots; every attempt during testing was refused by a website too busy to process anyone's booking. The old clicking method remains in place as a fallback at every stage. Watch the first real booking closely.
+
 ## 2026-09-22 — Ready for the Chrome Web Store, and the last of the competitor's code is gone (Issue #78)
 
 **What it does:** Three things, so the extension can be published to the Chrome Web Store and installed by your team from a link.

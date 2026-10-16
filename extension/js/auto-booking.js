@@ -50,12 +50,15 @@
 
   // #58 Bounded submit retries on a throttle. Small on purpose: the site meters
   // daily actions and a long burst triggers a 24-72h lockout.
-  const SUBMIT_RETRIES = 3;
+  const SUBMIT_RETRIES = 2;   // #88 each retry now waits ~35s for a real answer
   // #58b Hard ceiling on one grab. "Keep retrying while the slot is still
   // listed" is right for a stampede (slots stay unclaimed ~20-30s), but each
   // calendar reload spends one of the client's metered daily actions — running
   // away would trigger a 24-72h lockout and cost us the NEXT release too.
-  const GRAB_MAX_MS = 90 * 1000;
+  // #88 Raised from 90s. Measured: a single submit takes ~35s to answer under
+  // load, so one submit plus retries never fitted in 90s and the grab was cut
+  // off part-way through its own retry sequence.
+  const GRAB_MAX_MS = 240 * 1000;
 
   const MAX_PARALLEL_STRIKES = 3;          // #46b after this many timeout rounds in a row, bench parallel
   const PARALLEL_BENCH_MS = 5 * 60 * 1000;  // #46b run pure-sequential this long before re-testing parallel
@@ -3509,6 +3512,7 @@
                   : (d.msBurst || d.msTime) ? "platform throttle"
                   : "site/app limiter";
         log(`429 detected (page.js) — source=${src} retryAfter=${d.retryAfter || "none"} url=${d.url}`);
+        noteRetryAfter(d.retryAfter);   // #82 act on it, not just log it
         if (d.body) log(`[429 diag] body: ${String(d.body).substring(0, 200)}`);
         chrome.storage.local.get(["loginDetails"], (dd) => {
           const u = dd.loginDetails?.username || "";
@@ -4161,14 +4165,57 @@
   }
 
   // One cycling round ended without booking this city+date.
+  // #82 The site sometimes states exactly how long to wait. Accept seconds or
+  // an HTTP date, clamp to [30s, 1h] so a malformed or hostile value cannot
+  // stall a client for a day, and expire it so it is only used while fresh.
+  let __retryAfterMs = 0;
+  let __retryAfterAt = 0;
+  const RETRY_AFTER_MIN_MS = 30 * 1000;
+  const RETRY_AFTER_MAX_MS = 60 * 60 * 1000;
+  const RETRY_AFTER_FRESH_MS = 2 * 60 * 1000;
+
+  function parseRetryAfter(raw) {
+    if (raw == null) return 0;
+    const txt = String(raw).trim();
+    if (!txt) return 0;
+    let ms = 0;
+    if (/^\d+$/.test(txt)) {
+      ms = Number(txt) * 1000;
+    } else {
+      const when = Date.parse(txt);
+      if (!Number.isFinite(when)) return 0;
+      ms = when - Date.now();
+    }
+    if (!Number.isFinite(ms) || ms <= 0) return 0;
+    return Math.min(Math.max(ms, RETRY_AFTER_MIN_MS), RETRY_AFTER_MAX_MS);
+  }
+
+  function noteRetryAfter(raw) {
+    const ms = parseRetryAfter(raw);
+    if (!ms) return;
+    __retryAfterMs = ms;
+    __retryAfterAt = Date.now();
+    log(`[retry-after] site asked for ${Math.round(ms / 1000)}s`);
+  }
+
+  function takeRetryAfter() {
+    if (!__retryAfterMs) return 0;
+    if (Date.now() - __retryAfterAt > RETRY_AFTER_FRESH_MS) { __retryAfterMs = 0; return 0; }
+    const ms = __retryAfterMs;
+    __retryAfterMs = 0;
+    return ms;
+  }
+
   function recordGrabFailure(cityValue, dateStr) {
     const k = grabKey(cityValue, dateStr);
     const t = __grabTries[k] || (__grabTries[k] = { fails: 0, pausedUntil: 0 });
     t.fails++;
     if (t.fails >= GRAB_ROUNDS_BEFORE_PAUSE) {
-      const ms = GRAB_PAUSE_MIN_MS + Math.random() * (GRAB_PAUSE_MAX_MS - GRAB_PAUSE_MIN_MS);
+      // Honour an explicit Retry-After over our own guess.
+      const asked = takeRetryAfter();
+      const ms = asked || (GRAB_PAUSE_MIN_MS + Math.random() * (GRAB_PAUSE_MAX_MS - GRAB_PAUSE_MIN_MS));
       t.pausedUntil = Date.now() + ms;
-      return { fails: t.fails, paused: true, pauseMin: Math.round(ms / 60000) };
+      return { fails: t.fails, paused: true, pauseMin: Math.round(ms / 60000), askedBySite: asked > 0 };
     }
     return { fails: t.fails, paused: false };
   }
@@ -4188,6 +4235,128 @@
     const sd = document.getElementById("ab-start-date")?.value || "";
     const ed = document.getElementById("ab-end-date")?.value || "";
     return !!(sd || ed);
+  }
+
+  // ─── #80 PORTAL FAST PATH ──────────────────────────────────────────
+  // page.js (MAIN world) can call the portal's own scheduling functions, which
+  // skips every render wait the DOM path needs — no datepicker poll, no hunting
+  // for a[data-date], no waiting for time radios. Only the server round-trip is
+  // left. Anything that fails here falls back to the DOM path, which stays the
+  // safety net until this has proven itself on real bookings.
+  const PORTAL_READ_MS = 30000;   // the portal is slow under load; the DOM path waited 10-12s
+  let __portalSeq = 0;
+  let __portalReady = null;       // probe result, cached per page
+
+  function portalCmd(type, params = {}, timeoutMs = PORTAL_READ_MS) {
+    return new Promise((resolve) => {
+      const id = `p${++__portalSeq}-${Date.now()}`;
+      let settled = false;
+      const finish = (v) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        removeEventListener("abPortalResult", onResult);
+        resolve(v);
+      };
+      const onResult = (ev) => {
+        const d = ev && ev.detail;
+        if (!d || d.id !== id) return;
+        finish(d.ok ? { ok: true, data: d.data } : { ok: false, why: d.error });
+      };
+      const timer = setTimeout(() => finish({ ok: false, why: "timeout" }), timeoutMs);
+      addEventListener("abPortalResult", onResult);
+      try {
+        dispatchEvent(new CustomEvent("abPortalCmd", { detail: { id, type, ...params } }));
+      } catch (e) {
+        finish({ ok: false, why: e.message });
+      }
+    });
+  }
+
+  async function portalAvailable() {
+    if (__portalReady !== null) return __portalReady;
+    const r = await portalCmd("probe", {}, 3000);
+    const d = (r.ok && r.data) || {};
+    __portalReady = !!d.available;
+    log(`[portal] fast path ${__portalReady ? "AVAILABLE" : "unavailable"}` +
+        (d.missing && d.missing.length ? ` — missing ${d.missing.join(",")}` : "") +
+        (r.ok ? "" : ` — ${r.why}`));
+    return __portalReady;
+  }
+
+  // Loads the city's days, confirms the date is still listed, loads its times
+  // and picks one. Returns the ordinal the submit call needs.
+  async function portalSelect(cityValue, dateStr) {
+    if (!(await portalAvailable())) return { ok: false, why: "fast path unavailable" };
+
+    const d = await portalCmd("days", { postId: cityValue });
+    if (!d.ok) return { ok: false, why: `days: ${d.why}` };
+    const dates = (d.data.days || []).map((x) => x.date);
+    if (!dates.includes(dateStr)) return { ok: false, why: `${dateStr} no longer listed` };
+
+    const e = await portalCmd("entries", { date: dateStr });
+    if (!e.ok) return { ok: false, why: `entries: ${e.why}` };
+    const entries = e.data.entries || [];
+    if (!entries.length) return { ok: false, why: "no times on that date" };
+
+    // #58 Never the first — every competing bot takes the first radio, so
+    // contention concentrates there. The DATE is still the earliest in range.
+    // #82 Among the rest, prefer the time with the most seats left
+    // (EntriesAvailable): a slot with 4 places is a better bet than one with 1.
+    // Ties break at random so we still don't all land on the same slot, and a
+    // feed without seat counts falls back to the original random pick.
+    const withSeats = entries.filter((e) => typeof e.seats === "number" && e.seats > 0);
+    let pool = entries;
+    if (withSeats.length) {
+      const most = Math.max(...withSeats.map((e) => e.seats));
+      pool = withSeats.filter((e) => e.seats === most);
+    }
+    const pick = pool[Math.floor(Math.random() * pool.length)];
+    return {
+      ok: true, num: pick.num, time: pick.time, seats: pick.seats,
+      count: entries.length, tiedAtBest: pool.length, seatAware: withSeats.length > 0,
+    };
+  }
+
+  // #80b Side-by-side timing, driven from the console by abPortalBench() in
+  // page.js. TEST build only — the listener is never registered in production.
+  // Selects a date and time by both routes; never submits.
+  if (TEST_MODE) {
+    addEventListener("abBenchCmd", async (ev) => {
+      const d = (ev && ev.detail) || {};
+      if (!d.cityValue || !d.date) return;
+      try {
+        // ── New route ──
+        const t0 = Date.now();
+        const fp = await portalSelect(d.cityValue, d.date);
+        const fastMs = Date.now() - t0;
+        log(fp.ok
+          ? `[bench] NEW route: ${fastMs}ms — ${d.date} ${fp.time} (slot ${fp.num}, ${fp.count} time(s))`
+          : `[bench] NEW route FAILED after ${fastMs}ms — ${fp.why}`);
+
+        // ── Old route: switch city, wait for the calendar, click through ──
+        const t1 = Date.now();
+        const select = document.getElementById("post_select");
+        if (!select) { log("[bench] OLD route: city dropdown missing"); return; }
+        select.value = d.cityValue;
+        const daysPromise = waitForScheduleData(15000);
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+        await daysPromise;
+        const picked = await selectDateInCalendar(new Date(d.date + "T00:00:00"), 10000);
+        if (!picked) { log(`[bench] OLD route: date never became clickable (${Date.now() - t1}ms)`); return; }
+        const timeOk = await waitForTimeSlotAndSelect(12000);
+        const slowMs = Date.now() - t1;
+        if (!timeOk) { log(`[bench] OLD route: times never appeared (${slowMs}ms)`); return; }
+        log(`[bench] OLD route: ${slowMs}ms — ${d.date} ${getSelectedTimeText()}`);
+
+        if (fp.ok) {
+          const saved = slowMs - fastMs;
+          log(`[bench] RESULT: new route is ${saved}ms faster (${(saved / 1000).toFixed(1)}s). Nothing was booked.`);
+        }
+      } catch (e) {
+        log("[bench] failed: " + e.message);
+      }
+    });
   }
 
   async function fastGrabBooking(cityValue, cityName, dateStr, alreadyOnCity = false) {
@@ -4212,6 +4381,12 @@
     trackEvent(EVENT_TYPES.SLOT_FOUND, `Slot in range: ${cityName} ${dateStr} — fast-grab started`, u);
     sendTelegramNotification("slot",
       `🎯 <b>SLOT FOUND — GRABBING</b>\n\n👤 <b>User:</b> ${u}\n📍 <b>${cityName}</b>\n📅 <b>${dateStr}</b>\n⚡ Booking now...`);
+    // #86 Seats are filled in by the fast path a moment later; declared here so
+    // the outcome messages below can report how contested the slot actually was.
+    let fpSeats = null;
+    // #89 Set when we backed off because the PORTAL was busy. That is not a
+    // failed attempt on our part and must not burn the #77 round budget.
+    let throttledOut = false;
 
     const MAX_ATTEMPTS = 5;
     const CAL_WAIT_MS = 10000;  // wait for calendar to render
@@ -4254,14 +4429,32 @@
         }
         lastTriedDate = targetDate;
 
-        // Wait (up to 10s) for the calendar + click the date.
-        const picked = await selectDateInCalendar(new Date(targetDate + "T00:00:00"), CAL_WAIT_MS);
-        if (!picked) { log(`[fastgrab] calendar/date not ready (attempt ${attempt}) — retrying`); continue; }
+        // #80 Fast path first: ask the portal's own functions for the days and
+        // times, which skips the datepicker and radio render waits entirely.
+        // Any failure drops through to the DOM path below.
+        let pickedTime = "";
+        let portalNum = null;
+        const fp = await portalSelect(cityValue, targetDate);
+        if (fp.ok) {
+          portalNum = fp.num;
+          pickedTime = fp.time || "";
+          fpSeats = fp.seats != null ? fp.seats : null;
+          log(`[fastgrab] portal fast path — ${targetDate} ${pickedTime} ` +
+              `(slot ${fp.num}, ${fp.count} time(s)` +
+              `${fp.seats != null ? `, ${fp.seats} seat(s)` : ""})` +
+              `${fp.seatAware ? ` — most seats, ${fp.tiedAtBest} tied` : ""} in ${Date.now() - t0}ms`);
+        } else {
+          log(`[fastgrab] portal fast path unusable (${fp.why}) — using the DOM path`);
 
-        // Wait (up to 12s) for time slots + select first; submit must be enabled.
-        const timeReady = await waitForTimeSlotAndSelect(TIME_WAIT_MS);
-        if (!timeReady) { log(`[fastgrab] time slots not ready (attempt ${attempt}) — retrying`); continue; }
-        const pickedTime = getSelectedTimeText();
+          // Wait (up to 10s) for the calendar + click the date.
+          const picked = await selectDateInCalendar(new Date(targetDate + "T00:00:00"), CAL_WAIT_MS);
+          if (!picked) { log(`[fastgrab] calendar/date not ready (attempt ${attempt}) — retrying`); continue; }
+
+          // Wait (up to 12s) for time slots + select first; submit must be enabled.
+          const timeReady = await waitForTimeSlotAndSelect(TIME_WAIT_MS);
+          if (!timeReady) { log(`[fastgrab] time slots not ready (attempt ${attempt}) — retrying`); continue; }
+          pickedTime = getSelectedTimeText();
+        }
 
         // Dry-run stop.
         if (TEST_MODE && TEST_FORCE_NO_SUBMIT) {
@@ -4273,13 +4466,83 @@
           booked = true; break;
         }
 
-        // Live submit.
-        const submitBtn = document.getElementById("submitbtn");
-        if (!submitBtn || submitBtn.disabled) { log(`[fastgrab] submit not ready (attempt ${attempt}) — retrying`); continue; }
-        submitBtn.click();
+        // Live submit. The fast path commits through the portal's own submit
+        // function; the DOM path clicks the button as before.
+        let portalVerdict = null;
+        if (portalNum !== null) {
+          // #81 The adapter waits for the portal's own reply and returns its
+          // verdict, so the clear cases skip the 15s page-watching entirely.
+          // #84 Measured on a live slot: the portal takes ~32s to answer a
+          // submit under contention. Both earlier values (15s, then 2.5s) gave
+          // up long before the reply, so we never learned the outcome AND
+          // fired retries while the first submit was still in flight — four
+          // bookings in five seconds. That IS the "too many requests" the site
+          // then complained about. Wait for the real answer instead.
+          const sub = await portalCmd("submit", { num: portalNum, waitMs: 45000 }, 50000);
+          if (!sub.ok) { log(`[fastgrab] portal submit failed (${sub.why}) (attempt ${attempt}) — retrying`); continue; }
+          portalVerdict = sub.data && sub.data.verdict ? sub.data : null;
+          if (portalVerdict) {
+            log(`[fastgrab] portal verdict: ${portalVerdict.verdict}` +
+                (portalVerdict.code ? ` (code ${portalVerdict.code})` : ""));
+          }
+        } else {
+          const submitBtn = document.getElementById("submitbtn");
+          if (!submitBtn || submitBtn.disabled) { log(`[fastgrab] submit not ready (attempt ${attempt}) — retrying`); continue; }
+          submitBtn.click();
+        }
         const ms = Date.now() - t0;
         trackEvent(EVENT_TYPES.BOOKING, `Submitted ${cityName} ${targetDate} ${pickedTime} (${ms}ms)`, u);
-        const outcome = await waitForBookingOutcome(15000);
+
+        // #81 Trust the portal only where it is unambiguous. "unconfirmed" and
+        // "unknown" still go through the page-watching path, which can tell
+        // confirmed from ofc_submitted and recognises a throttle.
+        // #88 A refusal is not one thing. "The system is processing too many
+        // requests" means the booking was never processed — safe and correct to
+        // retry. "No longer available" means we lost it. We were collapsing
+        // both to "failed", so every throttle burned a round of the #77 budget
+        // and rested a date that was never actually contested.
+        const refusedByThrottle = !!(portalVerdict && portalVerdict.verdict === "rejected" &&
+          portalVerdict.message && /too\s+many\s+requests|processing\s+too\s+many|server\s+is\s+busy|try\s+again\s+later|please\s+wait/i.test(portalVerdict.message));
+
+        let outcome;
+        if (refusedByThrottle) {
+          // #89 Measured: retrying a throttle 0.9s later made things worse —
+          // reads went from 2.4s to 100s after three submits in two minutes.
+          // "The system is processing too many requests" is an instruction to
+          // back off, and we were answering it with more requests.
+          //
+          // So: back out to scanning, which is a natural ~60s backoff, and do
+          // NOT count this as a failed round — the slot was never contested
+          // and the date must not be rested over it. Persistent without
+          // hammering.
+          log(`[fastgrab] THROTTLED — the booking never ran. Backing off to scanning; ` +
+              `this does not count against the date's retry budget.`);
+          sendTelegramNotification("rate",
+            `⏳ <b>PORTAL BUSY</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n` +
+            `${fpSeats != null ? `🪑 ${fpSeats} seat(s) still free\n` : ""}` +
+            `\n💬 "${portalVerdict.message}"\n\n` +
+            `↩️ Nobody could book it either — backing off and trying again shortly`);
+          throttledOut = true;
+          resumeScan = true;
+          break;
+        } else if (portalVerdict && portalVerdict.verdict === "rejected") {
+          // #84 The portal names its own reason. Record it — "slot taken" and
+          // "you are rate limited" are very different and we were guessing.
+          log(`[fastgrab] portal REFUSED the booking` +
+              `${portalVerdict.code ? ` — code ${portalVerdict.code}` : ""}` +
+              `${portalVerdict.message ? ` — "${portalVerdict.message}"` : " (portal gave no reason)"}`);
+          if (portalVerdict.message) {
+            trackEvent(EVENT_TYPES.ERROR, `Portal refused booking: ${portalVerdict.message}`, u);
+          }
+          outcome = "failed";
+        } else if (portalVerdict && portalVerdict.verdict === "booked") {
+          // Same rule the page-watcher uses: on the OFC page a success means
+          // the OFC half is done and the interview is next.
+          outcome = window.location.pathname.toLowerCase().includes("ofc-schedule")
+            ? "ofc_submitted" : "confirmed";
+        } else {
+          outcome = await waitForBookingOutcome(15000);
+        }
         if (outcome === "confirmed" || outcome === "ofc_submitted") {
           // #75 A client counts as fully booked only once BOTH halves are done.
           // The status value stays "confirmed" so nothing downstream changes;
@@ -4288,13 +4551,26 @@
           updateUserStatus(u, "confirmed", bookingHalfStamp(outcome));
           updateSlotHistoryAction(u, cityName, targetDate, outcome === "confirmed" ? "confirmed" : "submitted");
           sendTelegramNotification("confirmed",
-            `🎉 <b>VAC BOOKED!</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n🕐 <b>${pickedTime || "first slot"}</b>\n✅ ${outcome === "ofc_submitted" ? "OFC submitted → consular next" : "Confirmed"}\n⏱️ Booked in ${ms}ms`);
+            `🎉 <b>VAC BOOKED!</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n🕐 <b>${pickedTime || "first slot"}</b>\n✅ ${outcome === "ofc_submitted" ? "OFC submitted → consular next" : "Confirmed"}` +
+            `${fpSeats != null ? `\n🪑 Won a slot with ${fpSeats} seat(s) left` : ""}\n⏱️ Booked in ${(ms / 1000).toFixed(1)}s`);
           booked = true; break;
         }
         // #58 A throttle is NOT a lost race — the server refused us before doing
         // anything, so the slot was not booked by anyone on this attempt.
         // Phase 1: classify + report correctly and let the attempt loop try
         // again (instead of declaring "slot taken" and abandoning it).
+        // #84 Only retry a submit we KNOW was refused. Retrying on an unknown
+        // outcome stacks concurrent bookings on a portal that answers in ~32s,
+        // which manufactures the throttle it then reports — and risks
+        // double-booking if the first one actually succeeded.
+        if (outcome === "throttled" && portalNum !== null && !portalVerdict) {
+          log("[fastgrab] throttle read from the page but no portal verdict — not re-submitting blind");
+          sendTelegramNotification("error",
+            `❓ <b>BOOKING UNCERTAIN</b>\n\n👤 ${u}\n📍 ${cityName} ${targetDate}\n` +
+            `The portal did not answer this booking. Check the portal before trying again.`);
+          break;
+        }
+
         if (outcome === "throttled") {
           log(`[fastgrab] THROTTLED on submit — "${__lastThrottleText}"`);
           trackEvent(EVENT_TYPES.ERROR, `Submit throttled: ${__lastThrottleText}`, u);
@@ -4309,9 +4585,17 @@
             log(`[fastgrab] submit retry ${r}/${SUBMIT_RETRIES} in ${Math.round(waitMs)}ms`);
             await sleep(waitMs);
             if (__abortAll || await checkStopSignal()) { log("[fastgrab] stop requested — aborting submit retries"); break; }
-            const btn2 = document.getElementById("submitbtn");
-            if (!btn2 || btn2.disabled) { log("[fastgrab] submit no longer clickable — stopping retries"); break; }
-            btn2.click();
+            // #80 Retry through whichever route committed the first attempt.
+            if (portalNum !== null) {
+              // #88 Same wait as the first submit. A short wait here would
+              // leave the retry blind and we would be guessing again.
+              const r2 = await portalCmd("submit", { num: portalNum, waitMs: 45000 }, 50000);
+              if (!r2.ok) { log(`[fastgrab] portal re-submit failed (${r2.why}) — stopping retries`); break; }
+            } else {
+              const btn2 = document.getElementById("submitbtn");
+              if (!btn2 || btn2.disabled) { log("[fastgrab] submit no longer clickable — stopping retries"); break; }
+              btn2.click();
+            }
             outcome2 = await waitForBookingOutcome(8000);
           }
 
@@ -4327,7 +4611,9 @@
             // date may still hold other times. Counted as a failed round like
             // any other, so the next round tries it again.
             log("[fastgrab] site reported slot taken during retries");
-            sendTelegramNotification("error", `❌ <b>SLOT TAKEN</b>\n\n👤 ${u}\n📍 ${cityName} ${targetDate}\nSomeone booked it first — will retry next round`);
+            sendTelegramNotification("error",
+              `❌ <b>SLOT TAKEN</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n` +
+              `Someone booked it first — will retry next round`);
             resumeScan = true; break;
           }
           // Still throttled (or ambiguous). Do NOT blindly re-submit — but do
@@ -4346,7 +4632,18 @@
         }
 
         if (outcome === "failed") {
-          sendTelegramNotification("error", `⚠️ <b>BOOKING FAILED (slot taken)</b>\n\n👤 ${u}\n${cityName} ${targetDate}\n❌ Someone grabbed it first`);
+          // #86 Say what the portal actually said. "Someone grabbed it first"
+          // was always an assumption; when the portal gives a reason, that
+          // reason is the message.
+          sendTelegramNotification("error",
+            portalVerdict && portalVerdict.message
+              ? `❌ <b>BOOKING REFUSED</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n` +
+                `🕐 ${pickedTime || "—"}${fpSeats != null ? ` · ${fpSeats} seat(s)` : ""}\n\n` +
+                `💬 <i>The portal said:</i>\n"${portalVerdict.message}"` +
+                `${portalVerdict.code ? `\n🔖 Code: ${portalVerdict.code}` : ""}\n\n` +
+                `🔁 Will retry next round`
+              : `⚠️ <b>BOOKING FAILED</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${targetDate}</b>\n` +
+                `❌ Refused, and the portal gave no reason\n🔁 Will retry next round`);
           resumeScan = true; break;
         }
         // uncertain/timeout — ambiguous; alert + stop (don't blindly re-submit a maybe-booking).
@@ -4370,13 +4667,16 @@
     // break site above, so every non-booking exit counts once and only once.
     if (booked) {
       clearGrabHistory(cityValue, lastTriedDate);
+    } else if (throttledOut) {
+      log(`[fastgrab] ${cityName} ${lastTriedDate} — portal was busy, not counted as a failed round`);
     } else if (!__abortAll) {
       const st = recordGrabFailure(cityValue, lastTriedDate);
       if (st.paused) {
         log(`[fastgrab] ${cityName} ${lastTriedDate} failed ${st.fails} rounds — resting THIS DATE ${st.pauseMin}min; all locations keep cycling`);
         sendTelegramNotification("rate",
           `⏸️ <b>DATE RESTING</b>\n\n👤 ${u}\n📍 <b>${cityName}</b>\n📅 <b>${lastTriedDate}</b>\n` +
-          `❌ Failed ${st.fails} rounds in a row\n⏳ Pausing this date ~${st.pauseMin} min, then trying again\n` +
+          `❌ Failed ${st.fails} rounds in a row\n⏳ Pausing this date ~${st.pauseMin} min, then trying again` +
+          `${st.askedBySite ? " (the site asked for this wait)" : ""}\n` +
           `🔄 All other locations and dates keep cycling and booking as normal`);
       } else {
         log(`[fastgrab] ${cityName} ${lastTriedDate} failed round ${st.fails}/${GRAB_ROUNDS_BEFORE_PAUSE} — retrying next round`);
@@ -4664,9 +4964,25 @@
         ? `<b>${inCount}</b> in range &nbsp;·&nbsp; green = inside ${startDate || "…"} → ${endDate || "…"}`
         : `<b style="color:#ffd2cc;">No date range set for this client — booking is blocked</b>`;
 
+      // #87 Show how many places each time still has (EntriesAvailable). The
+      // feed has carried it all along and we were dropping it. A 1-seat slot
+      // and a 14-seat slot look identical otherwise, and they are not remotely
+      // the same bet. Green = roomy, amber = tight, red = last place.
+      const seatHtml = (t) => {
+        const time = esc(t.Time);
+        const n = (typeof t.EntriesAvailable === "number" && isFinite(t.EntriesAvailable))
+          ? t.EntriesAvailable : null;
+        if (n === null) return `<b>${time}</b>`;
+        const colour = n >= 5 ? "#1e8449" : (n >= 2 ? "#b9770e" : "#c0392b");
+        return `<b>${time}</b> <span style="color:${colour};">(${n})</span>`;
+      };
+      const totalSeats = (times || []).reduce(
+        (sum, t) => sum + ((typeof t.EntriesAvailable === "number" && isFinite(t.EntriesAvailable)) ? t.EntriesAvailable : 0), 0);
       const timeRow = (times && times.length)
         ? `<div style="margin-top:6px;font-size:12px;">🕐 <b>Times on the open date:</b> ${
-             esc(times.map((t) => t.Time).filter(Boolean).slice(0, 24).join(", "))}</div>`
+             times.filter((t) => t.Time).slice(0, 24).map(seatHtml).join(", ")}` +
+          `${totalSeats > 0 ? ` &nbsp;·&nbsp; <b>${totalSeats}</b> seat(s) in total` : ""}` +
+          `<br><span style="color:#7f8c8d;">( ) = places left on that time</span></div>`
         : "";
 
       const stamp = new Date().toLocaleString("en-IN", {
@@ -6324,6 +6640,12 @@
 
     if (path.includes("/ofc-schedule") || path.includes("/schedule")) {
       log("On booking page: " + path);
+      // #80b Report up-front whether the portal fast path is usable here, so
+      // this is visible on every page load instead of only when a slot appears
+      // and fastGrabBooking() happens to run. Pure feature-detect, no request.
+      portalAvailable().catch(() => {});
+      // #90 Arm the console test helpers in page.js — TEST build only.
+      if (TEST_MODE) { try { dispatchEvent(new CustomEvent("abEnableTestHelpers")); } catch (e) {} }
       await handleBookingPage(settings);
       return;
     }
