@@ -1578,6 +1578,17 @@
       document.getElementById("sweep-report-title").textContent =
         sweep.stoppedReason ? "Login check stopped" : "Login check finished";
 
+      // #83 A stopped run keeps its queue (stopSweep only flips `active` off),
+      // so offer to carry on from where it stopped. Restarting instead would
+      // rebuild the queue from every profile and re-spend a daily page-view on
+      // each client already done. Only offered when there is something left.
+      const contBtn = document.getElementById("sweep-report-continue");
+      const left = (sweep.queue || []).length;
+      if (contBtn) {
+        contBtn.hidden = !(sweep.stoppedReason && left > 0);
+        contBtn.textContent = `Continue checking (${left} left)`;
+      }
+
       document.getElementById("sweep-report-body").innerHTML = `
         ${sweep.stoppedReason ? `<p class="sr-stopped">${esc(sweep.stoppedReason)}</p>` : ""}
         <div class="sr-tallies">
@@ -2629,6 +2640,45 @@
     if (confirm("Stop the login check?\n\nClients already checked keep their result.")) {
       stopSweep("Stopped by you");
     }
+  });
+
+  // #83 Carry on a run that stopped at the block cap, instead of restarting it.
+  // `stopSweep` leaves `sweep.queue` intact and pushes the client it was blocked
+  // on back to the front, so everything needed to resume is already in storage.
+  document.getElementById("sweep-report-continue")?.addEventListener("click", async () => {
+    const sweep = await readSweep();
+    if (!sweep || !(sweep.queue || []).length) return;
+
+    const active = await new Promise((r) =>
+      chrome.storage.local.get(["activeAutomationUser"], (d) => r(d.activeAutomationUser)));
+    if (active) {
+      alert(`Can't carry on — ${active} is mid-session.\n\nStop that client first.`);
+      return;
+    }
+
+    // Resuming on the same IP just walks into the same challenge and stops
+    // again four blocks later. Say so once rather than spending them silently.
+    if (!confirm(
+      `Carry on with the remaining ${sweep.queue.length} client${sweep.queue.length === 1 ? "" : "s"}?\n\n` +
+      `• Change your IP first — on the same one this will stop again.\n` +
+      `• The ${(sweep.checked || []).length} already checked are not checked again.\n` +
+      `• Leave this dashboard tab open.`)) return;
+
+    sweep.active = true;
+    sweep.blocks = 0;          // otherwise the cap trips again immediately
+    sweep.paused = false;
+    sweep.retryAt = 0;
+    sweep.nextAt = 0;
+    sweep.current = null;
+    sweep.finishedAt = null;
+    sweep.stoppedReason = null;
+    sweep.dismissed = false;
+    await writeSweep(sweep);
+
+    // Same reason as startSweep: drop a stale tab id so the next client claims
+    // a tab cleanly instead of reviving one that has since been closed.
+    await new Promise((r) => chrome.storage.local.remove(["__abVerifyTabId"], r));
+    refresh();
   });
 
   document.getElementById("sweep-report-close")?.addEventListener("click", async () => {

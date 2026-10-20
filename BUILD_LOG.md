@@ -12,6 +12,23 @@ Format:
 
 ---
 
+## 2026-10-20 — Carry on a stopped login check instead of starting over (Issue #83)
+
+**What it does:** Adds a green **"Continue checking (N left)"** button to the orange "Login check stopped" box. Press it and the check picks up at the exact client it stopped on. The button only appears when there are actually clients left to check, and it tells you how many.
+
+**Why:** When the login check gets blocked four times in a row it stops and asks you to change your IP. Until now the box only had a **Dismiss** button. So the only way forward was to dismiss it and press "Check all logins" again — which started from the very top and re-checked every client that had already passed. On the run that prompted this, 11 clients had already signed in fine. Restarting would have signed all 11 in a second time for no reason, and each sign-in spends one of that client's limited daily page-views on the visa site. The list of who still needs checking was already saved — nothing was using it.
+
+**What changed for you:**
+- The orange stopped box now has two buttons: **Continue checking (N left)** and **Dismiss**.
+- Before it carries on, it asks you to confirm, and reminds you to change your IP first. On the same IP it will simply hit the same block and stop again — so this is a nudge, not a formality.
+- Clients already checked are never checked again. Their results stay.
+- If some client is mid-session, it refuses and tells you to stop that client first — same safety check the normal "Check all logins" button already has.
+- Nothing about booking, cycling or slot hunting was touched. This is dashboard-only.
+
+**Tested:** Confirmed working on the live dashboard — the button appeared on the already-stopped run and carried on from where it left off.
+
+---
+
 ## 2026-10-16 — Booking rebuilt around what the website actually does (Issues #80-#90)
 
 **What it does:** A week of work on the moment a slot is found. Four parts.
