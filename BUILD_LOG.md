@@ -12,6 +12,67 @@ Format:
 
 ---
 
+## 2026-10-27 — Show what the website actually said when it refuses a booking (Issue #86)
+
+**What it does:** When a booking is refused, the log now prints the website's own words, not just our one-word summary.
+
+Before: `portal verdict: rejected`
+Now: `portal verdict: rejected — portal said: "..."`
+
+**Why:** The bot already reads that message — it uses the wording to decide whether the website was simply too busy (so the booking never happened and the date is still worth trying) or whether we genuinely lost the slot to someone else. Those two need opposite responses. But the message was never shown, so there was no way to check that decision was right, and no way to learn the wording of a refusal we had not seen before. On 27 Oct a Chennai slot with 10 free seats was refused twice and we could only report our own interpretation of why.
+
+**What changed for you:** One extra piece of text in the console when a booking is refused. Nothing else — no change to how it books, no extra requests to the website.
+
+**Tested:** Not yet — shows up the next time a booking is refused.
+
+---
+
+## 2026-10-25 — Login check results now show on every computer (Issue #85)
+
+**What it does:** When any machine runs a login check, the result now appears on every dashboard — every Chrome profile, every computer. Before, only the machine that ran the check could see it.
+
+**Why:** The result was being saved in a box that belongs to one Chrome profile on one computer. Nothing ever sent it to the shared cloud, so no other profile could see it — not a delay, it simply was never connected. Whoever was actually handling a client had no way to know whether their login still worked unless they happened to be sitting at the right machine. The client's "status" already travels this way, which is why that one stays in step and this one did not.
+
+**What changed for you:**
+- Run a check on one computer, and the result shows on all of them, with the same wording and the same "checked X ago".
+- If two computers check the same client, the newer result wins. Neither can overwrite a fresher answer with a stale one.
+- A computer with no internet still works exactly as now — it saves locally first, and shares when it can. Nothing waits on the network.
+- Nothing about booking, cycling or slot hunting was touched.
+
+**One step for you:** this needs a small change applied to the database before it works — three new optional fields. The file is `sql/04-login-health.sql`. Run it once in Supabase. Until it is run, everything keeps working exactly as it does today; the sharing just stays off.
+
+**Tested:** Not yet — waiting on your test.
+
+---
+
+## 2026-10-25 — Bad security answers no longer freeze the login check (Issue #84)
+
+**What it does:** Three fixes to what happens when a client's saved security answers are wrong or missing.
+
+1. **It stops freezing.** The check now marks that client and moves to the next one straight away, instead of sitting there for four minutes doing nothing.
+2. **It tries twice.** If the site says the answers are wrong, it answers once more before giving up. One bad submit no longer writes a client off.
+3. **It tells you which question.** The card now names the actual question, so you know exactly what to fix.
+
+**Why:** The freeze had one real cause, found from a live log after a first attempt missed it.
+
+After you type the password, the website **swaps the security questions into the same page** — it does not load a fresh page. Our bot only decides what to do when a page loads. So on that swap nobody was put in charge. The part watching the login saw the questions appear and stepped aside, assuming the next page load would take over. There was no next page load. A separate background check noticed the answer boxes, filled in what it could, sent you the "security questions failed" alert, and stopped — but that part knows nothing about the login check, so it never reported the result. With nobody reporting, the queue kept waiting on that client until a four-minute safety timer gave up.
+
+Two smaller things came out of the same look: there was never actually a retry (it gave up the instant the site complained), and the question wording was read and then thrown away, so you were told "only 1 of 2 questions had a saved answer" without ever being told which one.
+
+**Correction:** the first attempt at this fixed a genuine but different fault — the bot thought a failed client was signed in and hunted for a "sign out" link that was not there. That fix is kept, but it was not what froze the queue, which is why nothing changed when you tested it.
+
+**What changed for you:**
+- A client with bad answers is marked and skipped in seconds, not four minutes. A sweep with several such clients finishes much sooner.
+- Their card now reads something like **Security answers wrong — missing: "What was the name of your first pet?"** so you can fix that profile directly.
+- If the answers are simply wrong, it has a second go before marking them. If we hold no answer for the questions asked, it gives up immediately — retrying a blank is pointless.
+- Everything else is untouched: healthy, password changed, CAPTCHA failed, blocked and no-answer all behave exactly as before. Booking, cycling and slot hunting were not touched at all.
+
+**Tested:** Not yet — waiting on your test.
+
+---
+
+---
+
 ## 2026-10-20 — Carry on a stopped login check instead of starting over (Issue #83)
 
 **What it does:** Adds a green **"Continue checking (N left)"** button to the orange "Login check stopped" box. Press it and the check picks up at the exact client it stopped on. The button only appears when there are actually clients left to check, and it tells you how many.

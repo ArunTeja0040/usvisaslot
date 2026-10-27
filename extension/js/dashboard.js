@@ -199,12 +199,42 @@
           slotHistory: data.slotHistory || [],
           dailyStats: data.dailyStats || {},
           storageStats: data.__storageStats || null,
-          loginHealth: data.__abLoginHealth || {},
+          loginHealth: mergeLoginHealth(data.__abLoginHealth || {}, data.userProfilesList || []),
           verifyUser: data.__abVerifyUser || null,
           sweep: data.__abSweep || null,
         })
       );
     });
+  }
+
+  // #85 A login check used to be visible only on the Chrome profile that ran
+  // it, because the result lives in chrome.storage.local — per-profile and
+  // per-machine. It now also travels on the client row, so merge the two here
+  // and let the NEWER of the pair win.
+  //
+  // Newest-wins matters: two machines may check the same client, and the local
+  // copy must not hide a fresher result from elsewhere (nor the reverse, which
+  // would make a machine forget the check it just ran).
+  //
+  // Both sides are optional. No cloud value means the project has not had
+  // sql/04-login-health.sql applied, or nothing has checked that client since
+  // it was; either way the local copy stands and this behaves exactly as before.
+  function mergeLoginHealth(local, profiles) {
+    const merged = { ...local };
+    (profiles || []).forEach((p) => {
+      const cloud = p && p.loginHealth;
+      if (!cloud || !cloud.state || !p.username) return;
+      const mine = merged[p.username];
+      const theirAt = Date.parse(cloud.checkedAt || "") || 0;
+      const myAt = Date.parse((mine && mine.checkedAt) || "") || 0;
+      if (mine && myAt >= theirAt) return;        // ours is newer, or the same check
+      merged[p.username] = {
+        state: cloud.state,
+        detail: cloud.detail || "",
+        checkedAt: cloud.checkedAt || null,
+      };
+    });
+    return merged;
   }
 
   // ─── STATS ─────────────────────────────────────────────────────────

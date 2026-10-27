@@ -413,6 +413,17 @@ const SupabaseSync = (() => {
           updatedAt: p.updated_at,
           rateLimitedAt: p.rate_limited_at,
           assignedStaffId: p.assigned_staff_id || null,
+          // #85 Last login-check result, from whichever machine ran it. Null on
+          // a project that has not had sql/04-login-health.sql applied yet; the
+          // dashboard reads that as "no cloud result" and keeps using whatever
+          // this profile knows locally, so an unmigrated project still works.
+          loginHealth: p.login_health_state
+            ? {
+                state: p.login_health_state,
+                detail: p.login_health_detail || "",
+                checkedAt: p.login_checked_at || null,
+              }
+            : null,
         });
       }
 
@@ -465,6 +476,26 @@ const SupabaseSync = (() => {
       await withRetry(() => update("user_profiles", { operator_id: operatorId, username }, data), "updateProfileStatus");
     } catch (e) {
       console.error("[SupabaseSync] updateProfileStatus failed after retries:", e.message);
+    }
+  }
+
+  // #85 Share a login-check result so every dashboard sees it, not only the
+  // Chrome profile that ran the check. The caller has already written it to
+  // chrome.storage.local, which is per-profile and per-machine; this is what
+  // carries it to everyone else, the same way updateProfileStatus carries
+  // `status`. A failure here is not worth surfacing — the local copy stands
+  // and the next check will push again.
+  async function updateLoginHealth(username, state, detail, checkedAt) {
+    if (!isReady()) return;
+    const data = {
+      login_health_state: state || null,
+      login_health_detail: (detail || "").slice(0, 500) || null,
+      login_checked_at: checkedAt || new Date().toISOString(),
+    };
+    try {
+      await withRetry(() => update("user_profiles", { operator_id: operatorId, username }, data), "updateLoginHealth");
+    } catch (e) {
+      console.error("[SupabaseSync] updateLoginHealth failed after retries:", e.message);
     }
   }
 
@@ -900,6 +931,7 @@ const SupabaseSync = (() => {
     pullProfiles,
     deleteProfile,
     updateProfileStatus,
+    updateLoginHealth,
 
     // Slots
     pushSlot,

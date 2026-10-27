@@ -2126,6 +2126,16 @@
       const responseFields = document.querySelectorAll('[id$="_response"]');
       if (responseFields.length === 2 && settings.securityQuestions) {
         clearInterval(waitForForm);
+        // #84 When a login check owns this session the verify-aware handler
+        // must take the page: it records the outcome and releases the sweep.
+        // The generic handler knows nothing about sweeps — it answers what it
+        // can, alerts, and returns, leaving the check unfinished and the sweep
+        // frozen on that client. This poller is how it used to win the race.
+        const verifyUser = await getVerifyUser();
+        if (verifyUser) {
+          await handleVerifySecurityQuestions(verifyUser);
+          return;
+        }
         await handleSecurityQuestions(settings.securityQuestions);
       }
     }, 500);
@@ -2191,11 +2201,24 @@
 
   function recordLoginHealth(username, state, detail) {
     if (!username) return Promise.resolve();
+    const checkedAt = new Date().toISOString();
     return new Promise((resolve) => {
       chrome.storage.local.get([VERIFY_HEALTH_KEY], (d) => {
         const all = d[VERIFY_HEALTH_KEY] || {};
-        all[username] = { state, detail: detail || "", checkedAt: new Date().toISOString() };
-        chrome.storage.local.set({ [VERIFY_HEALTH_KEY]: all }, resolve);
+        all[username] = { state, detail: detail || "", checkedAt };
+        chrome.storage.local.set({ [VERIFY_HEALTH_KEY]: all }, () => {
+          // #85 The local write above is per-profile, per-machine — it is why a
+          // check run on one Chrome profile was invisible everywhere else. Push
+          // the same result to the shared table so every dashboard sees it.
+          //
+          // Deliberately not awaited: the local copy is the source of truth for
+          // this machine and must not be held up by the network. If the push
+          // fails the next check pushes again.
+          if (SUPABASE_ENABLED && SupabaseSync.isReady()) {
+            SupabaseSync.updateLoginHealth(username, state, detail, checkedAt);
+          }
+          resolve();
+        });
       });
     });
   }
@@ -2217,7 +2240,17 @@
     updateUserStatus(username, "idle");
 
     // A rejected login has no session to end, so the check is over now.
-    const hasSession = state === VERIFY_STATE.HEALTHY || state === VERIFY_STATE.SECURITY_MISMATCH;
+    //
+    // #84 SECURITY_MISMATCH used to be counted as having a session, and that
+    // stalled the sweep for four minutes on every client with bad answers.
+    // The password being accepted is not a session: the site only issues one
+    // once the security questions pass, so the client is still sitting on the
+    // b2clogin question page. There is no sign-out link there, the fallback
+    // ("go to the dashboard and sign out") lands on a page they were never
+    // signed in to, and the verify key this function deliberately holds until
+    // sign-out lands therefore never cleared. The sweep advances on that key,
+    // so it sat there until the dashboard's SWEEP_STUCK_MS fired.
+    const hasSession = state === VERIFY_STATE.HEALTHY;
     if (!hasSession) {
       await new Promise((r) => chrome.storage.local.remove(
         [VERIFY_KEY, VERIFY_STARTED_KEY, VERIFY_PHASE_KEY,
@@ -2268,7 +2301,15 @@
 
       // Navigated off the login form — the next page load routes itself.
       if (!window.location.hostname.toLowerCase().includes("b2clogin.com")) return;
-      if (isSecurityQuestionsPage()) return;
+
+      // #84 This used to `return` on the same assumption, but B2C swaps the
+      // security form into the SAME page — there is no second page load and
+      // so no second trip through the dispatcher. Returning here left nobody
+      // to finish the check and froze the sweep. Handle it in place instead.
+      if (isSecurityQuestionsPage()) {
+        await handleVerifySecurityQuestions(username);
+        return;
+      }
 
       const errorEl = document.getElementById("claimVerificationServerError");
       const errText = (errorEl?.textContent || "").trim();
@@ -2333,6 +2374,107 @@
     return null;
   }
 
+  // #84 The verify-aware security-questions handler.
+  //
+  // This must not assume a page load. B2C swaps the security form into the
+  // SAME page after the credential step, so the content script never re-runs
+  // and the dispatcher never gets a second chance to route it. Before this
+  // existed, `watchVerifyLoginOutcome` returned on sight of this page expecting
+  // the router to take over, the generic `handleSecurityQuestions` picked it up
+  // from runLogin's 500ms poller, answered what it could, alerted and returned
+  // — and nothing ever called finishVerify. The verify key stayed set and the
+  // sweep sat on that client until the dashboard's SWEEP_STUCK_MS fired.
+  //
+  // So: own the page here, loop in place for the retry, and always finish.
+  async function handleVerifySecurityQuestions(username) {
+    if (window.__abVerifySecHandling) return;   // router and watcher can both arrive
+    window.__abVerifySecHandling = true;
+    try {
+      for (;;) {
+        // Read what was actually asked before deciding anything, so every
+        // outcome can name the questions instead of only counting them. The
+        // operator cannot fix a profile they are not told the question for.
+        const settings = await getSettings();
+        const saved = settings.securityQuestions || {};
+        const asked = document.querySelectorAll("#attributeList li.Paragraph");
+        const askedText = [];
+        const unanswered = [];
+        let answerable = 0;
+        asked.forEach((item) => {
+          const q = item.querySelector("p.textInParagraph")?.textContent.trim();
+          if (!q) return;
+          askedText.push(q);
+          if (findAnswer(saved, q)) answerable++;
+          else unanswered.push(q);
+        });
+        const quoted = (list) => list.map((q) => `"${q}"`).join("; ");
+
+        const triesKey = "__abVerifySecTries";
+        const tries = parseInt(sessionStorage.getItem(triesKey) || "0", 10);
+
+        // The site says the answers were wrong. Give it one more go before
+        // writing the client off — a single bad submit should not condemn a
+        // profile — but stop once the attempts are used, or this would loop
+        // on the freshly-served questions forever.
+        const stated = securityQuestionsError();
+        if (stated && tries >= SEC_MAX_SUBMITS) {
+          sessionStorage.removeItem(triesKey);
+          await finishVerify(username, VERIFY_STATE.SECURITY_MISMATCH,
+            `${stated}${askedText.length ? ` — asked: ${quoted(askedText)}` : ""}`);
+          return;
+        }
+
+        // Nothing to retry with: we simply do not hold answers for what was
+        // asked, so re-submitting the same gaps would just burn attempts.
+        if (answerable < 2) {
+          await finishVerify(username, VERIFY_STATE.SECURITY_MISMATCH,
+            `password ok; only ${answerable} of ${asked.length} questions had a saved answer` +
+            (unanswered.length ? ` — missing: ${quoted(unanswered)}` : ""));
+          return;
+        }
+
+        // Belt and braces: even if the wording changes and the check above
+        // stops matching, never submit answers more than twice for one client.
+        if (tries >= SEC_MAX_SUBMITS) {
+          sessionStorage.removeItem(triesKey);
+          await finishVerify(username, VERIFY_STATE.SECURITY_MISMATCH,
+            `saved answers rejected after ${tries} attempts` +
+            (askedText.length ? ` — asked: ${quoted(askedText)}` : ""));
+          return;
+        }
+        sessionStorage.setItem(triesKey, String(tries + 1));
+
+        log(`[verify] password ok, submitting security answers (attempt ${tries + 1})`);
+        await handleSecurityQuestions(saved);
+
+        const verdict = await waitForSecurityVerdict();
+        if (verdict === "retry") continue;          // re-served with an error
+        if (verdict === "moved") return;            // real navigation routes itself
+        await finishVerify(username, VERIFY_STATE.TIMEOUT,
+          "security questions never concluded");
+        return;
+      }
+    } finally {
+      window.__abVerifySecHandling = false;
+    }
+  }
+
+  // What the security submit produced:
+  //   "retry" — still on the questions, site reported an error, go again
+  //   "moved" — navigated away or off the questions; that page routes itself
+  //   "timeout" — nothing happened; the caller must finish the check
+  async function waitForSecurityVerdict() {
+    const deadline = Date.now() + 45000;
+    while (Date.now() < deadline) {
+      if (__abortAll) return "moved";
+      await sleep(1000);
+      if (!window.location.hostname.toLowerCase().includes("b2clogin.com")) return "moved";
+      if (!isSecurityQuestionsPage()) return "moved";
+      if (securityQuestionsError()) return "retry";
+    }
+    return "timeout";
+  }
+
   async function handleVerifyLoginPage(username) {
     const startedAt = await new Promise((r) =>
       chrome.storage.local.get([VERIFY_STARTED_KEY], (d) => r(d[VERIFY_STARTED_KEY])));
@@ -2346,45 +2488,8 @@
     if (pageType === "security") {
       // Reaching this page at all proves the password was accepted — the site
       // only asks these once it is satisfied with the credentials.
-
-      // The site already told us the answers were wrong. Record its own wording
-      // and stop; trying the freshly-served questions would just loop.
-      const stated = securityQuestionsError();
-      if (stated) {
-        await finishVerify(username, VERIFY_STATE.SECURITY_MISMATCH, stated);
-        return;
-      }
-
-      const settings = await getSettings();
-      const saved = settings.securityQuestions || {};
-      const asked = document.querySelectorAll("#attributeList li.Paragraph");
-      let answerable = 0;
-      asked.forEach((item) => {
-        const q = item.querySelector("p.textInParagraph")?.textContent.trim();
-        if (q && findAnswer(saved, q)) answerable++;
-      });
-
-      if (answerable < 2) {
-        await finishVerify(username, VERIFY_STATE.SECURITY_MISMATCH,
-          `password ok; only ${answerable} of ${asked.length} questions had a saved answer`);
-        return;
-      }
-
-      // Belt and braces: even if the wording changes and the check above stops
-      // matching, never submit answers more than twice for one client.
-      const triesKey = "__abVerifySecTries";
-      const tries = parseInt(sessionStorage.getItem(triesKey) || "0", 10);
-      if (tries >= SEC_MAX_SUBMITS) {
-        sessionStorage.removeItem(triesKey);
-        await finishVerify(username, VERIFY_STATE.SECURITY_MISMATCH,
-          `saved answers rejected after ${tries} attempts`);
-        return;
-      }
-      sessionStorage.setItem(triesKey, String(tries + 1));
-
-      log(`[verify] password ok, submitting security answers (attempt ${tries + 1})`);
-      await handleSecurityQuestions(saved);
-      return;   // the dashboard branch finishes the check
+      await handleVerifySecurityQuestions(username);
+      return;
     }
 
     if (pageType === "unknown") {
@@ -4482,8 +4587,15 @@
           if (!sub.ok) { log(`[fastgrab] portal submit failed (${sub.why}) (attempt ${attempt}) — retrying`); continue; }
           portalVerdict = sub.data && sub.data.verdict ? sub.data : null;
           if (portalVerdict) {
+            // #86 Print the portal's own wording, not just our reading of it.
+            // `refusedByThrottle` below decides throttled-vs-lost by pattern
+            // matching this very message, and without it in the log there is no
+            // way to confirm that call was right — or to learn the wording of a
+            // refusal we have not seen before. Bounded so a long server message
+            // cannot flood the console.
             log(`[fastgrab] portal verdict: ${portalVerdict.verdict}` +
-                (portalVerdict.code ? ` (code ${portalVerdict.code})` : ""));
+                (portalVerdict.code ? ` (code ${portalVerdict.code})` : "") +
+                (portalVerdict.message ? ` — portal said: "${String(portalVerdict.message).slice(0, 300)}"` : " — no message"));
           }
         } else {
           const submitBtn = document.getElementById("submitbtn");
