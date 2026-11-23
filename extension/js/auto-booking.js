@@ -1,13 +1,13 @@
 (function () {
   "use strict";
 
-  const LOG_PREFIX = "[AutoBook]";
+  const LOG_PREFIX = "[AutoBook-DATES]";
   // ─── TEST MODE ──────────────────────────────────────────────────
   // This is the TEST build (feature/parallel-booking worktree).
   // - Telegram messages prefixed [TEST]
   // - Auto-submit FORCED OFF during detection-stage testing (protect real client)
   // - Device name auto-prefixed TEST- so dashboard can filter test noise
-  const TEST_MODE = false;
+  const TEST_MODE = true;
   const TEST_FORCE_NO_SUBMIT = false; // #40 LIVE: real submit enabled (was true = dry-run)
   // ─── PARALLEL SCAN config (A3) ──
   const USE_PARALLEL_SCAN = true;     // after template captured, replace sequential per-city loop
@@ -545,14 +545,25 @@
       ? inRange.filter((ds) => isSlotPaused(cityValue, ds))
       : [];
     const pausedSet = new Set(paused);
+    // #94 Same reasoning as the resting marker above, for the client's own date
+    // rules. A date the client cannot take is still listed by the site, so show
+    // it and say why rather than dropping it — otherwise "was there anything on
+    // the 18th?" has no answer, and a silently missing date looks like the bot
+    // missed it rather than correctly refused it.
+    const refusedSet = new Map();
+    inRange.forEach((ds) => {
+      const why = dateRefusalReason(ds, startDate, endDate);
+      if (why && why !== "out of range") refusedSet.set(ds, why);
+    });
     const byMonth = (arr) => {
       const m = {};
       arr.forEach((ds) => {
         const date = new Date(ds + "T00:00:00");
         const key = date.toLocaleString("en-US", { month: "long", year: "numeric" });
         const day = date.getDate();
-        // Keep the number for sorting; the label carries the resting marker.
-        (m[key] = m[key] || []).push({ day, label: pausedSet.has(ds) ? `${day}⏸️` : String(day) });
+        // Keep the number for sorting; the label carries the markers.
+        const mark = refusedSet.has(ds) ? "🚫" : pausedSet.has(ds) ? "⏸️" : "";
+        (m[key] = m[key] || []).push({ day, label: `${day}${mark}` });
       });
       return Object.entries(m)
         .map(([mo, days]) =>
@@ -2999,6 +3010,9 @@
               );
             });
           }
+          // #94 Same profile the dates come from, so the rules can never be
+          // out of step with the window they narrow.
+          loadDateRules(profile);
           log("Booking panel auto-populated from profile: " + (profile.name || activeUser));
         }
       }
@@ -4526,7 +4540,7 @@
           const daysData = await daysPromise;
           // Re-check this city's in-range dates from the fresh data.
           const fresh = (daysData && Array.isArray(daysData.ScheduleDays)) ? daysData.ScheduleDays.map((d) => d.Date) : [];
-          const inRange = fresh.filter((d) => isDateInRange(d, startDate, endDate)).sort();
+          const inRange = fresh.filter((d) => isDateBookable(d, startDate, endDate)).sort();   // #94 rules, not just the window
           if (!inRange.length) { resumeScan = true; log(`[fastgrab] no in-range date left at ${cityName} — back to scanning`); break; }
           targetDate = inRange[0];
         } else {
@@ -5050,7 +5064,7 @@
       const startDate = document.getElementById("ab-start-date")?.value || "";
       const endDate = document.getElementById("ab-end-date")?.value || "";
       const all = Array.isArray(dates) ? dates.slice().sort() : [];
-      const inSet = new Set(all.filter((d) => isDateInRange(d, startDate, endDate)));
+      const inSet = new Set(all.filter((d) => isDateBookable(d, startDate, endDate)));   // #94 live availability, so it must match what we would take
 
       // Group by month, keeping in-range days visually distinct.
       const months = {};
@@ -5197,6 +5211,60 @@
     if (startStr && d < new Date(startStr + "T00:00:00")) return false;
     if (endStr && d > new Date(endStr + "T00:00:00")) return false;
     return true;
+  }
+
+  // ─── #94 PER-CLIENT DATE RULES ───────────────────────────────────
+  //
+  // The window was only ever a start and an end date, so the bot would take a
+  // slot while the client was abroad, or three days out when they need two
+  // weeks to arrange travel. Two optional rules now narrow it further.
+  //
+  // Held in module state rather than read per call: the booking path takes its
+  // dates from the panel's DOM inputs, not from a profile object, and the hot
+  // path must not hit storage once per candidate date.
+  let __dateRules = { excluded: new Set(), minNoticeDays: 0 };
+
+  // Loaded when the booking panel is populated, from the same profile the
+  // dates come from. Absent fields mean "no rule", so a client without them —
+  // or a Supabase project that has not run sql/06-date-rules.sql — behaves
+  // exactly as before.
+  function loadDateRules(profile) {
+    const list = Array.isArray(profile && profile.excludedDates) ? profile.excludedDates : [];
+    const n = Number(profile && profile.minimumNoticeDays);
+    __dateRules = {
+      excluded: new Set(list.filter((s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || "").trim()))),
+      minNoticeDays: Number.isFinite(n) && n > 0 ? Math.floor(n) : 0,
+    };
+    if (__dateRules.excluded.size || __dateRules.minNoticeDays) {
+      log(`[dates] rules loaded — ${__dateRules.excluded.size} excluded date(s), ` +
+          `${__dateRules.minNoticeDays} day(s) minimum notice`);
+    }
+    return __dateRules;
+  }
+
+  // Why a date was refused, or "" when it is bookable. Separate from the
+  // boolean so the overview can say "excluded" rather than silently dropping a
+  // date the operator will ask about later.
+  function dateRefusalReason(dateStr, startStr, endStr) {
+    if (!isDateInRange(dateStr, startStr, endStr)) return "out of range";
+    if (__dateRules.excluded.has(dateStr)) return "excluded";
+    if (__dateRules.minNoticeDays > 0) {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const d = new Date(dateStr + "T00:00:00");
+      const days = Math.round((d - today) / 86400000);
+      if (days < __dateRules.minNoticeDays) return `needs ${__dateRules.minNoticeDays}d notice`;
+    }
+    return "";
+  }
+
+  // THE single gate. Every place that decides whether a date may be taken goes
+  // through this, never through isDateInRange directly — a rule applied in nine
+  // of ten places shows a date as available and then refuses it at booking, or
+  // takes one it should not. isDateInRange stays the pure range test it is, for
+  // the places that genuinely only mean "inside the window".
+  function isDateBookable(dateStr, startStr, endStr) {
+    return dateRefusalReason(dateStr, startStr, endStr) === "";
   }
 
   async function selectDateInCalendar(dateObj, timeout = 10000) {
@@ -5600,7 +5668,7 @@
             sendSlotsOverview(r.name, r.dates, startDate, endDate, pid); // availability ping — every parallel round
             // First in-range date wins (user choice: grab first detected)
             if (!grabCity) {
-              const inRange = r.dates.filter((d) => isDateInRange(d, startDate, endDate) && !isSlotPaused(pid, d)).sort();
+              const inRange = r.dates.filter((d) => isDateBookable(d, startDate, endDate) && !isSlotPaused(pid, d)).sort();   // #94
               if (inRange.length) { grabCity = { value: pid, name: r.name }; grabDate = inRange[0]; }
             }
           } else {
@@ -5865,11 +5933,11 @@
 
       // Separate in-range and out-of-range dates
       const inRange = data.ScheduleDays.filter((d) =>
-        isDateInRange(d.Date, startDate, endDate)
+        isDateBookable(d.Date, startDate, endDate)   // #94
       ).sort((a, b) => new Date(a.Date) - new Date(b.Date));
 
       const outOfRange = data.ScheduleDays.filter((d) =>
-        !isDateInRange(d.Date, startDate, endDate)
+        !isDateBookable(d.Date, startDate, endDate)   // #94 complement of the above — the two must agree
       ).sort((a, b) => new Date(a.Date) - new Date(b.Date));
 
       // Group by month (in-range)

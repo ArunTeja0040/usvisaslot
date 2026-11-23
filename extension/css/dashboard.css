@@ -1871,3 +1871,10 @@ select:focus, input:focus, textarea:focus { border-color: var(--line); }
   .stats-bar, .attention-lane, .main-content { padding-left: 14px; padding-right: 14px; }
   .sh-toaster { left: 14px; right: 14px; width: auto; }
 }
+
+/* #94 The parse echo under the excluded-dates and minimum-notice fields. It
+   exists so a loosely typed entry can be checked before saving: green states
+   what will be stored, amber names what could not be read. */
+.field-echo { font-family: var(--mono); font-size: 10px; margin-top: 4px; min-height: 12px; color: var(--text-3); }
+.field-echo.is-ok { color: var(--ok); }
+.field-echo.is-bad { color: var(--accent); }

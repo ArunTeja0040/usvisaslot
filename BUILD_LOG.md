@@ -12,6 +12,29 @@ Format:
 
 ---
 
+## 2026-11-25 — Say which dates a client cannot take, and how much notice they need (Issue #94)
+
+**What it does:** Two new optional boxes in a client's Edit screen, next to their dates.
+
+**Excluded dates** — days this client cannot take, even if a slot appears. Type them the way you would say them: `15 Jan 27, 20-25 Feb 27`. Strict form works too: `2027-01-15`. Underneath the box it tells you what it understood — *"7 day(s) excluded: 15 Jan 27, 20 Feb 27, …"* — before you save. If it cannot read something it says so and names the bit it could not read, so nothing is ever thrown away quietly.
+
+**Minimum notice** — the soonest the client could actually attend, in days. Put 10 and a slot three days away is ignored. Underneath it shows the real date that works out to, so there is no counting on your fingers.
+
+Leave either blank and nothing changes for that client.
+
+**Why:** A client's window was only a start and an end date. If they were abroad for a fortnight in the middle, or needed two weeks to arrange travel, the bot would happily grab a slot they could not attend — and you had to watch for it and undo it by hand, which rather defeats the point.
+
+**What changed for you:**
+- Dates the client cannot take are **still shown** in the slot alerts, marked 🚫, rather than disappearing. So "was there anything on the 18th?" has an answer, instead of looking like the bot missed it.
+- The same rules apply everywhere — the scan, the grab, the counts, the alerts. A date that cannot be taken is never shown as available and then refused.
+- Minimum notice counts from today and moves with it: a date that is eleven days away today stops qualifying in two days' time. That is correct, but it does mean a date can quietly drop out.
+
+**One step for you:** needs a small change in Supabase first — two new optional fields. The file is `sql/06-date-rules.sql`. Run it once. Until you do, everything works exactly as before and the two boxes simply have nothing to save into.
+
+**Tested:** 15 checks on the date reader (friendly and strict forms, ranges, rubbish, and impossible dates like 31 February, which must be rejected rather than rolled into March), and 15 on the booking rule itself (no rules, excluded only, notice only, both together, and nonsense stored in the fields, which must never widen the window). All passing. Not yet run against the live site.
+
+---
+
 ## 2026-11-24 — Client card reordered, and the state dropdown matches the buttons (Issue #93)
 
 **What it does:** Two things on each client card.

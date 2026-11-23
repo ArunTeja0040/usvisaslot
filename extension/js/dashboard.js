@@ -168,6 +168,123 @@
   const agreedOf = (p) => Math.max(0, Number(p.agreedPrice) || 0);
   const balanceOf = (p) => Math.max(0, agreedOf(p) - paidOf(p));
 
+  // #94 Excluded dates, typed the way an operator talks: "15 Jan 27",
+  // "20-25 Feb 27", "2027-01-15", separated by commas. Parsed to a plain array
+  // of YYYY-MM-DD and echoed back under the field before saving, so a loose
+  // format can never be silently misread. What you see is what is stored, and
+  // the booking path never parses anything.
+  const MONTHS = { jan:1, feb:2, mar:3, apr:4, may:5, jun:6, jul:7, aug:8, sep:9, oct:10, nov:11, dec:12 };
+  const MON_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+  function toISO(y, m, d) {
+    if (!(m >= 1 && m <= 12) || !(d >= 1 && d <= 31)) return null;
+    const yy = y < 100 ? 2000 + y : y;
+    const dt = new Date(Date.UTC(yy, m - 1, d));
+    // Rejects the 31st of a 30-day month rather than rolling it into the next.
+    if (dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return null;
+    return yy + "-" + String(m).padStart(2, "0") + "-" + String(d).padStart(2, "0");
+  }
+
+  // One token: "2027-01-15", "15 Jan 27", "15 January 2027", "15/01/27".
+  function parseOneDate(tok) {
+    const t = String(tok || "").trim().replace(/\s+/g, " ");
+    if (!t) return null;
+    let m = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if (m) return toISO(+m[1], +m[2], +m[3]);
+    m = t.match(/^(\d{1,2})[ \/.-]([A-Za-z]{3,})[ \/.,-]*(\d{2,4})$/);
+    if (m) { const mo = MONTHS[m[2].slice(0, 3).toLowerCase()]; return mo ? toISO(+m[3], mo, +m[1]) : null; }
+    m = t.match(/^([A-Za-z]{3,})[ \/.-](\d{1,2})[ \/.,-]*(\d{2,4})$/);
+    if (m) { const mo = MONTHS[m[1].slice(0, 3).toLowerCase()]; return mo ? toISO(+m[3], mo, +m[2]) : null; }
+    m = t.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})$/);
+    if (m) return toISO(+m[3], +m[2], +m[1]);     // day first, as written here
+    return null;
+  }
+
+  // "20-25 Feb 27" means the 20th to the 25th: a bare day on the left borrows
+  // the month and year from the right.
+  //
+  // The whole token is tried as a single date FIRST, and then every plausible
+  // split point in turn, because an ISO date contains the very "-" used as a
+  // range separator: "2027-01-15" split on its first dash gives "2027" and
+  // "01-15", which reads as nothing. Taking the first split where BOTH halves
+  // parse handles "2027-02-20:2027-02-22" as well.
+  function parseDateToken(tok) {
+    const t = String(tok || "").trim();
+    const single = parseOneDate(t);
+    if (single) return [single];
+
+    const seps = [];
+    const re = /\s*(?:to|:|–|—|-)\s*/gi;
+    let m;
+    while ((m = re.exec(t)) !== null) {
+      seps.push([m.index, m.index + m[0].length]);
+      if (m[0].length === 0) re.lastIndex++;      // never spin on an empty match
+    }
+
+    for (let i = 0; i < seps.length; i++) {
+      const left = t.slice(0, seps[i][0]).trim();
+      const right = t.slice(seps[i][1]).trim();
+      const end = parseOneDate(right);
+      if (!end) continue;
+      let begin = parseOneDate(left);
+      if (!begin && /^\d{1,2}$/.test(left)) begin = toISO(+end.slice(0, 4), +end.slice(5, 7), +left);
+      if (!begin || begin > end) continue;
+      const out = [];
+      for (let d = new Date(begin + "T00:00:00Z"); d <= new Date(end + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + 1)) {
+        out.push(d.toISOString().slice(0, 10));
+        if (out.length > 400) break;              // a typo must not build a decade
+      }
+      return out;
+    }
+    return null;
+  }
+
+  // -> { dates: [...], bad: [...] }. Never throws; the caller shows both.
+  function parseExcludedDates(raw) {
+    const dates = new Set(); const bad = [];
+    String(raw || "").split(",").map(function (t) { return t.trim(); }).filter(Boolean).forEach(function (tok) {
+      const got = parseDateToken(tok);
+      if (got && got.length) got.forEach(function (d) { dates.add(d); });
+      else bad.push(tok);
+    });
+    return { dates: Array.from(dates).sort(), bad: bad };
+  }
+
+  function fmtEchoDate(iso) {
+    const d = new Date(iso + "T00:00:00Z");
+    return d.getUTCDate() + " " + MON_ABBR[d.getUTCMonth()] + " " + String(d.getUTCFullYear()).slice(2);
+  }
+
+  function updateExcludedEcho() {
+    const input = document.getElementById("edit-excluded-dates");
+    const echo = document.getElementById("edit-excluded-echo");
+    if (!input || !echo) return;
+    const raw = input.value.trim();
+    if (!raw) { echo.textContent = ""; echo.className = "field-echo"; return; }
+    const r = parseExcludedDates(raw);
+    const shown = r.dates.slice(0, 8).map(fmtEchoDate).join(", ");
+    const more = r.dates.length > 8 ? " +" + (r.dates.length - 8) + " more" : "";
+    if (r.bad.length) {
+      echo.className = "field-echo is-bad";
+      echo.textContent = "Could not read: " + r.bad.join(", ") +
+        (r.dates.length ? " · reading " + r.dates.length + " day(s): " + shown + more : "");
+    } else {
+      echo.className = "field-echo is-ok";
+      echo.textContent = r.dates.length + " day(s) excluded: " + shown + more;
+    }
+  }
+
+  function updateNoticeEcho() {
+    const input = document.getElementById("edit-min-notice");
+    const echo = document.getElementById("edit-min-notice-echo");
+    if (!input || !echo) return;
+    const n = Math.floor(Number(input.value) || 0);
+    if (n <= 0) { echo.textContent = ""; echo.className = "field-echo"; return; }
+    const from = new Date(); from.setHours(0, 0, 0, 0); from.setDate(from.getDate() + n);
+    echo.className = "field-echo is-ok";
+    echo.textContent = "Nothing before " + fmtEchoDate(from.toISOString().slice(0, 10));
+  }
+
   // True when the promised window has already finished. Almost always a
   // range that was stored with the wrong year on intake.
   function isRangeExpired(p) {
@@ -2860,6 +2977,11 @@
     refresh();
   });
 
+  // #94 Echo as they type, so an unreadable entry is visible before saving
+  // rather than silently dropped.
+  document.getElementById("edit-excluded-dates")?.addEventListener("input", updateExcludedEcho);
+  document.getElementById("edit-min-notice")?.addEventListener("input", updateNoticeEcho);
+
   document.getElementById("sweep-report-close")?.addEventListener("click", async () => {
     const sweep = await readSweep();
     if (sweep) { sweep.dismissed = true; await writeSweep(sweep); }
@@ -3042,6 +3164,13 @@
       document.getElementById("edit-price").value = profile.pricePerPerson || profile.agreedPrice || "";
       const paidField = document.getElementById("edit-paid");
       if (paidField) paidField.value = profile.paidAmount || "";
+      // #94 Stored normalised; shown back in the friendly form.
+      const exField = document.getElementById("edit-excluded-dates");
+      if (exField) exField.value = (profile.excludedDates || []).map(fmtEchoDate).join(", ");
+      const mnField = document.getElementById("edit-min-notice");
+      if (mnField) mnField.value = profile.minimumNoticeDays || "";
+      updateExcludedEcho();
+      updateNoticeEcho();
       calcTotalPrice();
 
       // Automation
@@ -3092,6 +3221,10 @@
       applicantCount: parseInt(document.getElementById("edit-applicants").value) || 1,
       pricePerPerson: document.getElementById("edit-price").value.trim(),
       paidAmount: Math.max(0, Math.round(Number(document.getElementById("edit-paid")?.value) || 0)),
+      // #94 Only what parsed cleanly is stored. Anything unreadable was shown
+      // under the field before saving, so nothing is dropped silently.
+      excludedDates: parseExcludedDates(document.getElementById("edit-excluded-dates")?.value).dates,
+      minimumNoticeDays: Math.max(0, Math.floor(Number(document.getElementById("edit-min-notice")?.value) || 0)),
       agreedPrice: String((parseInt(document.getElementById("edit-price").value) || 0) * (parseInt(document.getElementById("edit-applicants").value) || 1)),
       autoLogin: document.getElementById("edit-auto-login").checked,
       autoDashboard: document.getElementById("edit-auto-dashboard").checked,
@@ -3431,6 +3564,12 @@
     document.getElementById("edit-total-price").value = "";
     const paidReset = document.getElementById("edit-paid");
     if (paidReset) paidReset.value = "";
+    const exReset = document.getElementById("edit-excluded-dates");
+    if (exReset) exReset.value = "";
+    const mnReset = document.getElementById("edit-min-notice");
+    if (mnReset) mnReset.value = "";
+    updateExcludedEcho();
+    updateNoticeEcho();
     document.getElementById("edit-auto-login").checked = true;
     document.getElementById("edit-auto-dashboard").checked = true;
     document.getElementById("edit-auto-select").checked = true;
