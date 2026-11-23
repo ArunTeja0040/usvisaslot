@@ -116,6 +116,48 @@
     return bookingHalves(username, statuses, cloudMap, slotHistory).complete;
   }
 
+  // #90 The operator's own mark for a client: "" normal, "booked", or
+  // "not_required". Deliberately separate from `status`, which is the live
+  // automation state and changes on its own — this one only changes when a
+  // person decides it has.
+  //
+  // Empty on a project that has not run sql/05-service-state.sql, which reads
+  // as normal, so an unmigrated project behaves exactly as it did before.
+  const SERVICE_STATES = { NORMAL: "", BOOKED: "booked", NOT_REQUIRED: "not_required" };
+
+  function serviceStateOf(profile) {
+    const v = String((profile && profile.serviceState) || "").trim();
+    return v === SERVICE_STATES.BOOKED || v === SERVICE_STATES.NOT_REQUIRED ? v : "";
+  }
+
+  // #90 "Booked" for every purpose: what the bot worked out by itself, OR the
+  // operator's own mark. Use this rather than isBooked() anywhere a decision
+  // depends on whether a client is finished — the tabs, the counts, the money
+  // panel and the hunting total must never disagree about who is done. Marking
+  // a client booked and still seeing their fee under "still hunting" is exactly
+  // the drift this prevents.
+  function isBookedNow(profile, statuses, cloudMap, slotHistory) {
+    if (!profile) return false;
+    return serviceStateOf(profile) === SERVICE_STATES.BOOKED ||
+      isBooked(profile.username, statuses, cloudMap, slotHistory);
+  }
+
+  // Writes the mark locally first so the dashboard reacts at once, then shares
+  // it. A failed share leaves the local copy standing and the next push repeats
+  // it — the same order used for login health in #85.
+  async function setServiceState(username, next) {
+    const d = await new Promise((r) => chrome.storage.local.get(["userProfilesList"], r));
+    const list = d.userProfilesList || [];
+    const p = list.find((x) => x.username === username);
+    if (!p) return false;
+    p.serviceState = next || "";
+    await new Promise((r) => chrome.storage.local.set({ userProfilesList: list }, r));
+    if (SUPA && SUPA.isReady()) {
+      try { SUPA.updateServiceState(username, p.serviceState); } catch (e) { /* offline is fine */ }
+    }
+    return true;
+  }
+
   function bookedAt(username, statuses, cloudMap) {
     const local = statuses[username] || {};
     const cloud = (cloudMap || {})[username] || {};
@@ -292,18 +334,25 @@
   // the split without clicking through.
   function updateViewCounts(profiles, statuses, slotHistory) {
     const cloudMap = viewCloudMap();
-    let booked = 0, expired = 0, active = 0;
+    let booked = 0, expired = 0, active = 0, notNeeded = 0;
     (profiles || []).forEach((p) => {
-      const b = isBooked(p.username, statuses, cloudMap, slotHistory);
+      // #90 Counts must agree with the filter, so the operator's own mark is
+      // applied here too — otherwise a tab would show a number its own list
+      // does not contain.
+      const svc = serviceStateOf(p);
+      const n = svc === "not_required";
+      const b = isBookedNow(p, statuses, cloudMap, slotHistory);
       const e = isRangeExpired(p);
+      if (n) notNeeded++;
       if (b) booked++;
       if (e) expired++;
-      if (!b && !e) active++;
+      if (!b && !e && !n) active++;
     });
     const set = (id, n) => { const el = document.getElementById(id); if (el && el.textContent !== String(n)) el.textContent = n; };
     set("ct-active", active);
     set("ct-booked", booked);
     set("ct-expired", expired);
+    set("ct-notneeded", notNeeded);
     set("ct-all", (profiles || []).length);
   }
 
@@ -329,26 +378,43 @@
 
     const cloudMap = viewCloudMap();
     const booked = (profiles || [])
-      .filter((p) => isBooked(p.username, statuses, cloudMap, slotHistory))
+      .filter((p) => isBookedNow(p, statuses, cloudMap, slotHistory))
       .map((p) => ({ p, at: bookedAt(p.username, statuses, cloudMap) }))
       .sort((a, b) => new Date(b.at || 0) - new Date(a.at || 0));
 
     // Money. Collected is what has actually been recorded as received, not
     // the agreed price — an advance must not read as paid in full.
-    let collected = 0, agreedTotal = 0, owing = 0;
+    // #91 Money received is money received, booked or not. Counting only booked
+    // clients made every advance invisible: it was stored and synced correctly,
+    // but the panel reported ₹0 collected, so the operator could not answer
+    // "how much cash have I actually taken" from this screen.
+    //
+    // The split goes in the note, not the number — one cash figure, with its
+    // source spelled out beneath.
+    let collectedBooked = 0, agreedTotal = 0, owing = 0;
     booked.forEach(({ p }) => {
-      collected += paidOf(p);
+      collectedBooked += paidOf(p);
       agreedTotal += agreedOf(p);
       if (balanceOf(p) > 0) owing++;
     });
-    const outstanding = Math.max(0, agreedTotal - collected);
 
-    let hunting = 0, huntingN = 0;
+    // Clients still being worked: not booked, not lapsed, not set aside. An
+    // Expired or Not-needed client's balance is not a live receivable, so they
+    // stay out of the advance and outstanding figures.
+    let hunting = 0, huntingN = 0, advances = 0, advancesN = 0;
     (profiles || []).forEach((p) => {
-      if (isBooked(p.username, statuses, cloudMap, slotHistory) || isRangeExpired(p)) return;
+      if (isBookedNow(p, statuses, cloudMap, slotHistory) || isRangeExpired(p) || serviceStateOf(p)) return;
       hunting += agreedOf(p);
       huntingN++;
+      const paid = paidOf(p);
+      if (paid > 0) { advances += paid; advancesN++; }
+      if (balanceOf(p) > 0) owing++;        // half-paid and still hunting is still owed
     });
+
+    const collected = collectedBooked + advances;
+    // Outstanding across everyone still live, not only the booked: a client who
+    // has paid half an advance still owes the other half.
+    const outstanding = Math.max(0, (agreedTotal + hunting) - collected);
 
     const rows = booked.map(({ p, at }) => {
       const appt = bookedAppointment(p.username, slotHistory);
@@ -407,12 +473,23 @@
     if (!staffMode) {
       const put = (id, v) => { const el = document.getElementById(id); if (el && el.textContent !== v) el.textContent = v; };
       put("money-collected", rupees(collected));
-      put("money-collected-note", `${booked.length} booked · ${rupees(agreedTotal)} agreed`);
+      // #91 Name both sources, so one figure can still be read correctly. Money
+      // from a finished booking and money taken in advance are very different
+      // things to the business, even though both are cash in hand.
+      put("money-collected-note",
+        advancesN === 0
+          ? `${booked.length} booked · ${rupees(agreedTotal)} agreed`
+          : `${rupees(collectedBooked)} from ${booked.length} booked · ${rupees(advances)} advance from ${advancesN} hunting`);
       put("money-outstanding", rupees(outstanding));
       put("money-outstanding-note", owing === 0 ? "nothing owed" : `${owing} client${owing === 1 ? "" : "s"} still owe you`);
       put("money-hunting", rupees(hunting));
       put("money-hunting-note", `${huntingN} not booked yet`);
-      const pct = agreedTotal > 0 ? (collected / agreedTotal) * 100 : 0;
+      // #91 Denominator has to match the numerator. `collected` now includes
+      // advances from clients still hunting, so dividing by the booked-only
+      // agreed total could show well over 100%. Measure against every live
+      // client's agreed fee, and clamp regardless.
+      const agreedLive = agreedTotal + hunting;
+      const pct = agreedLive > 0 ? Math.min(100, (collected / agreedLive) * 100) : 0;
       const g = document.getElementById("money-bar-got"), d = document.getElementById("money-bar-due");
       if (g) g.style.width = pct.toFixed(1) + "%";
       if (d) d.style.width = (100 - pct).toFixed(1) + "%";
@@ -614,11 +691,18 @@
 
       // #75 View. Active is the working list, so it drops anyone already
       // booked and anyone whose window has lapsed.
-      const booked = isBooked(p.username, statuses, cloudStatusMap, slotHistory);
+      // #90 The operator's own mark sits on top of the computed check. A client
+      // booked outside the bot, or one who no longer wants the service, can now
+      // be set aside by hand instead of staying in Active for ever and being
+      // signed into by every login sweep.
+      const svc = serviceStateOf(p);
+      const notNeeded = svc === "not_required";
+      const booked = isBookedNow(p, statuses, cloudStatusMap, slotHistory);
       const expired = isRangeExpired(p);
-      if (clientView === "active" && (booked || expired)) return false;
+      if (clientView === "active" && (booked || expired || notNeeded)) return false;
       if (clientView === "booked" && !booked) return false;
       if (clientView === "expired" && !expired) return false;
+      if (clientView === "notneeded" && !notNeeded) return false;
 
       return true;
     });
@@ -680,6 +764,7 @@
       const rlMs = rateLimitedAt ? new Date(rateLimitedAt).getTime() : 0;
       const isRateLimited = rlMs > 0 && (Date.now() - rlMs < 24 * 60 * 60 * 1000);
       const rateLimitHoursLeft = isRateLimited ? Math.max(0, Math.ceil((24 * 60 * 60 * 1000 - (Date.now() - rlMs)) / 3600000)) : 0;
+      const svcState = serviceStateOf(profile);   // #90 "", "booked" or "not_required"
 
       // Auto-clear once expired, or a stuck rate_limited status with no fresh timestamp
       if ((userStatus === "rate_limited" || rateLimitedAt) && !isRateLimited && SUPA && SUPA.isReady()) {
@@ -744,6 +829,19 @@
               <span class="detail-label">PRICE</span>
               <span class="detail-value">${profile.agreedPrice ? "₹" + Number(profile.agreedPrice).toLocaleString() + (profile.applicantCount > 1 ? " (" + (profile.pricePerPerson || profile.agreedPrice) + "/pp)" : "") : "—"}</span>
             </div>`}
+            ${/* #91 An advance used to live only inside the Edit box — recorded,
+                  synced, and shown nowhere. Put it on the card so money taken is
+                  visible without opening each client one at a time. Owner only,
+                  same rule as PRICE above, and hidden when nothing is paid so
+                  the card stays quiet for clients who owe everything. */ ""}
+            ${staffMode || paidOf(profile) <= 0 ? "" : `<div class="card-detail">
+              <span class="detail-label">PAID</span>
+              <span class="detail-value">₹${paidOf(profile).toLocaleString()}${
+                balanceOf(profile) > 0
+                  ? ` · <span class="pay-due">₹${balanceOf(profile).toLocaleString()} due</span>`
+                  : agreedOf(profile) > 0 ? ` · <span class="pay-clear">paid in full</span>` : ""
+              }</span>
+            </div>`}
             <div class="card-detail">
               <span class="detail-label">CAPTCHA</span>
               <span class="detail-value">${esc(profile.captchaMode) || "manual"}</span>
@@ -802,6 +900,15 @@
               <button class="btn btn-small btn-edit" data-user="${safeUser}">Edit</button>
               <button class="btn btn-small btn-history" data-user="${safeUser}">History</button>
               <button class="btn btn-small btn-check-login" data-user="${safeUser}" title="Log in as this client, check the credentials still work, then log out">Check login</button>
+              ${/* #90 Operator-set state. Both marks take the client out of the
+                    Active list AND out of "Check all logins", so no more of
+                    their daily page-views are spent on an account nobody is
+                    working. Set back to Normal to bring them back. */ ""}
+              <select class="svc-select" data-user="${safeUser}" title="Booked and Not needed are both skipped by Check all logins">
+                <option value=""${svcState === "" ? " selected" : ""}>Normal</option>
+                <option value="booked"${svcState === "booked" ? " selected" : ""}>Booked</option>
+                <option value="not_required"${svcState === "not_required" ? " selected" : ""}>Not needed</option>
+              </select>
             </span>
           </div>
 
@@ -1302,6 +1409,10 @@
       const busy = ["cycling", "logging_in", "security_questions", "on_dashboard", "slot_found"];
       if (busy.includes(st.status)) { skipped.push(p.username); return; }
       if (!p.password) { skipped.push(p.username); return; }
+      // #90 Never sign in as a client who is already booked or has been set
+      // aside. Each sign-in spends one of that client's limited daily
+      // page-views, and nobody is working these accounts any more.
+      if (serviceStateOf(p)) { skipped.push(p.username); return; }
       queue.push(p.username);
     });
 
@@ -2708,6 +2819,36 @@
     // Same reason as startSweep: drop a stale tab id so the next client claims
     // a tab cleanly instead of reviving one that has since been closed.
     await new Promise((r) => chrome.storage.local.remove(["__abVerifyTabId"], r));
+    refresh();
+  });
+
+  // #90 Mark a client Booked or Not needed. Both take them out of the Active
+  // list and out of "Check all logins", so no more of their limited daily
+  // page-views are spent on an account nobody is working.
+  document.addEventListener("change", async (e) => {
+    const sel = e.target.closest(".svc-select");
+    if (!sel) return;
+    const username = sel.dataset.user;
+    const next = sel.value;
+    const label = next === "booked" ? "Booked" : next === "not_required" ? "Not needed" : "Normal";
+
+    // A client who is mid-session must not be left being hunted after they have
+    // just been closed. Confirm, stop them, then mark.
+    const d = await new Promise((r) => chrome.storage.local.get(["userStatuses", "activeAutomationUser"], r));
+    const st = (d.userStatuses || {})[username] || {};
+    const live = ["cycling", "logging_in", "security_questions", "on_dashboard", "slot_found"].includes(st.status)
+      || d.activeAutomationUser === username;
+
+    if (next && live) {
+      if (!confirm(`${username} is running right now.\n\nStop that session and mark them ${label}?`)) {
+        refresh();   // re-renders from storage, so the dropdown returns to its real value
+        return;
+      }
+      try { await stopUser(username); } catch (err) { /* marking still proceeds */ }
+    }
+
+    const ok = await setServiceState(username, next);
+    if (!ok) { alert(`Could not update ${username}.`); return; }
     refresh();
   });
 

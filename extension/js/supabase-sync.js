@@ -355,6 +355,9 @@ const SupabaseSync = (() => {
       captcha_mode: profile.captchaMode || "auto",
       status: profile.status || "idle",
       is_active: profile.isActive || false,
+      // #90 Operator-set: "" normal, "booked", "not_required". Distinct from
+      // `status`, which is the live automation state and changes by itself.
+      service_state: profile.serviceState || null,
     };
 
     // Security questions — local format is object { "question": "answer" }
@@ -413,6 +416,10 @@ const SupabaseSync = (() => {
           updatedAt: p.updated_at,
           rateLimitedAt: p.rate_limited_at,
           assignedStaffId: p.assigned_staff_id || null,
+          // #90 Empty on a project that has not run sql/05-service-state.sql,
+          // which reads as "normal" — so an unmigrated project behaves exactly
+          // as it did before.
+          serviceState: p.service_state || "",
           // #85 Last login-check result, from whichever machine ran it. Null on
           // a project that has not had sql/04-login-health.sql applied yet; the
           // dashboard reads that as "no cloud result" and keeps using whatever
@@ -496,6 +503,22 @@ const SupabaseSync = (() => {
       await withRetry(() => update("user_profiles", { operator_id: operatorId, username }, data), "updateLoginHealth");
     } catch (e) {
       console.error("[SupabaseSync] updateLoginHealth failed after retries:", e.message);
+    }
+  }
+
+  // #90 Share an operator's Booked / No-longer-needed mark so every dashboard
+  // agrees about who is still being worked. Written locally first by the
+  // caller; this is what carries it to the other machines.
+  async function updateServiceState(username, serviceState) {
+    if (!isReady()) return;
+    const data = {
+      service_state: serviceState || null,
+      updated_at: new Date().toISOString(),
+    };
+    try {
+      await withRetry(() => update("user_profiles", { operator_id: operatorId, username }, data), "updateServiceState");
+    } catch (e) {
+      console.error("[SupabaseSync] updateServiceState failed after retries:", e.message);
     }
   }
 
@@ -932,6 +955,7 @@ const SupabaseSync = (() => {
     deleteProfile,
     updateProfileStatus,
     updateLoginHealth,
+    updateServiceState,
 
     // Slots
     pushSlot,

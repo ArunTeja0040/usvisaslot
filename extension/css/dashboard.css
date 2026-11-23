@@ -1038,6 +1038,11 @@ select:focus, input:focus, textarea:focus { border-color: var(--line); }
 .pay-part { background: rgba(229, 169, 78, .14); color: var(--accent); }
 .pay-none { background: rgba(241, 111, 111, .13); color: var(--danger); }
 
+/* #91 Inline on the client card, so no pill background — beside the amount
+   already paid, the colour alone carries whether anything is still due. */
+.pay-due { color: var(--accent); }
+.pay-clear { color: var(--ok); }
+
 /* ── USER CARDS (structure kept; internals are Phase 2) ────── */
 
 .user-cards-grid {

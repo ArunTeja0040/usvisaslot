@@ -12,6 +12,53 @@ Format:
 
 ---
 
+## 2026-11-24 — Advance payments now show up in the money figures (Issue #91)
+
+**What it does:** Money a client has paid you before their appointment is booked now counts, and shows on their card.
+
+- **COLLECTED** is every rupee you have actually received, booked or not. The line underneath splits it: `₹60,000 from 3 booked · ₹1,25,000 advance from 7 hunting`.
+- **The client card** gains a **PAID** line — `₹10,000 · ₹15,000 due` — shown only when something has been paid.
+- **OUTSTANDING** counts everyone who still owes you, not only booked clients.
+
+**Why:** You could type an advance into a client's Edit box, and it was saved and shared correctly — but the dashboard only ever added up money from *booked* clients. So an advance was recorded and then shown nowhere. With 46 clients hunting, deposits you had genuinely collected read as ₹0, and the only way to see one was to open that client's Edit box and look. There was no way to answer "how much have I actually taken" from this screen.
+
+**What changed for you:**
+- One number for cash in hand, with the source named underneath, so booked money and advance money stay tellable apart.
+- A client who has paid part says so on their own card, in orange when money is still due and green when they are square.
+- Clients marked **Expired** or **Not needed** are left out of both the advance and the owed figures — they are not being worked, so their balances are not live money.
+- The progress bar now measures against every live client's fee, not just the booked ones, so it can no longer read over 100%.
+
+**Tested:** Confirmed working on the live dashboard.
+
+---
+
+## 2026-11-24 — Mark a client Booked or Not needed, and stop checking their login (Issue #90)
+
+**What it does:** Every client card now has a small dropdown: **Normal / Booked / Not needed.**
+
+- **Booked** — moves them into the Booked tab.
+- **Not needed** — moves them into a new **Not needed** tab, next to Active, Booked, Expired and All.
+- **Both are skipped by "Check all logins".**
+
+Set it back to Normal at any time and the client returns to the Active list.
+
+**Why:** "Booked" was worked out by the bot on its own, from what it had booked. There was no way for you to say so. A client who booked elsewhere, or who no longer wants the service, stayed in the Active list for ever — and every single "Check all logins" run signed in as them, spending one of that client's limited daily page views on an account nobody is working any more. With 57 clients and only a handful actually finished, that adds up every run.
+
+**What changed for you:**
+- The dropdown sits on each card beside Edit, History and Check login.
+- The tab counts match what each tab actually shows — a client marked Booked leaves Active and the numbers move with them.
+- **If you mark a client who is running right now,** it asks first: "X is running right now. Stop that session and mark them Booked?" Say yes and it stops them, then marks them. Say no and nothing changes.
+- The mark is shared with your other computers, so every dashboard agrees about who is still being worked.
+- Marking someone **Booked by hand does not change anything the bot worked out by itself** — it sits on top. A client the bot already knows is booked stays booked either way.
+
+**One step for you:** this needs a small change in Supabase before the sharing works — one new optional field. The file is `sql/05-service-state.sql`. Run it once. Until you do, the marks still work but stay on the machine you set them on.
+
+**Built straight into production** at your request, because the test folder currently holds another session's unfinished work across the same files. That means **this one has not been through a test build first** — it is dashboard and status work only, nothing near booking, cycling or the Cloudflare handling.
+
+**Tested:** Confirmed working on the live dashboard.
+
+---
+
 ## 2026-10-27 — Show what the website actually said when it refuses a booking (Issue #86)
 
 **What it does:** When a booking is refused, the log now prints the website's own words, not just our one-word summary.
