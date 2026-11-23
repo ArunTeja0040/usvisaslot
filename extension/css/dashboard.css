@@ -871,10 +871,20 @@ select:focus, input:focus, textarea:focus { border-color: var(--line); }
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
   padding: 2px;
-  width: max-content;
+  /* #92 Wrap onto a second row rather than scrolling sideways. The old
+     `overflow-x: auto` left a squeezed strip with a scrollbar once the tabs
+     outgrew their container, so the later options could not be seen at all —
+     and #90's fifth tab made that happen at widths where it used to fit.
+     Desktop is unchanged: there the row still fits on one line. */
+  flex-wrap: wrap;
+  /* fit-content, not max-content: max-content means "as wide as one unbroken
+     row", so the strip would never wrap however narrow the window got.
+     fit-content hugs the tabs when they fit and lets them wrap when they
+     do not, which keeps the snug box on desktop and the full set visible
+     on a phone. */
+  width: fit-content;
   max-width: 100%;
   margin: 0 0 12px;
-  overflow-x: auto;
 }
 
 .view-btn {
@@ -1305,6 +1315,17 @@ select:focus, input:focus, textarea:focus { border-color: var(--line); }
 
 .card-locations { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 4px; }
 
+/* #93 Inside the details grid rather than below it: the locations are the field
+   that decides where we hunt, so they belong next to the dates, not last on the
+   card. Both take a full row; the pairs below them keep the two-column flow.
+
+   The span goes on the VALUE, not on .card-detail. That wrapper is
+   `display: contents`, so it generates no box and grid-column on it does
+   nothing at all — which is why the date stayed in one narrow column and
+   truncated to "15 Jun 26 — …" instead of showing the full range. */
+.card-detail.detail-wide .detail-value { grid-column: 2 / -1; }
+.card-locations.in-details { grid-column: 1 / -1; margin: 4px 0 5px; }
+
 .loc-tag {
   font-family: var(--mono);
   background: var(--surface-2);
@@ -1357,17 +1378,48 @@ select:focus, input:focus, textarea:focus { border-color: var(--line); }
 /* Secondary actions stay out of the way until the card is hovered, so a
    grid of forty cards is not a wall of buttons. Always shown on touch,
    where there is no hover to reveal them. */
-.card-actions-rest {
-  margin-left: auto;
-  display: flex;
-  gap: 6px;
-  transition: opacity 180ms ease, transform 180ms var(--ease-out);
+/* #93 The #90 state dropdown sits beside Edit / History / Check login, so it has
+   to read as the same kind of control. The generic `select` rule gives it a
+   different background, taller padding and no weight, which made it look like a
+   stray form field. Match .btn.btn-small exactly and draw our own arrow, since
+   the native one cannot be styled to suit. */
+.svc-select {
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 4px 22px 4px 10px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+                    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 12px) 52%, calc(100% - 8px) 52%;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+  transition: background-color 180ms ease, border-color 180ms ease, color 180ms ease;
 }
 
+/* #93 `display: contents` so the four controls become direct children of
+   .card-actions and flow alongside "Start now", wrapping one at a time as the
+   card narrows. As its own flex box pushed right by `margin-left: auto`, the
+   group could only wrap as a single unit, which left "Start now" alone on one
+   line and the rest stacked awkwardly beneath it. */
+.card-actions-rest { display: contents; }
+
 @media (hover: hover) and (pointer: fine) {
-  .card-actions-rest { opacity: 0; transform: translateX(4px); }
-  .user-card:hover .card-actions-rest,
-  .user-card:focus-within .card-actions-rest { opacity: 1; transform: none; }
+  /* The reveal has to sit on the buttons themselves now: a `display: contents`
+     element generates no box, so opacity and transform on it would do nothing. */
+  .card-actions-rest > * {
+    opacity: 0;
+    transform: translateX(4px);
+    transition: opacity 180ms ease, transform 180ms var(--ease-out);
+  }
+  .user-card:hover .card-actions-rest > *,
+  .user-card:focus-within .card-actions-rest > * { opacity: 1; transform: none; }
 }
 
 .card-footer {

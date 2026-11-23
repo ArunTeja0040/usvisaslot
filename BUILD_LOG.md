@@ -12,6 +12,59 @@ Format:
 
 ---
 
+## 2026-11-24 — Client card reordered, and the state dropdown matches the buttons (Issue #93)
+
+**What it does:** Two things on each client card.
+
+1. **The order now reads the way you read a client:** dates first, then the consulates we are hunting, then visa and applicants, then price and advance. The consulate tags used to sit right at the bottom of the card, below everything.
+2. **The Normal / Booked / Not needed dropdown now looks like the buttons next to it.**
+
+**Why:** The consulate list is what tells you where we are searching, and it was the last thing on the card, under the slot history. It belongs beside the dates.
+
+The dropdown was inheriting the generic form-field style instead of the button style, so beside Edit, History and Check login it sat taller, in a darker shade, with a different arrow. It read as a stray form control rather than part of the row.
+
+**What changed for you:**
+
+```
+DATES      01 Jan 27 — 31 Mar 27
+[ Mumbai ] [ New Delhi ] [ Chennai ] [ Kolkata ] [ Hyderabad ]
+VISA  H1B              APPL  1
+PRICE ₹25,000          PAID  ₹10,000 · ₹15,000 due
+CAPTCHA auto
+```
+
+Everything after that — slot history, round counters, warnings, buttons — is exactly where it was.
+
+**Also fixed, after you spotted them on a real card:**
+- **Full dates now show.** The first attempt did not work: the row that holds a label and its value is built in a way that makes it invisible to the layout, so the instruction to "use the whole width" was being given to something that is not there. It now goes on the value itself, and `15 Jun 26 — 30 Sep 26` shows in full instead of `15 Jun 26 — …`.
+- **The dropdown no longer runs off the card.** The four buttons were locked to one unbreakable line; on a narrow card the last one hung over the edge. They now wrap onto a second line when there is no room.
+- **CAPTCHA is replaced by ADVANCE.** The CAPTCHA setting is chosen once and never looked at again; what a client still owes is looked at constantly. The line reads `₹10,000 · ₹15,000 due` when something is paid, and `— · ₹19,000 due` when nothing is.
+
+**Tested:** Rendered real cards against the actual stylesheet and measured them. Dropdown matches the buttons exactly (27px height, same background, border, text size, weight, radius) and stays inside the card at 460, 400, 340 and 300 pixels wide, wrapping to two rows at the narrowest. Dates no longer truncate at any of those widths. Confirmed working on the live dashboard.
+
+---
+
+## 2026-11-24 — Dashboard now fits phones and tablets properly (Issue #92)
+
+**What it does:** Two lines. The dashboard now lays itself out correctly on any screen size, and the Active / Booked / Expired / Not needed / All strip wraps onto a second row instead of being cut off.
+
+**Why:** The page was missing one standard line that tells a phone or tablet "this page knows how to fit you". Without it, every phone assumed the dashboard was a 980-pixel-wide desktop page and shrank the whole thing to fit — which is why nothing lined up.
+
+Worse, the stylesheet already had seventeen rules for smaller screens, written long ago. **None of them had ever run on a real phone**, because the browser was being told the screen was 980 pixels wide no matter what it actually was. The responsive design was there the whole time and had never once been used.
+
+The tab strip was a separate, smaller fault: it scrolled sideways rather than wrapping, so once the tabs were wider than the space available you got a squeezed strip with a scrollbar and could not see the later options at all. Adding the fifth tab ("Not needed") last week made that start happening at ordinary window sizes.
+
+**What changed for you:**
+- On a phone or tablet the dashboard now fits the screen, with the stat cards stacking and the buttons wrapping instead of running off the edge.
+- All five tabs are always visible. On a narrow screen they use two rows.
+- **Desktop is unchanged.** The tab strip still hugs its buttons on one row, and nothing else moves.
+
+**Measured before and after**, in an emulated phone screen of 375 pixels: the page used to be 980 pixels wide (so it overflowed); it is now exactly 375 with nothing hanging off the edge, and all five tabs reachable. Checked again at tablet (768) and desktop (1440) — no overflow at any of them.
+
+**Tested:** Checked at 375, 768 and 1440 pixels against the real files, then confirmed working on the live dashboard.
+
+---
+
 ## 2026-11-24 — Advance payments now show up in the money figures (Issue #91)
 
 **What it does:** Money a client has paid you before their appointment is booked now counts, and shows on their card.

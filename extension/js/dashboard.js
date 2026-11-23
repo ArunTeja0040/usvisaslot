@@ -812,11 +812,16 @@
           ${checking ? `<div class="card-note note-checking">${CARD_ICON.device}<span><b>Checking login…</b> signing in to test the credentials.</span></div>` : ""}
           ${!checking && health && health.state !== "healthy" ? `<div class="card-note note-${health.state === "password_changed" || health.state === "security_mismatch" ? "block" : "half"}">${CARD_ICON.warn}<span><b>${esc(LOGIN_HEALTH_LABELS[health.state] || health.state)}</b>${health.detail ? " — " + esc(health.detail) : ""} <span class="note-when">checked ${timeAgo(health.checkedAt)}</span></span></div>` : ""}
           ${halfDone ? `<div class="card-note note-half">${CARD_ICON.warn}<span><b>${halves.ofc ? "OFC done" : "Consular done"}</b> — ${halves.ofc ? "consular interview" : "OFC"} still to book.</span></div>` : ""}
+          ${/* #93 Order follows how a client is actually read: when they want to
+                go, where we are hunting, who is applying, then the money. DATES
+                and the locations each take a full row of the grid; the pairs
+                below them fall into the two columns as before. */ ""}
           <div class="card-details">
-            <div class="card-detail">
+            <div class="card-detail detail-wide">
               <span class="detail-label">DATES</span>
               <span class="detail-value${rangeExpired ? " date-expired" : ""}"${rangeExpired ? ' title="This window has already ended — check the year is right"' : ""}>${formatRange(profile.startDate, profile.endDate, rangeExpired)}${rangeExpired ? " · expired" : ""}</span>
             </div>
+            ${locs ? `<div class="card-locations in-details">${locs}</div>` : ""}
             <div class="card-detail">
               <span class="detail-label">VISA</span>
               <span class="detail-value">${esc(profile.visaType) || "—"}</span>
@@ -831,23 +836,26 @@
             </div>`}
             ${/* #91 An advance used to live only inside the Edit box — recorded,
                   synced, and shown nowhere. Put it on the card so money taken is
-                  visible without opening each client one at a time. Owner only,
-                  same rule as PRICE above, and hidden when nothing is paid so
-                  the card stays quiet for clients who owe everything. */ ""}
-            ${staffMode || paidOf(profile) <= 0 ? "" : `<div class="card-detail">
-              <span class="detail-label">PAID</span>
-              <span class="detail-value">₹${paidOf(profile).toLocaleString()}${
-                balanceOf(profile) > 0
-                  ? ` · <span class="pay-due">₹${balanceOf(profile).toLocaleString()} due</span>`
-                  : agreedOf(profile) > 0 ? ` · <span class="pay-clear">paid in full</span>` : ""
+                  visible without opening each client one at a time.
+
+                  #93 Always shown now, in the slot CAPTCHA used to hold. CAPTCHA
+                  mode is set once and never looked at again; what is owed gets
+                  looked at constantly, so it earns the space. Owner only, same
+                  rule as PRICE above. */ ""}
+            ${staffMode ? "" : `<div class="card-detail">
+              <span class="detail-label">ADVANCE</span>
+              <span class="detail-value">${
+                paidOf(profile) > 0
+                  ? `₹${paidOf(profile).toLocaleString()}` + (
+                      balanceOf(profile) > 0
+                        ? ` · <span class="pay-due">₹${balanceOf(profile).toLocaleString()} due</span>`
+                        : agreedOf(profile) > 0 ? ` · <span class="pay-clear">paid in full</span>` : "")
+                  : agreedOf(profile) > 0
+                    ? `— · <span class="pay-due">₹${agreedOf(profile).toLocaleString()} due</span>`
+                    : "—"
               }</span>
             </div>`}
-            <div class="card-detail">
-              <span class="detail-label">CAPTCHA</span>
-              <span class="detail-value">${esc(profile.captchaMode) || "manual"}</span>
-            </div>
           </div>
-          ${locs ? `<div class="card-locations">${locs}</div>` : ""}
 
           ${(() => {
             const st = slotStats[profile.username];

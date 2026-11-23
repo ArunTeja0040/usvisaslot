@@ -2,6 +2,11 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <!-- #92 Without this a phone or tablet assumes a 980px desktop page and
+       scales the whole dashboard down, which also means none of the
+       stylesheet's media queries ever fire on a real device. Measured at
+       375px wide, clientWidth reported 980 until this line existed. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SlotHunter — Dashboard</title>
   <link rel="stylesheet" href="css/dashboard.css">
 </head>
