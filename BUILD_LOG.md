@@ -31,7 +31,13 @@ Leave either blank and nothing changes for that client.
 
 **One step for you:** needs a small change in Supabase first — two new optional fields. The file is `sql/06-date-rules.sql`. Run it once. Until you do, everything works exactly as before and the two boxes simply have nothing to save into.
 
-**Tested:** 15 checks on the date reader (friendly and strict forms, ranges, rubbish, and impossible dates like 31 February, which must be rejected rather than rolled into March), and 15 on the booking rule itself (no rules, excluded only, notice only, both together, and nonsense stored in the fields, which must never widen the window). All passing. Not yet run against the live site.
+**When the rules leave nothing to book, it now says so.** Minimum notice counts from today and moves with it, so a window closes from both ends. With a window of 1–31 December and one week's notice, on 24 December only the 31st is still reachable, and from the 25th nothing is. Before this the bot would have carried on hunting that client for ever, finding slots and refusing every one, with nothing on screen explaining why.
+
+Two places now catch it:
+- **On the client's card:** *"No bookable dates left — 7 days' notice means nothing before 1 Dec, but the window ends 30 Nov."*
+- **While you type it:** the line under the notice box turns amber and says the same thing, so you see it when registering the client rather than three weeks later. It re-checks when you change either date too.
+
+**Tested:** 15 checks on the date reader (friendly and strict forms, ranges, rubbish, and impossible dates like 31 February, which must be rejected rather than rolled into March), 15 on the booking rule itself (no rules, excluded only, notice only, both together, and nonsense stored in the fields, which must never widen the window). and 9 on the no-bookable-dates check (open-ended windows, notice landing exactly on the end date, overrunning it by one day, a window already past, and every remaining day excluded). All 39 passing. Not yet run against the live site.
 
 ---
 

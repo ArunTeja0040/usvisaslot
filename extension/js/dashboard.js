@@ -274,6 +274,48 @@
     }
   }
 
+  // #94 Can this client still be booked at all?
+  //
+  // Minimum notice is measured from today and moves with it, so a window closes
+  // from both ends: a 1-week notice against a window ending 31 Dec leaves one
+  // usable day on 24 Dec and none on the 25th. Without this the bot would hunt
+  // that client for ever, finding slots and refusing every one, with nothing on
+  // screen saying why. Silent refusal is how the security-question freeze went
+  // unnoticed for weeks.
+  //
+  // Returns { blocked, reason } — blocked only when we are certain nothing can
+  // be taken, never on a guess.
+  function dateRulesBlock(profile) {
+    if (!profile) return { blocked: false, reason: "" };
+    const notice = Math.max(0, Math.floor(Number(profile.minimumNoticeDays) || 0));
+    const excluded = new Set(Array.isArray(profile.excludedDates) ? profile.excludedDates : []);
+    const end = String(profile.endDate || "").trim();
+    if (!end) return { blocked: false, reason: "" };     // open-ended: never blocked
+
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const earliest = new Date(today); earliest.setDate(earliest.getDate() + notice);
+    const start = String(profile.startDate || "").trim();
+    const from = start && new Date(start + "T00:00:00") > earliest
+      ? new Date(start + "T00:00:00") : earliest;
+    const until = new Date(end + "T00:00:00");
+
+    const asISO = (d) => d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") +
+                         "-" + String(d.getDate()).padStart(2, "0");
+
+    if (from > until) {
+      return { blocked: true, reason: notice > 0
+        ? `${notice} day${notice === 1 ? "" : "s"}' notice means nothing before ${fmtEchoDate(asISO(from))}, but the window ends ${fmtEchoDate(end)}`
+        : `the window ended ${fmtEchoDate(end)}` };
+    }
+    if (excluded.size) {
+      for (let d = new Date(from); d <= until; d.setDate(d.getDate() + 1)) {
+        if (!excluded.has(asISO(d))) return { blocked: false, reason: "" };
+      }
+      return { blocked: true, reason: `every remaining day to ${fmtEchoDate(end)} is excluded` };
+    }
+    return { blocked: false, reason: "" };
+  }
+
   function updateNoticeEcho() {
     const input = document.getElementById("edit-min-notice");
     const echo = document.getElementById("edit-min-notice-echo");
@@ -281,8 +323,20 @@
     const n = Math.floor(Number(input.value) || 0);
     if (n <= 0) { echo.textContent = ""; echo.className = "field-echo"; return; }
     const from = new Date(); from.setHours(0, 0, 0, 0); from.setDate(from.getDate() + n);
+    const fromISO = from.getFullYear() + "-" + String(from.getMonth() + 1).padStart(2, "0") +
+                    "-" + String(from.getDate()).padStart(2, "0");
+    // #94 Warn at the point of entry, not three weeks later. If the notice
+    // period already runs past this client's end date there is nothing left to
+    // book, and the operator should see that while they are still typing.
+    const endVal = String(document.getElementById("edit-end-date")?.value || "").trim();
+    if (endVal && fromISO > endVal) {
+      echo.className = "field-echo is-bad";
+      echo.textContent = "Nothing before " + fmtEchoDate(fromISO) +
+        " — but the window ends " + fmtEchoDate(endVal) + ", so no date can be booked";
+      return;
+    }
     echo.className = "field-echo is-ok";
-    echo.textContent = "Nothing before " + fmtEchoDate(from.toISOString().slice(0, 10));
+    echo.textContent = "Nothing before " + fmtEchoDate(fromISO);
   }
 
   // True when the promised window has already finished. Almost always a
@@ -929,7 +983,15 @@
           ${checking ? `<div class="card-note note-checking">${CARD_ICON.device}<span><b>Checking login…</b> signing in to test the credentials.</span></div>` : ""}
           ${!checking && health && health.state !== "healthy" ? `<div class="card-note note-${health.state === "password_changed" || health.state === "security_mismatch" ? "block" : "half"}">${CARD_ICON.warn}<span><b>${esc(LOGIN_HEALTH_LABELS[health.state] || health.state)}</b>${health.detail ? " — " + esc(health.detail) : ""} <span class="note-when">checked ${timeAgo(health.checkedAt)}</span></span></div>` : ""}
           ${halfDone ? `<div class="card-note note-half">${CARD_ICON.warn}<span><b>${halves.ofc ? "OFC done" : "Consular done"}</b> — ${halves.ofc ? "consular interview" : "OFC"} still to book.</span></div>` : ""}
-          ${/* #93 Order follows how a client is actually read: when they want to
+
+          ${(() => {
+            // #94 Nothing can be booked for this client any more. Say so rather
+            // than hunting silently for a date that cannot exist.
+            const blk = dateRulesBlock(profile);
+            return blk.blocked
+              ? `<div class="card-note note-block">${CARD_ICON.warn}<span><b>No bookable dates left</b> — ${esc(blk.reason)}.</span></div>`
+              : "";
+          })()}          ${/* #93 Order follows how a client is actually read: when they want to
                 go, where we are hunting, who is applying, then the money. DATES
                 and the locations each take a full row of the grid; the pairs
                 below them fall into the two columns as before. */ ""}
@@ -2981,6 +3043,10 @@
   // rather than silently dropped.
   document.getElementById("edit-excluded-dates")?.addEventListener("input", updateExcludedEcho);
   document.getElementById("edit-min-notice")?.addEventListener("input", updateNoticeEcho);
+  // #94 Changing the window can turn a fine notice period into an impossible
+  // one, so the warning has to re-evaluate when either side moves.
+  document.getElementById("edit-end-date")?.addEventListener("change", updateNoticeEcho);
+  document.getElementById("edit-start-date")?.addEventListener("change", updateNoticeEcho);
 
   document.getElementById("sweep-report-close")?.addEventListener("click", async () => {
     const sweep = await readSweep();
