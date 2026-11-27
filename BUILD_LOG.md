@@ -12,6 +12,16 @@ Format:
 
 ---
 
+## 2026-11-28 — Tidy the Automation checkboxes in the Edit box
+
+**What it does:** The four Automation checkboxes — Auto-Login, Auto-Dashboard, Auto-Select, Auto-Submit — now sit in a neat two-by-two block, each tick next to its own label.
+
+**Why:** They were stacked one per line, with the tick box stranded on the left and its label pushed to the far right, wrapping mid-word as "Auto-" then "Login". Two styling rules were fighting: the one meant for a normal form row came later in the stylesheet and overruled the one meant for a row of tick boxes, stacking them vertically and stretching each tick box to the full width of the box.
+
+**What changed for you:** Only the appearance of those four. Nothing about what they do.
+
+---
+
 ## 2026-11-28 — Check faster at minutes you choose (Issue #95)
 
 **What it does:** A new **Release windows** section in the dashboard's `⋯` menu. Pick up to four minutes past the hour, say how long each should last, and the bot checks faster during those minutes — normal pace the rest of the time.

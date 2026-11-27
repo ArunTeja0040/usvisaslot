@@ -1690,6 +1690,38 @@ select:focus, input:focus, textarea:focus { border-color: var(--line); }
 .form-row label { font-size: 11px; color: var(--text-2); }
 .form-row input, .form-row select, .form-row textarea { width: 100%; }
 
+/* #95b The automation checkboxes are on a div that carries BOTH .form-row and
+   .edit-checks. Same specificity, so the .form-row rules above — declared
+   later in this file — were winning: flex-direction:column put each box on its
+   own line, and width:100% stretched the checkbox so its label was pushed to
+   the far edge and wrapped mid-word ("Auto-\nLogin").
+
+   Overridden here, after both, and laid out as a 2x2 grid so the four read as
+   one block rather than a ragged wrap. */
+.form-row.edit-checks {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 16px;
+}
+
+.form-row.edit-checks label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.form-row.edit-checks input[type="checkbox"] {
+  width: auto;
+  flex: none;
+  margin: 0;
+}
+
+@media (max-width: 420px) {
+  .form-row.edit-checks { grid-template-columns: 1fr; }
+}
+
 /* ── TOASTS ───────────────────────────────────────────────── */
 
 .sh-toaster {
