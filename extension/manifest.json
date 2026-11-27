@@ -1,5 +1,5 @@
 {
-    "name": "SlotHunter DATES-TEST",
+    "name": "SlotHunter",
     "description": "Automated US visa appointment hunter \u2014 auto-login, CAPTCHA solving, slot detection, and auto-booking.",
     "manifest_version": 3,
     "version": "5.0.0",
