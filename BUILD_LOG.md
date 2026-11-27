@@ -54,7 +54,7 @@ After a few weeks that tells you whether :26 is real **for your consulates** —
 
 **What it costs:** a 2-minute window at about 8 seconds makes roughly 15 checks where the normal pace makes 10. Two windows is about 11 extra checks an hour per running client. Modest — but it is more traffic at the busiest minute, and your logs already show the website saying *"The system is processing too many requests."* If that gets worse after turning this on, that is the cause.
 
-**Tested:** 17 checks on the timing (windows hit on the right minutes, every hour, and a window set to run past the hour — ":58 for 5 minutes" correctly covers :58 to :02), and 6 on the pace itself, including 2,000 gaps with the feature off to prove it is byte-for-byte the old 10–15 seconds, 2,000 with it on to prove the faster range still varies rather than ticking, and that "enabled but no windows set" behaves as off. All 23 passing. Not yet run against the live site.
+**Tested:** 17 checks on the timing (windows hit on the right minutes, every hour, and a window set to run past the hour — ":58 for 5 minutes" correctly covers :58 to :02), and 6 on the pace itself, including 2,000 gaps with the feature off to prove it is byte-for-byte the old 10–15 seconds, 2,000 with it on to prove the faster range still varies rather than ticking, and that "enabled but no windows set" behaves as off. All 23 passing, and confirmed working on the live dashboard.
 
 ---
 
@@ -89,7 +89,7 @@ Two places now catch it:
 - **On the client's card:** *"No bookable dates left — 7 days' notice means nothing before 1 Dec, but the window ends 30 Nov."*
 - **While you type it:** the line under the notice box turns amber and says the same thing, so you see it when registering the client rather than three weeks later. It re-checks when you change either date too.
 
-**Tested:** 15 checks on the date reader (friendly and strict forms, ranges, rubbish, and impossible dates like 31 February, which must be rejected rather than rolled into March), 15 on the booking rule itself (no rules, excluded only, notice only, both together, and nonsense stored in the fields, which must never widen the window). and 9 on the no-bookable-dates check (open-ended windows, notice landing exactly on the end date, overrunning it by one day, a window already past, and every remaining day excluded). All 39 passing. Not yet run against the live site.
+**Tested:** 15 checks on the date reader (friendly and strict forms, ranges, rubbish, and impossible dates like 31 February, which must be rejected rather than rolled into March), 15 on the booking rule itself (no rules, excluded only, notice only, both together, and nonsense stored in the fields, which must never widen the window). and 9 on the no-bookable-dates check (open-ended windows, notice landing exactly on the end date, overrunning it by one day, a window already past, and every remaining day excluded). All 39 passing, and confirmed working on the live dashboard.
 
 ---
 
