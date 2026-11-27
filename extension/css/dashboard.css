@@ -1878,3 +1878,12 @@ select:focus, input:focus, textarea:focus { border-color: var(--line); }
 .field-echo { font-family: var(--mono); font-size: 10px; margin-top: 4px; min-height: 12px; color: var(--text-3); }
 .field-echo.is-ok { color: var(--ok); }
 .field-echo.is-bad { color: var(--accent); }
+
+/* #95 Release-window settings, in the header's overflow menu. Compact on
+   purpose: it is set once and then left alone. */
+.menu-check { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text-2); cursor: pointer; padding: 2px 0; }
+.rw-body { display: none; padding: 4px 0 2px; }
+.rw-body.is-on { display: block; }
+.rw-row { display: flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--text-3); margin-bottom: 3px; white-space: nowrap; }
+.rw-row input { width: 46px; padding: 2px 5px; font-size: 10.5px; }
+.rw-note { font-family: var(--mono); font-size: 10px; color: var(--text-3); margin-top: 5px; line-height: 1.45; }

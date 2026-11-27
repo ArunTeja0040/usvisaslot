@@ -40,6 +40,21 @@
           <button id="export-csv-btn" class="btn btn-small">Export CSV</button>
           <button id="import-btn" class="btn btn-small">Import JSON</button>
           <input type="file" id="import-file" accept=".json" style="display:none">
+          <!-- #95 Global, not per-client: a slot dropping at :26 drops at :26
+               for everyone, so this belongs to the portal rather than to a
+               client. Scanning only — a login sweep in the same minute would
+               compete with the hunting it is meant to help. -->
+          <div class="menu-label">RELEASE WINDOWS</div>
+          <label class="menu-check"><input type="checkbox" id="rw-enabled"> Check faster at set minutes</label>
+          <div id="rw-body" class="rw-body">
+            <div class="rw-row"><span>at min</span><input type="number" id="rw-m1" min="0" max="59" placeholder="26"><span>for</span><input type="number" id="rw-d1" min="1" max="60" placeholder="2"><span>min</span></div>
+            <div class="rw-row"><span>at min</span><input type="number" id="rw-m2" min="0" max="59" placeholder="56"><span>for</span><input type="number" id="rw-d2" min="1" max="60" placeholder="2"><span>min</span></div>
+            <div class="rw-row"><span>at min</span><input type="number" id="rw-m3" min="0" max="59" placeholder="—"><span>for</span><input type="number" id="rw-d3" min="1" max="60" placeholder="—"><span>min</span></div>
+            <div class="rw-row"><span>at min</span><input type="number" id="rw-m4" min="0" max="59" placeholder="—"><span>for</span><input type="number" id="rw-d4" min="1" max="60" placeholder="—"><span>min</span></div>
+            <div class="rw-row"><span>every</span><input type="number" id="rw-lo" min="2" max="300" placeholder="6"><span>–</span><input type="number" id="rw-hi" min="2" max="300" placeholder="10"><span>sec inside</span></div>
+            <div id="rw-note" class="rw-note"></div>
+            <div id="rw-stats" class="rw-note"></div>
+          </div>
           <div class="menu-label">GOOGLE SHEET</div>
           <a id="sheets-link" href="#" target="_blank" rel="noreferrer" style="display:none;" class="btn btn-small">Open sheet</a>
           <input type="text" id="sheets-url-input" placeholder="Paste Google Sheet URL (optional)" style="display:none;">

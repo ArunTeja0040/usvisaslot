@@ -2971,6 +2971,99 @@
   document.getElementById("edit-end-date")?.addEventListener("change", updateNoticeEcho);
   document.getElementById("edit-start-date")?.addEventListener("change", updateNoticeEcho);
 
+  // ─── #95 RELEASE WINDOWS ─────────────────────────────────────────
+  //
+  // Global, so it lives in the header menu rather than on a client. Nothing is
+  // hardcoded — 26 and 56 are placeholder text only, because that is what a
+  // competitor on this portal ships as their default. A starting guess to
+  // test, not a fact to build in.
+  const RW_IDS = [["rw-m1","rw-d1"],["rw-m2","rw-d2"],["rw-m3","rw-d3"],["rw-m4","rw-d4"]];
+
+  function rwRead() {
+    const windows = [];
+    RW_IDS.forEach(([mId, dId]) => {
+      const m = document.getElementById(mId)?.value.trim();
+      const d = document.getElementById(dId)?.value.trim();
+      if (m === "" || d === "") return;                 // a blank pair is simply off
+      const mi = Math.floor(Number(m)), du = Math.floor(Number(d));
+      if (!Number.isFinite(mi) || mi < 0 || mi > 59) return;
+      if (!Number.isFinite(du) || du < 1) return;
+      windows.push({ startMinute: mi, durationMinutes: du });
+    });
+    let lo = Math.max(2, Math.floor(Number(document.getElementById("rw-lo")?.value) || 6));
+    let hi = Math.max(2, Math.floor(Number(document.getElementById("rw-hi")?.value) || 10));
+    if (hi < lo) { const t = lo; lo = hi; hi = t; }
+    return { enabled: !!document.getElementById("rw-enabled")?.checked, windows, fastLo: lo, fastHi: hi };
+  }
+
+  function rwDescribe(cfg) {
+    const note = document.getElementById("rw-note");
+    if (!note) return;
+    document.getElementById("rw-body")?.classList.toggle("is-on", !!cfg.enabled);
+    if (!cfg.enabled) { note.textContent = ""; return; }
+    if (!cfg.windows.length) { note.textContent = "No windows set — nothing will change."; return; }
+    const mins = cfg.windows.reduce((n, w) => n + w.durationMinutes, 0);
+    note.textContent = cfg.windows.map((w) => ":" + String(w.startMinute).padStart(2, "0") + "–:" +
+      String((w.startMinute + w.durationMinutes) % 60).padStart(2, "0")).join(", ") +
+      " · " + mins + " min/hour at " + cfg.fastLo + "–" + cfg.fastHi + "s";
+  }
+
+  // The figure that settles whether those minutes are real for our consulates,
+  // rather than a number inherited from someone else's extension.
+  async function rwRenderStats() {
+    const el = document.getElementById("rw-stats");
+    if (!el) return;
+    const d = await new Promise((r) => chrome.storage.local.get(["__abWindowStats"], r));
+    const t = d.__abWindowStats;
+    if (!t || (!t.inChecks && !t.outChecks)) { el.textContent = ""; return; }
+    const rate = (slots, checks) => checks > 0 ? ((slots / checks) * 100).toFixed(2) + "%" : "—";
+    el.textContent =
+      "in windows: " + (t.inSlots || 0) + " finds / " + (t.inChecks || 0) + " checks (" + rate(t.inSlots || 0, t.inChecks || 0) + ")\n" +
+      "outside:    " + (t.outSlots || 0) + " finds / " + (t.outChecks || 0) + " checks (" + rate(t.outSlots || 0, t.outChecks || 0) + ")";
+    el.style.whiteSpace = "pre";
+  }
+
+  async function rwSave() {
+    const cfg = rwRead();
+    rwDescribe(cfg);
+    await new Promise((r) => chrome.storage.local.set({ __abReleaseWindows: cfg }, r));
+  }
+
+  async function rwLoad() {
+    const d = await new Promise((r) => chrome.storage.local.get(["__abReleaseWindows"], r));
+    const cfg = d.__abReleaseWindows || { enabled: false, windows: [], fastLo: 6, fastHi: 10 };
+    const en = document.getElementById("rw-enabled");
+    if (en) en.checked = !!cfg.enabled;
+    RW_IDS.forEach(([mId, dId], i) => {
+      const w = (cfg.windows || [])[i];
+      const m = document.getElementById(mId), dd = document.getElementById(dId);
+      if (m) m.value = w ? w.startMinute : "";
+      if (dd) dd.value = w ? w.durationMinutes : "";
+    });
+    const lo = document.getElementById("rw-lo"), hi = document.getElementById("rw-hi");
+    if (lo) lo.value = cfg.fastLo || "";
+    if (hi) hi.value = cfg.fastHi || "";
+    rwDescribe(cfg);
+    rwRenderStats();
+  }
+
+  document.getElementById("rw-enabled")?.addEventListener("change", async (e) => {
+    // Turning it ON asks once, because it genuinely increases portal traffic at
+    // the busiest minute. Turning it off never asks.
+    if (e.target.checked && !confirm(
+        "Check faster during these minutes?\n\n" +
+        "This sends more requests at the busiest point of the hour. The portal may " +
+        "answer with rate limits, waiting rooms or Cloudflare checks.\n\n" +
+        "If that starts happening, turn this off and it goes back to normal.")) {
+      e.target.checked = false;
+      return;
+    }
+    rwSave();
+  });
+  ["rw-m1","rw-d1","rw-m2","rw-d2","rw-m3","rw-d3","rw-m4","rw-d4","rw-lo","rw-hi"]
+    .forEach((id) => document.getElementById(id)?.addEventListener("change", rwSave));
+  rwLoad();
+
   document.getElementById("sweep-report-close")?.addEventListener("click", async () => {
     const sweep = await readSweep();
     if (sweep) { sweep.dismissed = true; await writeSweep(sweep); }

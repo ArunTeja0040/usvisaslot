@@ -12,6 +12,42 @@ Format:
 
 ---
 
+## 2026-11-28 — Check faster at minutes you choose (Issue #95)
+
+**What it does:** A new **Release windows** section in the dashboard's `⋯` menu. Pick up to four minutes past the hour, say how long each should last, and the bot checks faster during those minutes — normal pace the rest of the time.
+
+```
+☐ Check faster at set minutes
+   at min [26] for [2] min
+   at min [56] for [2] min
+   at min [  ] for [ ] min        ← blank = unused
+   at min [  ] for [ ] min
+   every [6]–[10] sec inside
+```
+
+**Why those numbers appear as examples:** the rival extension on this same website ships exactly 26 and 56 as its defaults, with a 2-minute window and an 8-second interval. That is their guess about when slots are released, and they believe it enough to ship it. **Nothing is fixed in our code** — they are grey placeholder text only. Set whatever minutes you want, or none.
+
+**What changed for you:**
+- **Off until you turn it on**, and turning it on asks once, plainly: this sends more requests at the busiest minute, and the website may answer with rate limits or Cloudflare checks. Turning it off never asks and puts everything back exactly as it was.
+- **Slot searching only.** The login check is deliberately left alone — running a login sweep in the same minute would compete with the searching it is meant to help.
+- **One setting for everything.** A slot appearing at :26 appears at :26 for every client, so this is set once and applies everywhere, rather than fifty times.
+- **It still varies.** Inside a window the gap is a random 6–10 seconds, not a metronome tick at exactly 8. A perfectly regular beat is the thing most likely to be noticed.
+
+**The part that matters most:** it counts. Every check is recorded as inside or outside a window, and the menu shows the comparison:
+
+```
+in windows: 3 finds / 48 checks (6.25%)
+outside:    11 finds / 2104 checks (0.52%)
+```
+
+After a few weeks that tells you whether :26 is real **for your consulates** — or that the real minute is different, or that it is noise. Without it you would be inheriting someone else's guess and never finding out.
+
+**What it costs:** a 2-minute window at about 8 seconds makes roughly 15 checks where the normal pace makes 10. Two windows is about 11 extra checks an hour per running client. Modest — but it is more traffic at the busiest minute, and your logs already show the website saying *"The system is processing too many requests."* If that gets worse after turning this on, that is the cause.
+
+**Tested:** 17 checks on the timing (windows hit on the right minutes, every hour, and a window set to run past the hour — ":58 for 5 minutes" correctly covers :58 to :02), and 6 on the pace itself, including 2,000 gaps with the feature off to prove it is byte-for-byte the old 10–15 seconds, 2,000 with it on to prove the faster range still varies rather than ticking, and that "enabled but no windows set" behaves as off. All 23 passing. Not yet run against the live site.
+
+---
+
 ## 2026-11-25 — Say which dates a client cannot take, and how much notice they need (Issue #94)
 
 **What it does:** A collapsible **Date rules** section in the booking panel — the panel that appears on the visa site once a client is logged in, next to the date range and locations.

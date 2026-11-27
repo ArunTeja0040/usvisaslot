@@ -37,7 +37,100 @@
   // boxes in the booking panel (default 10-15s). Random (not a flat interval)
   // keeps the cadence from looking like a metronome. Used for both the city-to-
   // city gap in sequential and the between-batch gap in parallel.
+  // ─── #95 RELEASE WINDOWS ─────────────────────────────────────────
+  //
+  // Check faster during minutes the operator chooses, normal pace otherwise.
+  // Nothing is hardcoded: the minutes, the durations and the faster rate are
+  // all settings. 26 and 56 appear only as placeholder text, because that is
+  // what a competitor on this portal ships as their default — a starting guess
+  // to test, not a fact to build in.
+  //
+  // Global rather than per-client: a slot dropping at :26 drops at :26 for
+  // everyone, so this belongs to the portal, not to a client.
+  //
+  // Cached in module state because randomGapMs() is the hot path and must not
+  // touch storage on every gap.
+  let __relWin = { enabled: false, windows: [], fastLo: 6, fastHi: 10 };
+
+  function loadReleaseWindows() {
+    try {
+      chrome.storage.local.get(["__abReleaseWindows"], (d) => {
+        const r = (d && d.__abReleaseWindows) || {};
+        const wins = (Array.isArray(r.windows) ? r.windows : [])
+          .map((w) => ({
+            startMinute: Math.floor(Number(w && w.startMinute)),
+            durationMinutes: Math.floor(Number(w && w.durationMinutes)),
+          }))
+          // A window with no usable minute or duration is simply off.
+          .filter((w) => Number.isFinite(w.startMinute) && w.startMinute >= 0 && w.startMinute <= 59 &&
+                         Number.isFinite(w.durationMinutes) && w.durationMinutes >= 1);
+        let lo = Math.max(2, Math.floor(Number(r.fastLo) || 6));
+        let hi = Math.max(2, Math.floor(Number(r.fastHi) || 10));
+        if (hi < lo) { const t = lo; lo = hi; hi = t; }
+        __relWin = { enabled: r.enabled === true && wins.length > 0, windows: wins, fastLo: lo, fastHi: hi };
+        if (__relWin.enabled) {
+          log("[window] release windows on — " +
+              wins.map((w) => ":" + String(w.startMinute).padStart(2, "0") + " for " + w.durationMinutes + "m").join(", ") +
+              " at " + lo + "-" + hi + "s");
+        }
+      });
+    } catch (e) { /* storage unavailable: stay off, which is the old behaviour */ }
+  }
+
+  // Which window we are inside, or null. A window may run past the hour
+  // (":58 for 5 minutes"), so the offset is taken modulo the hour and wrapped
+  // rather than compared on the minute hand alone.
+  function currentReleaseWindow(now) {
+    if (!__relWin.enabled) return null;
+    const d = now || new Date();
+    const minuteOfHour = d.getMinutes();
+    for (const w of __relWin.windows) {
+      const offset = ((minuteOfHour - w.startMinute) + 60) % 60;
+      if (offset < w.durationMinutes) return w;
+    }
+    return null;
+  }
+
+  // Tags each check, so the dashboard can later say whether slots really do
+  // cluster in these windows. Without that we would inherit a competitor's
+  // guess and never find out whether it holds for our consulates.
+  function inReleaseWindow() { return currentReleaseWindow() !== null; }
+
+  // Running tallies, kept in storage so they survive the reloads the keep-alive
+  // performs and can be read by the dashboard.
+  function bumpWindowStat(field) {
+    try {
+      chrome.storage.local.get(["__abWindowStats"], (d) => {
+        const t = (d && d.__abWindowStats) ||
+          { inChecks: 0, outChecks: 0, inSlots: 0, outSlots: 0, since: new Date().toISOString() };
+        t[field] = (t[field] || 0) + 1;
+        chrome.storage.local.set({ __abWindowStats: t });
+      });
+    } catch (e) {}
+  }
+
+  function noteReleaseWindowCheck(inside) { bumpWindowStat(inside ? "inChecks" : "outChecks"); }
+
+  // Called when a check actually turns up a date, so the dashboard can show
+  // finds per check inside versus outside — the only figure that settles it.
+  function noteReleaseWindowSlot() { bumpWindowStat(inReleaseWindow() ? "inSlots" : "outSlots"); }
+
+  // Load once, and again whenever the dashboard changes the setting, so a
+  // change takes effect on the next gap rather than needing a page reload.
+  loadReleaseWindows();
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === "local" && changes.__abReleaseWindows) loadReleaseWindows();
+    });
+  } catch (e) { /* no storage events: the cached value simply stands */ }
+
   function gapBoundsMs() {
+    // #95 Inside a release window the operator's faster pair replaces the
+    // normal one. Still a RANGE, not a fixed number: the gap is random on
+    // purpose so the cadence is not a metronome, and a window ticking at
+    // exactly 8.000s would undo that.
+    if (currentReleaseWindow()) return { lo: __relWin.fastLo * 1000, hi: __relWin.fastHi * 1000 };
+
     let lo = parseInt(document.getElementById("ab-gap-min")?.value || "10", 10) || 10;
     let hi = parseInt(document.getElementById("ab-gap-max")?.value || "15", 10) || 15;
     if (hi < lo) { const t = lo; lo = hi; hi = t; }   // tolerate swapped entry
@@ -535,6 +628,7 @@
   // (same format the sequential path uses). dates = array of "YYYY-MM-DD" strings.
   function sendSlotsOverview(cityName, dates, startDate, endDate, cityValue) {
     if (!dates || !dates.length) return;
+    noteReleaseWindowSlot();        // #95 a check that turned up dates
     const inRange = dates.filter((d) => isDateInRange(d, startDate, endDate)).sort();
     const outOfRange = dates.filter((d) => !isDateInRange(d, startDate, endDate)).sort();
     // #77 A resting date is still listed by the site but is not being grabbed
@@ -2915,6 +3009,11 @@
     const now = Date.now();
     rateTracker.window.push(now);
     rateTracker.totalRequests++;
+    // #95 Count every successful check as inside or outside a release window.
+    // This is the point of the feature being measurable: without it we would
+    // inherit a competitor's guess about :26 and :56 and never learn whether it
+    // holds for our consulates.
+    if (success) noteReleaseWindowCheck(inReleaseWindow());
     if (success) rateTracker.successfulRequests++;
     else rateTracker.blockedRequests++;
     if (delaySec != null) rateTracker.delays.push(delaySec);
