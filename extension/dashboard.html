@@ -40,6 +40,21 @@
           <button id="export-csv-btn" class="btn btn-small">Export CSV</button>
           <button id="import-btn" class="btn btn-small">Import JSON</button>
           <input type="file" id="import-file" accept=".json" style="display:none">
+          <!-- #95 Global, not per-client: a slot dropping at :26 drops at :26
+               for everyone, so this belongs to the portal rather than to a
+               client. Scanning only — a login sweep in the same minute would
+               compete with the hunting it is meant to help. -->
+          <div class="menu-label">RELEASE WINDOWS</div>
+          <label class="menu-check"><input type="checkbox" id="rw-enabled"> Check faster at set minutes</label>
+          <div id="rw-body" class="rw-body">
+            <div class="rw-row"><span>at min</span><input type="number" id="rw-m1" min="0" max="59" placeholder="26"><span>for</span><input type="number" id="rw-d1" min="1" max="60" placeholder="2"><span>min</span></div>
+            <div class="rw-row"><span>at min</span><input type="number" id="rw-m2" min="0" max="59" placeholder="56"><span>for</span><input type="number" id="rw-d2" min="1" max="60" placeholder="2"><span>min</span></div>
+            <div class="rw-row"><span>at min</span><input type="number" id="rw-m3" min="0" max="59" placeholder="—"><span>for</span><input type="number" id="rw-d3" min="1" max="60" placeholder="—"><span>min</span></div>
+            <div class="rw-row"><span>at min</span><input type="number" id="rw-m4" min="0" max="59" placeholder="—"><span>for</span><input type="number" id="rw-d4" min="1" max="60" placeholder="—"><span>min</span></div>
+            <div class="rw-row"><span>every</span><input type="number" id="rw-lo" min="2" max="300" placeholder="6"><span>–</span><input type="number" id="rw-hi" min="2" max="300" placeholder="10"><span>sec inside</span></div>
+            <div id="rw-note" class="rw-note"></div>
+            <div id="rw-stats" class="rw-note"></div>
+          </div>
           <div class="menu-label">GOOGLE SHEET</div>
           <a id="sheets-link" href="#" target="_blank" rel="noreferrer" style="display:none;" class="btn btn-small">Open sheet</a>
           <input type="text" id="sheets-url-input" placeholder="Paste Google Sheet URL (optional)" style="display:none;">
@@ -472,6 +487,22 @@
           <div><label>Start Date</label><input type="date" id="edit-start-date"></div>
           <div><label>End Date</label><input type="date" id="edit-end-date"></div>
         </div>
+        <!-- #94 The same two rules as the booking panel, reachable from here
+             too. One saved value; whichever surface you use, both show it. -->
+        <div class="form-row two-col">
+          <div>
+            <label>Excluded dates</label>
+            <input type="text" id="edit-excluded-dates" placeholder="15 Dec 26, 20-23 Dec 26"
+                   title="Days this client cannot take, even if a slot appears.">
+            <div id="edit-excluded-echo" class="field-echo"></div>
+          </div>
+          <div>
+            <label>Minimum notice (days)</label>
+            <input type="number" id="edit-min-notice" min="0" step="1" placeholder="0"
+                   title="Ignore slots sooner than this many days from today.">
+            <div id="edit-min-notice-echo" class="field-echo"></div>
+          </div>
+        </div>
         <div class="form-row">
           <label>Locations</label>
           <div id="edit-locations" class="edit-locations">
@@ -515,6 +546,7 @@
   <script src="js/supabase-sync.js"></script>
   <script src="js/sheets-sync.js"></script>
   <script src="js/ui-kit.js"></script>
+  <script src="js/date-rules.js"></script>
   <script src="js/dashboard.js"></script>
 </body>
 </html>

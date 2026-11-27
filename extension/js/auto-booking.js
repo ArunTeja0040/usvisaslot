@@ -1,13 +1,13 @@
 (function () {
   "use strict";
 
-  const LOG_PREFIX = "[AutoBook]";
+  const LOG_PREFIX = "[AutoBook-DATES]";
   // ─── TEST MODE ──────────────────────────────────────────────────
   // This is the TEST build (feature/parallel-booking worktree).
   // - Telegram messages prefixed [TEST]
   // - Auto-submit FORCED OFF during detection-stage testing (protect real client)
   // - Device name auto-prefixed TEST- so dashboard can filter test noise
-  const TEST_MODE = false;
+  const TEST_MODE = true;
   const TEST_FORCE_NO_SUBMIT = false; // #40 LIVE: real submit enabled (was true = dry-run)
   // ─── PARALLEL SCAN config (A3) ──
   const USE_PARALLEL_SCAN = true;     // after template captured, replace sequential per-city loop
@@ -37,7 +37,100 @@
   // boxes in the booking panel (default 10-15s). Random (not a flat interval)
   // keeps the cadence from looking like a metronome. Used for both the city-to-
   // city gap in sequential and the between-batch gap in parallel.
+  // ─── #95 RELEASE WINDOWS ─────────────────────────────────────────
+  //
+  // Check faster during minutes the operator chooses, normal pace otherwise.
+  // Nothing is hardcoded: the minutes, the durations and the faster rate are
+  // all settings. 26 and 56 appear only as placeholder text, because that is
+  // what a competitor on this portal ships as their default — a starting guess
+  // to test, not a fact to build in.
+  //
+  // Global rather than per-client: a slot dropping at :26 drops at :26 for
+  // everyone, so this belongs to the portal, not to a client.
+  //
+  // Cached in module state because randomGapMs() is the hot path and must not
+  // touch storage on every gap.
+  let __relWin = { enabled: false, windows: [], fastLo: 6, fastHi: 10 };
+
+  function loadReleaseWindows() {
+    try {
+      chrome.storage.local.get(["__abReleaseWindows"], (d) => {
+        const r = (d && d.__abReleaseWindows) || {};
+        const wins = (Array.isArray(r.windows) ? r.windows : [])
+          .map((w) => ({
+            startMinute: Math.floor(Number(w && w.startMinute)),
+            durationMinutes: Math.floor(Number(w && w.durationMinutes)),
+          }))
+          // A window with no usable minute or duration is simply off.
+          .filter((w) => Number.isFinite(w.startMinute) && w.startMinute >= 0 && w.startMinute <= 59 &&
+                         Number.isFinite(w.durationMinutes) && w.durationMinutes >= 1);
+        let lo = Math.max(2, Math.floor(Number(r.fastLo) || 6));
+        let hi = Math.max(2, Math.floor(Number(r.fastHi) || 10));
+        if (hi < lo) { const t = lo; lo = hi; hi = t; }
+        __relWin = { enabled: r.enabled === true && wins.length > 0, windows: wins, fastLo: lo, fastHi: hi };
+        if (__relWin.enabled) {
+          log("[window] release windows on — " +
+              wins.map((w) => ":" + String(w.startMinute).padStart(2, "0") + " for " + w.durationMinutes + "m").join(", ") +
+              " at " + lo + "-" + hi + "s");
+        }
+      });
+    } catch (e) { /* storage unavailable: stay off, which is the old behaviour */ }
+  }
+
+  // Which window we are inside, or null. A window may run past the hour
+  // (":58 for 5 minutes"), so the offset is taken modulo the hour and wrapped
+  // rather than compared on the minute hand alone.
+  function currentReleaseWindow(now) {
+    if (!__relWin.enabled) return null;
+    const d = now || new Date();
+    const minuteOfHour = d.getMinutes();
+    for (const w of __relWin.windows) {
+      const offset = ((minuteOfHour - w.startMinute) + 60) % 60;
+      if (offset < w.durationMinutes) return w;
+    }
+    return null;
+  }
+
+  // Tags each check, so the dashboard can later say whether slots really do
+  // cluster in these windows. Without that we would inherit a competitor's
+  // guess and never find out whether it holds for our consulates.
+  function inReleaseWindow() { return currentReleaseWindow() !== null; }
+
+  // Running tallies, kept in storage so they survive the reloads the keep-alive
+  // performs and can be read by the dashboard.
+  function bumpWindowStat(field) {
+    try {
+      chrome.storage.local.get(["__abWindowStats"], (d) => {
+        const t = (d && d.__abWindowStats) ||
+          { inChecks: 0, outChecks: 0, inSlots: 0, outSlots: 0, since: new Date().toISOString() };
+        t[field] = (t[field] || 0) + 1;
+        chrome.storage.local.set({ __abWindowStats: t });
+      });
+    } catch (e) {}
+  }
+
+  function noteReleaseWindowCheck(inside) { bumpWindowStat(inside ? "inChecks" : "outChecks"); }
+
+  // Called when a check actually turns up a date, so the dashboard can show
+  // finds per check inside versus outside — the only figure that settles it.
+  function noteReleaseWindowSlot() { bumpWindowStat(inReleaseWindow() ? "inSlots" : "outSlots"); }
+
+  // Load once, and again whenever the dashboard changes the setting, so a
+  // change takes effect on the next gap rather than needing a page reload.
+  loadReleaseWindows();
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === "local" && changes.__abReleaseWindows) loadReleaseWindows();
+    });
+  } catch (e) { /* no storage events: the cached value simply stands */ }
+
   function gapBoundsMs() {
+    // #95 Inside a release window the operator's faster pair replaces the
+    // normal one. Still a RANGE, not a fixed number: the gap is random on
+    // purpose so the cadence is not a metronome, and a window ticking at
+    // exactly 8.000s would undo that.
+    if (currentReleaseWindow()) return { lo: __relWin.fastLo * 1000, hi: __relWin.fastHi * 1000 };
+
     let lo = parseInt(document.getElementById("ab-gap-min")?.value || "10", 10) || 10;
     let hi = parseInt(document.getElementById("ab-gap-max")?.value || "15", 10) || 15;
     if (hi < lo) { const t = lo; lo = hi; hi = t; }   // tolerate swapped entry
@@ -535,6 +628,7 @@
   // (same format the sequential path uses). dates = array of "YYYY-MM-DD" strings.
   function sendSlotsOverview(cityName, dates, startDate, endDate, cityValue) {
     if (!dates || !dates.length) return;
+    noteReleaseWindowSlot();        // #95 a check that turned up dates
     const inRange = dates.filter((d) => isDateInRange(d, startDate, endDate)).sort();
     const outOfRange = dates.filter((d) => !isDateInRange(d, startDate, endDate)).sort();
     // #77 A resting date is still listed by the site but is not being grabbed
@@ -545,14 +639,25 @@
       ? inRange.filter((ds) => isSlotPaused(cityValue, ds))
       : [];
     const pausedSet = new Set(paused);
+    // #94 Same reasoning as the resting marker above, for the client's own date
+    // rules. A date the client cannot take is still listed by the site, so show
+    // it and say why rather than dropping it — otherwise "was there anything on
+    // the 18th?" has no answer, and a silently missing date looks like the bot
+    // missed it rather than correctly refused it.
+    const refusedSet = new Map();
+    inRange.forEach((ds) => {
+      const why = dateRefusalReason(ds, startDate, endDate);
+      if (why && why !== "out of range") refusedSet.set(ds, why);
+    });
     const byMonth = (arr) => {
       const m = {};
       arr.forEach((ds) => {
         const date = new Date(ds + "T00:00:00");
         const key = date.toLocaleString("en-US", { month: "long", year: "numeric" });
         const day = date.getDate();
-        // Keep the number for sorting; the label carries the resting marker.
-        (m[key] = m[key] || []).push({ day, label: pausedSet.has(ds) ? `${day}⏸️` : String(day) });
+        // Keep the number for sorting; the label carries the markers.
+        const mark = refusedSet.has(ds) ? "🚫" : pausedSet.has(ds) ? "⏸️" : "";
+        (m[key] = m[key] || []).push({ day, label: `${day}${mark}` });
       });
       return Object.entries(m)
         .map(([mo, days]) =>
@@ -2386,6 +2491,101 @@
   // sweep sat on that client until the dashboard's SWEEP_STUCK_MS fired.
   //
   // So: own the page here, loop in place for the retry, and always finish.
+  // #94 Panel wiring: fill the fields from the client, echo what was typed,
+  // and save it back so it is still there next run and on the other machines.
+  function abRulesSummary() {
+    const n = __dateRules.excluded.size, d = __dateRules.minNoticeDays;
+    const bits = [];
+    if (n) bits.push(n + " excluded");
+    if (d) bits.push(d + "d notice");
+    return bits.length ? "— " + bits.join(", ") : "— none set";
+  }
+
+  function abUpdateRuleEchoes() {
+    const ex = document.getElementById("ab-excluded");
+    const exEcho = document.getElementById("ab-excluded-echo");
+    if (ex && exEcho) {
+      const raw = ex.value.trim();
+      if (!raw) { exEcho.textContent = ""; exEcho.style.color = "#777"; }
+      else {
+        const r = abParseExcluded(raw);
+        const shown = r.dates.slice(0, 6).map(abFmtDate).join(", ");
+        const more = r.dates.length > 6 ? " +" + (r.dates.length - 6) + " more" : "";
+        if (r.bad.length) {
+          exEcho.style.color = "#b9770e";
+          exEcho.textContent = "Could not read: " + r.bad.join(", ") +
+            (r.dates.length ? " · reading " + r.dates.length + ": " + shown + more : "");
+        } else {
+          exEcho.style.color = "#1e8449";
+          exEcho.textContent = r.dates.length + " day(s) excluded: " + shown + more;
+        }
+      }
+    }
+    const mn = document.getElementById("ab-min-notice");
+    const mnEcho = document.getElementById("ab-min-notice-echo");
+    if (mn && mnEcho) {
+      const n = Math.floor(Number(mn.value) || 0);
+      if (n <= 0) { mnEcho.textContent = ""; mnEcho.style.color = "#777"; }
+      else {
+        const from = new Date(); from.setHours(0, 0, 0, 0); from.setDate(from.getDate() + n);
+        const fromISO = from.getFullYear() + "-" + String(from.getMonth() + 1).padStart(2, "0") +
+                        "-" + String(from.getDate()).padStart(2, "0");
+        // Warn here rather than letting the bot hunt a window that has closed.
+        const endVal = String(document.getElementById("ab-end-date")?.value || "").trim();
+        if (endVal && fromISO > endVal) {
+          mnEcho.style.color = "#b9770e";
+          mnEcho.textContent = "Nothing before " + abFmtDate(fromISO) + " — but the window ends " +
+                               abFmtDate(endVal) + ", so no date can be booked";
+        } else {
+          mnEcho.style.color = "#1e8449";
+          mnEcho.textContent = "Nothing before " + abFmtDate(fromISO);
+        }
+      }
+    }
+    const sum = document.getElementById("ab-rules-summary");
+    if (sum) sum.textContent = abRulesSummary();
+  }
+
+  // Applies what is typed to the live rules, saves it to the client, and keeps
+  // it in the cycling state so the keep-alive page reload does not lose it.
+  async function abSaveRules() {
+    const exRaw = document.getElementById("ab-excluded")?.value || "";
+    const parsed = abParseExcluded(exRaw);
+    const notice = Math.max(0, Math.floor(Number(document.getElementById("ab-min-notice")?.value) || 0));
+
+    loadDateRules({ excludedDates: parsed.dates, minimumNoticeDays: notice });
+    abUpdateRuleEchoes();
+
+    const d = await new Promise((r) => chrome.storage.local.get(["loginDetails", "userProfilesList"], r));
+    const username = d.loginDetails?.username;
+    const profiles = d.userProfilesList || [];
+    const prof = username ? profiles.find((x) => x.username === username) : null;
+    if (!prof) return;
+    prof.excludedDates = parsed.dates;
+    prof.minimumNoticeDays = notice;
+    await new Promise((r) => chrome.storage.local.set({ userProfilesList: profiles }, r));
+    if (SUPABASE_ENABLED && SupabaseSync.isReady()) {
+      try { SupabaseSync.pushProfile(prof); } catch (e) { /* offline is fine; local stands */ }
+    }
+    log(`[dates] rules saved for ${username} — ${parsed.dates.length} excluded, ${notice}d notice`);
+  }
+
+  function abWireRuleFields(profile) {
+    const ex = document.getElementById("ab-excluded");
+    const mn = document.getElementById("ab-min-notice");
+    if (!ex || !mn) return;
+    ex.value = (profile && Array.isArray(profile.excludedDates) ? profile.excludedDates : []).map(abFmtDate).join(", ");
+    mn.value = (profile && profile.minimumNoticeDays) || "";
+    abUpdateRuleEchoes();
+    // Echo as they type; save when they leave the field, so a half-typed date
+    // is never written.
+    ex.addEventListener("input", abUpdateRuleEchoes);
+    mn.addEventListener("input", abUpdateRuleEchoes);
+    ex.addEventListener("change", abSaveRules);
+    mn.addEventListener("change", abSaveRules);
+    document.getElementById("ab-end-date")?.addEventListener("change", abUpdateRuleEchoes);
+  }
+
   async function handleVerifySecurityQuestions(username) {
     if (window.__abVerifySecHandling) return;   // router and watcher can both arrive
     window.__abVerifySecHandling = true;
@@ -2809,6 +3009,11 @@
     const now = Date.now();
     rateTracker.window.push(now);
     rateTracker.totalRequests++;
+    // #95 Count every successful check as inside or outside a release window.
+    // This is the point of the feature being measurable: without it we would
+    // inherit a competitor's guess about :26 and :56 and never learn whether it
+    // holds for our consulates.
+    if (success) noteReleaseWindowCheck(inReleaseWindow());
     if (success) rateTracker.successfulRequests++;
     else rateTracker.blockedRequests++;
     if (delaySec != null) rateTracker.delays.push(delaySec);
@@ -2926,6 +3131,26 @@
                    style="width:52px;padding:4px 6px;border:1px solid #ccc;border-radius:4px;">
           </label>
         </div>
+          <!-- #94 Collapsed by default: set once per client and then left
+               alone, so it must not crowd the panel during a live run. -->
+          <details id="ab-rules" style="margin-bottom:12px;border:1px solid #e0e0e0;border-radius:5px;padding:6px 10px;background:#fafafa;">
+            <summary style="font-size:13px;font-weight:600;cursor:pointer;color:#1a5276;">Date rules <span id="ab-rules-summary" style="font-weight:400;color:#777;"></span></summary>
+            <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start;margin-top:8px;">
+              <label style="font-size:12px;font-weight:600;">Excluded dates
+                <input type="text" id="ab-excluded" placeholder="15 Dec 26, 20-23 Dec 26"
+                       title="Days this client cannot take, even if a slot appears."
+                       style="display:block;width:260px;margin-top:3px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-weight:400;">
+                <div id="ab-excluded-echo" style="font-size:11px;margin-top:3px;min-height:13px;color:#777;font-weight:400;"></div>
+              </label>
+              <label style="font-size:12px;font-weight:600;">Min. notice (days)
+                <input type="number" id="ab-min-notice" min="0" step="1" placeholder="0"
+                       title="Ignore slots sooner than this many days from today."
+                       style="display:block;width:90px;margin-top:3px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-weight:400;">
+                <div id="ab-min-notice-echo" style="font-size:11px;margin-top:3px;min-height:13px;color:#777;font-weight:400;"></div>
+              </label>
+            </div>
+            <div style="font-size:11px;color:#888;margin-top:6px;">Saved to this client \u2014 still here next run, and on your other machines.</div>
+          </details>
         <div style="margin-bottom:12px;">
           <strong style="font-size:13px;">Locations: </strong>
           ${checkboxesHTML}
@@ -2999,6 +3224,10 @@
               );
             });
           }
+          // #94 Same profile the dates come from, so the rules can never be
+          // out of step with the window they narrow.
+          loadDateRules(profile);
+          abWireRuleFields(profile);
           log("Booking panel auto-populated from profile: " + (profile.name || activeUser));
         }
       }
@@ -4526,7 +4755,7 @@
           const daysData = await daysPromise;
           // Re-check this city's in-range dates from the fresh data.
           const fresh = (daysData && Array.isArray(daysData.ScheduleDays)) ? daysData.ScheduleDays.map((d) => d.Date) : [];
-          const inRange = fresh.filter((d) => isDateInRange(d, startDate, endDate)).sort();
+          const inRange = fresh.filter((d) => isDateBookable(d, startDate, endDate)).sort();   // #94 rules, not just the window
           if (!inRange.length) { resumeScan = true; log(`[fastgrab] no in-range date left at ${cityName} — back to scanning`); break; }
           targetDate = inRange[0];
         } else {
@@ -5050,7 +5279,7 @@
       const startDate = document.getElementById("ab-start-date")?.value || "";
       const endDate = document.getElementById("ab-end-date")?.value || "";
       const all = Array.isArray(dates) ? dates.slice().sort() : [];
-      const inSet = new Set(all.filter((d) => isDateInRange(d, startDate, endDate)));
+      const inSet = new Set(all.filter((d) => isDateBookable(d, startDate, endDate)));   // #94 live availability, so it must match what we would take
 
       // Group by month, keeping in-range days visually distinct.
       const months = {};
@@ -5197,6 +5426,66 @@
     if (startStr && d < new Date(startStr + "T00:00:00")) return false;
     if (endStr && d > new Date(endStr + "T00:00:00")) return false;
     return true;
+  }
+
+  // ─── #94 PER-CLIENT DATE RULES ───────────────────────────────────
+  //
+  // The window was only ever a start and an end date, so the bot would take a
+  // slot while the client was abroad, or three days out when they need two
+  // weeks to arrange travel. Two optional rules now narrow it further.
+  //
+  // Held in module state rather than read per call: the booking path takes its
+  // dates from the panel's DOM inputs, not from a profile object, and the hot
+  // path must not hit storage once per candidate date.
+  let __dateRules = { excluded: new Set(), minNoticeDays: 0 };
+
+  // Loaded when the booking panel is populated, from the same profile the
+  // dates come from. Absent fields mean "no rule", so a client without them —
+  // or a Supabase project that has not run sql/06-date-rules.sql — behaves
+  // exactly as before.
+  function loadDateRules(profile) {
+    const list = Array.isArray(profile && profile.excludedDates) ? profile.excludedDates : [];
+    const n = Number(profile && profile.minimumNoticeDays);
+    __dateRules = {
+      excluded: new Set(list.filter((s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || "").trim()))),
+      minNoticeDays: Number.isFinite(n) && n > 0 ? Math.floor(n) : 0,
+    };
+    if (__dateRules.excluded.size || __dateRules.minNoticeDays) {
+      log(`[dates] rules loaded — ${__dateRules.excluded.size} excluded date(s), ` +
+          `${__dateRules.minNoticeDays} day(s) minimum notice`);
+    }
+    return __dateRules;
+  }
+
+  // #94 Parsing lives in js/date-rules.js, shared with the dashboard's Edit
+  // dialog so both surfaces read "20-23 Dec 26" the same way. Loaded before
+  // this file by the manifest.
+  const abParseExcluded = (raw) => window.ABDateRules.parseExcluded(raw);
+  const abFmtDate = (iso) => window.ABDateRules.fmt(iso);
+
+  // Why a date was refused, or "" when it is bookable. Separate from the
+  // boolean so the overview can say "excluded" rather than silently dropping a
+  // date the operator will ask about later.
+  function dateRefusalReason(dateStr, startStr, endStr) {
+    if (!isDateInRange(dateStr, startStr, endStr)) return "out of range";
+    if (__dateRules.excluded.has(dateStr)) return "excluded";
+    if (__dateRules.minNoticeDays > 0) {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const d = new Date(dateStr + "T00:00:00");
+      const days = Math.round((d - today) / 86400000);
+      if (days < __dateRules.minNoticeDays) return `needs ${__dateRules.minNoticeDays}d notice`;
+    }
+    return "";
+  }
+
+  // THE single gate. Every place that decides whether a date may be taken goes
+  // through this, never through isDateInRange directly — a rule applied in nine
+  // of ten places shows a date as available and then refuses it at booking, or
+  // takes one it should not. isDateInRange stays the pure range test it is, for
+  // the places that genuinely only mean "inside the window".
+  function isDateBookable(dateStr, startStr, endStr) {
+    return dateRefusalReason(dateStr, startStr, endStr) === "";
   }
 
   async function selectDateInCalendar(dateObj, timeout = 10000) {
@@ -5600,7 +5889,7 @@
             sendSlotsOverview(r.name, r.dates, startDate, endDate, pid); // availability ping — every parallel round
             // First in-range date wins (user choice: grab first detected)
             if (!grabCity) {
-              const inRange = r.dates.filter((d) => isDateInRange(d, startDate, endDate) && !isSlotPaused(pid, d)).sort();
+              const inRange = r.dates.filter((d) => isDateBookable(d, startDate, endDate) && !isSlotPaused(pid, d)).sort();   // #94
               if (inRange.length) { grabCity = { value: pid, name: r.name }; grabDate = inRange[0]; }
             }
           } else {
@@ -5865,11 +6154,11 @@
 
       // Separate in-range and out-of-range dates
       const inRange = data.ScheduleDays.filter((d) =>
-        isDateInRange(d.Date, startDate, endDate)
+        isDateBookable(d.Date, startDate, endDate)   // #94
       ).sort((a, b) => new Date(a.Date) - new Date(b.Date));
 
       const outOfRange = data.ScheduleDays.filter((d) =>
-        !isDateInRange(d.Date, startDate, endDate)
+        !isDateBookable(d.Date, startDate, endDate)   // #94 complement of the above — the two must agree
       ).sort((a, b) => new Date(a.Date) - new Date(b.Date));
 
       // Group by month (in-range)

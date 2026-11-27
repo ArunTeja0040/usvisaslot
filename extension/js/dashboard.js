@@ -168,6 +168,101 @@
   const agreedOf = (p) => Math.max(0, Number(p.agreedPrice) || 0);
   const balanceOf = (p) => Math.max(0, agreedOf(p) - paidOf(p));
 
+  // #94 Used by the no-bookable-dates warning below. The fields themselves now
+  // live in the booking panel, so the parsing lives there too.
+  const MON_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  function fmtEchoDate(iso) {
+    const d = new Date(iso + "T00:00:00Z");
+    return d.getUTCDate() + " " + MON_ABBR[d.getUTCMonth()] + " " + String(d.getUTCFullYear()).slice(2);
+  }
+
+  // #94 The Edit dialog's own echo for the same two rules the booking panel
+  // sets. Parsing comes from js/date-rules.js, loaded before this file, so the
+  // two surfaces can never disagree about what "20-23 Dec 26" means.
+  function updateExcludedEcho() {
+    const input = document.getElementById("edit-excluded-dates");
+    const echo = document.getElementById("edit-excluded-echo");
+    if (!input || !echo) return;
+    const raw = input.value.trim();
+    if (!raw) { echo.textContent = ""; echo.className = "field-echo"; return; }
+    const r = window.ABDateRules.parseExcluded(raw);
+    const shown = r.dates.slice(0, 8).map(fmtEchoDate).join(", ");
+    const more = r.dates.length > 8 ? " +" + (r.dates.length - 8) + " more" : "";
+    if (r.bad.length) {
+      echo.className = "field-echo is-bad";
+      echo.textContent = "Could not read: " + r.bad.join(", ") +
+        (r.dates.length ? " · reading " + r.dates.length + " day(s): " + shown + more : "");
+    } else {
+      echo.className = "field-echo is-ok";
+      echo.textContent = r.dates.length + " day(s) excluded: " + shown + more;
+    }
+  }
+
+  function updateNoticeEcho() {
+    const input = document.getElementById("edit-min-notice");
+    const echo = document.getElementById("edit-min-notice-echo");
+    if (!input || !echo) return;
+    const n = Math.floor(Number(input.value) || 0);
+    if (n <= 0) { echo.textContent = ""; echo.className = "field-echo"; return; }
+    const from = new Date(); from.setHours(0, 0, 0, 0); from.setDate(from.getDate() + n);
+    const fromISO = from.getFullYear() + "-" + String(from.getMonth() + 1).padStart(2, "0") +
+                    "-" + String(from.getDate()).padStart(2, "0");
+    // Warn at the point of entry when the notice period already runs past this
+    // client's end date, rather than letting the bot hunt a closed window.
+    const endVal = String(document.getElementById("edit-end-date")?.value || "").trim();
+    if (endVal && fromISO > endVal) {
+      echo.className = "field-echo is-bad";
+      echo.textContent = "Nothing before " + fmtEchoDate(fromISO) +
+        " — but the window ends " + fmtEchoDate(endVal) + ", so no date can be booked";
+      return;
+    }
+    echo.className = "field-echo is-ok";
+    echo.textContent = "Nothing before " + fmtEchoDate(fromISO);
+  }
+
+  // #94 Can this client still be booked at all?
+  //
+  // Minimum notice is measured from today and moves with it, so a window closes
+  // from both ends: a 1-week notice against a window ending 31 Dec leaves one
+  // usable day on 24 Dec and none on the 25th. Without this the bot would hunt
+  // that client for ever, finding slots and refusing every one, with nothing on
+  // screen saying why. Silent refusal is how the security-question freeze went
+  // unnoticed for weeks.
+  //
+  // Returns { blocked, reason } — blocked only when we are certain nothing can
+  // be taken, never on a guess.
+  function dateRulesBlock(profile) {
+    if (!profile) return { blocked: false, reason: "" };
+    const notice = Math.max(0, Math.floor(Number(profile.minimumNoticeDays) || 0));
+    const excluded = new Set(Array.isArray(profile.excludedDates) ? profile.excludedDates : []);
+    const end = String(profile.endDate || "").trim();
+    if (!end) return { blocked: false, reason: "" };     // open-ended: never blocked
+
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const earliest = new Date(today); earliest.setDate(earliest.getDate() + notice);
+    const start = String(profile.startDate || "").trim();
+    const from = start && new Date(start + "T00:00:00") > earliest
+      ? new Date(start + "T00:00:00") : earliest;
+    const until = new Date(end + "T00:00:00");
+
+    const asISO = (d) => d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") +
+                         "-" + String(d.getDate()).padStart(2, "0");
+
+    if (from > until) {
+      return { blocked: true, reason: notice > 0
+        ? `${notice} day${notice === 1 ? "" : "s"}' notice means nothing before ${fmtEchoDate(asISO(from))}, but the window ends ${fmtEchoDate(end)}`
+        : `the window ended ${fmtEchoDate(end)}` };
+    }
+    if (excluded.size) {
+      for (let d = new Date(from); d <= until; d.setDate(d.getDate() + 1)) {
+        if (!excluded.has(asISO(d))) return { blocked: false, reason: "" };
+      }
+      return { blocked: true, reason: `every remaining day to ${fmtEchoDate(end)} is excluded` };
+    }
+    return { blocked: false, reason: "" };
+  }
+
+
   // True when the promised window has already finished. Almost always a
   // range that was stored with the wrong year on intake.
   function isRangeExpired(p) {
@@ -812,7 +907,15 @@
           ${checking ? `<div class="card-note note-checking">${CARD_ICON.device}<span><b>Checking login…</b> signing in to test the credentials.</span></div>` : ""}
           ${!checking && health && health.state !== "healthy" ? `<div class="card-note note-${health.state === "password_changed" || health.state === "security_mismatch" ? "block" : "half"}">${CARD_ICON.warn}<span><b>${esc(LOGIN_HEALTH_LABELS[health.state] || health.state)}</b>${health.detail ? " — " + esc(health.detail) : ""} <span class="note-when">checked ${timeAgo(health.checkedAt)}</span></span></div>` : ""}
           ${halfDone ? `<div class="card-note note-half">${CARD_ICON.warn}<span><b>${halves.ofc ? "OFC done" : "Consular done"}</b> — ${halves.ofc ? "consular interview" : "OFC"} still to book.</span></div>` : ""}
-          ${/* #93 Order follows how a client is actually read: when they want to
+
+          ${(() => {
+            // #94 Nothing can be booked for this client any more. Say so rather
+            // than hunting silently for a date that cannot exist.
+            const blk = dateRulesBlock(profile);
+            return blk.blocked
+              ? `<div class="card-note note-block">${CARD_ICON.warn}<span><b>No bookable dates left</b> — ${esc(blk.reason)}.</span></div>`
+              : "";
+          })()}          ${/* #93 Order follows how a client is actually read: when they want to
                 go, where we are hunting, who is applying, then the money. DATES
                 and the locations each take a full row of the grid; the pairs
                 below them fall into the two columns as before. */ ""}
@@ -2860,6 +2963,107 @@
     refresh();
   });
 
+
+  // #94 Echo as they type; re-check when either date moves, since changing the
+  // window can turn a fine notice period into an impossible one.
+  document.getElementById("edit-excluded-dates")?.addEventListener("input", updateExcludedEcho);
+  document.getElementById("edit-min-notice")?.addEventListener("input", updateNoticeEcho);
+  document.getElementById("edit-end-date")?.addEventListener("change", updateNoticeEcho);
+  document.getElementById("edit-start-date")?.addEventListener("change", updateNoticeEcho);
+
+  // ─── #95 RELEASE WINDOWS ─────────────────────────────────────────
+  //
+  // Global, so it lives in the header menu rather than on a client. Nothing is
+  // hardcoded — 26 and 56 are placeholder text only, because that is what a
+  // competitor on this portal ships as their default. A starting guess to
+  // test, not a fact to build in.
+  const RW_IDS = [["rw-m1","rw-d1"],["rw-m2","rw-d2"],["rw-m3","rw-d3"],["rw-m4","rw-d4"]];
+
+  function rwRead() {
+    const windows = [];
+    RW_IDS.forEach(([mId, dId]) => {
+      const m = document.getElementById(mId)?.value.trim();
+      const d = document.getElementById(dId)?.value.trim();
+      if (m === "" || d === "") return;                 // a blank pair is simply off
+      const mi = Math.floor(Number(m)), du = Math.floor(Number(d));
+      if (!Number.isFinite(mi) || mi < 0 || mi > 59) return;
+      if (!Number.isFinite(du) || du < 1) return;
+      windows.push({ startMinute: mi, durationMinutes: du });
+    });
+    let lo = Math.max(2, Math.floor(Number(document.getElementById("rw-lo")?.value) || 6));
+    let hi = Math.max(2, Math.floor(Number(document.getElementById("rw-hi")?.value) || 10));
+    if (hi < lo) { const t = lo; lo = hi; hi = t; }
+    return { enabled: !!document.getElementById("rw-enabled")?.checked, windows, fastLo: lo, fastHi: hi };
+  }
+
+  function rwDescribe(cfg) {
+    const note = document.getElementById("rw-note");
+    if (!note) return;
+    document.getElementById("rw-body")?.classList.toggle("is-on", !!cfg.enabled);
+    if (!cfg.enabled) { note.textContent = ""; return; }
+    if (!cfg.windows.length) { note.textContent = "No windows set — nothing will change."; return; }
+    const mins = cfg.windows.reduce((n, w) => n + w.durationMinutes, 0);
+    note.textContent = cfg.windows.map((w) => ":" + String(w.startMinute).padStart(2, "0") + "–:" +
+      String((w.startMinute + w.durationMinutes) % 60).padStart(2, "0")).join(", ") +
+      " · " + mins + " min/hour at " + cfg.fastLo + "–" + cfg.fastHi + "s";
+  }
+
+  // The figure that settles whether those minutes are real for our consulates,
+  // rather than a number inherited from someone else's extension.
+  async function rwRenderStats() {
+    const el = document.getElementById("rw-stats");
+    if (!el) return;
+    const d = await new Promise((r) => chrome.storage.local.get(["__abWindowStats"], r));
+    const t = d.__abWindowStats;
+    if (!t || (!t.inChecks && !t.outChecks)) { el.textContent = ""; return; }
+    const rate = (slots, checks) => checks > 0 ? ((slots / checks) * 100).toFixed(2) + "%" : "—";
+    el.textContent =
+      "in windows: " + (t.inSlots || 0) + " finds / " + (t.inChecks || 0) + " checks (" + rate(t.inSlots || 0, t.inChecks || 0) + ")\n" +
+      "outside:    " + (t.outSlots || 0) + " finds / " + (t.outChecks || 0) + " checks (" + rate(t.outSlots || 0, t.outChecks || 0) + ")";
+    el.style.whiteSpace = "pre";
+  }
+
+  async function rwSave() {
+    const cfg = rwRead();
+    rwDescribe(cfg);
+    await new Promise((r) => chrome.storage.local.set({ __abReleaseWindows: cfg }, r));
+  }
+
+  async function rwLoad() {
+    const d = await new Promise((r) => chrome.storage.local.get(["__abReleaseWindows"], r));
+    const cfg = d.__abReleaseWindows || { enabled: false, windows: [], fastLo: 6, fastHi: 10 };
+    const en = document.getElementById("rw-enabled");
+    if (en) en.checked = !!cfg.enabled;
+    RW_IDS.forEach(([mId, dId], i) => {
+      const w = (cfg.windows || [])[i];
+      const m = document.getElementById(mId), dd = document.getElementById(dId);
+      if (m) m.value = w ? w.startMinute : "";
+      if (dd) dd.value = w ? w.durationMinutes : "";
+    });
+    const lo = document.getElementById("rw-lo"), hi = document.getElementById("rw-hi");
+    if (lo) lo.value = cfg.fastLo || "";
+    if (hi) hi.value = cfg.fastHi || "";
+    rwDescribe(cfg);
+    rwRenderStats();
+  }
+
+  document.getElementById("rw-enabled")?.addEventListener("change", async (e) => {
+    // Turning it ON asks once, because it genuinely increases portal traffic at
+    // the busiest minute. Turning it off never asks.
+    if (e.target.checked && !confirm(
+        "Check faster during these minutes?\n\n" +
+        "This sends more requests at the busiest point of the hour. The portal may " +
+        "answer with rate limits, waiting rooms or Cloudflare checks.\n\n" +
+        "If that starts happening, turn this off and it goes back to normal.")) {
+      e.target.checked = false;
+      return;
+    }
+    rwSave();
+  });
+  ["rw-m1","rw-d1","rw-m2","rw-d2","rw-m3","rw-d3","rw-m4","rw-d4","rw-lo","rw-hi"]
+    .forEach((id) => document.getElementById(id)?.addEventListener("change", rwSave));
+  rwLoad();
+
   document.getElementById("sweep-report-close")?.addEventListener("click", async () => {
     const sweep = await readSweep();
     if (sweep) { sweep.dismissed = true; await writeSweep(sweep); }
@@ -3042,6 +3246,13 @@
       document.getElementById("edit-price").value = profile.pricePerPerson || profile.agreedPrice || "";
       const paidField = document.getElementById("edit-paid");
       if (paidField) paidField.value = profile.paidAmount || "";
+      // #94 Same saved value the booking panel shows.
+      const exField = document.getElementById("edit-excluded-dates");
+      if (exField) exField.value = (profile.excludedDates || []).map(fmtEchoDate).join(", ");
+      const mnField = document.getElementById("edit-min-notice");
+      if (mnField) mnField.value = profile.minimumNoticeDays || "";
+      updateExcludedEcho();
+      updateNoticeEcho();
       calcTotalPrice();
 
       // Automation
@@ -3092,6 +3303,10 @@
       applicantCount: parseInt(document.getElementById("edit-applicants").value) || 1,
       pricePerPerson: document.getElementById("edit-price").value.trim(),
       paidAmount: Math.max(0, Math.round(Number(document.getElementById("edit-paid")?.value) || 0)),
+      // #94 Only what parsed cleanly is stored; anything unreadable was shown
+      // under the field before saving, so nothing is dropped silently.
+      excludedDates: window.ABDateRules.parseExcluded(document.getElementById("edit-excluded-dates")?.value).dates,
+      minimumNoticeDays: Math.max(0, Math.floor(Number(document.getElementById("edit-min-notice")?.value) || 0)),
       agreedPrice: String((parseInt(document.getElementById("edit-price").value) || 0) * (parseInt(document.getElementById("edit-applicants").value) || 1)),
       autoLogin: document.getElementById("edit-auto-login").checked,
       autoDashboard: document.getElementById("edit-auto-dashboard").checked,
@@ -3431,6 +3646,12 @@
     document.getElementById("edit-total-price").value = "";
     const paidReset = document.getElementById("edit-paid");
     if (paidReset) paidReset.value = "";
+    const exReset = document.getElementById("edit-excluded-dates");
+    if (exReset) exReset.value = "";
+    const mnReset = document.getElementById("edit-min-notice");
+    if (mnReset) mnReset.value = "";
+    updateExcludedEcho();
+    updateNoticeEcho();
     document.getElementById("edit-auto-login").checked = true;
     document.getElementById("edit-auto-dashboard").checked = true;
     document.getElementById("edit-auto-select").checked = true;

@@ -358,6 +358,12 @@ const SupabaseSync = (() => {
       // #90 Operator-set: "" normal, "booked", "not_required". Distinct from
       // `status`, which is the live automation state and changes by itself.
       service_state: profile.serviceState || null,
+      // #94 Normalised by the dashboard before it gets here, so the booking
+      // path never parses anything: an array of "YYYY-MM-DD", and whole days.
+      excluded_dates: Array.isArray(profile.excludedDates) && profile.excludedDates.length
+        ? profile.excludedDates : null,
+      minimum_notice_days: Number(profile.minimumNoticeDays) > 0
+        ? Math.floor(Number(profile.minimumNoticeDays)) : null,
     };
 
     // Security questions — local format is object { "question": "answer" }
@@ -420,6 +426,10 @@ const SupabaseSync = (() => {
           // which reads as "normal" — so an unmigrated project behaves exactly
           // as it did before.
           serviceState: p.service_state || "",
+          // #94 Empty on a project that has not run sql/06-date-rules.sql,
+          // which reads as "no rule" — so it behaves exactly as before.
+          excludedDates: Array.isArray(p.excluded_dates) ? p.excluded_dates : [],
+          minimumNoticeDays: Number(p.minimum_notice_days) > 0 ? Number(p.minimum_notice_days) : 0,
           // #85 Last login-check result, from whichever machine ran it. Null on
           // a project that has not had sql/04-login-health.sql applied yet; the
           // dashboard reads that as "no cloud result" and keeps using whatever

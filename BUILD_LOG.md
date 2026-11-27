@@ -12,6 +12,87 @@ Format:
 
 ---
 
+## 2026-11-28 — Tidy the Automation checkboxes in the Edit box
+
+**What it does:** The four Automation checkboxes — Auto-Login, Auto-Dashboard, Auto-Select, Auto-Submit — now sit in a neat two-by-two block, each tick next to its own label.
+
+**Why:** They were stacked one per line, with the tick box stranded on the left and its label pushed to the far right, wrapping mid-word as "Auto-" then "Login". Two styling rules were fighting: the one meant for a normal form row came later in the stylesheet and overruled the one meant for a row of tick boxes, stacking them vertically and stretching each tick box to the full width of the box.
+
+**What changed for you:** Only the appearance of those four. Nothing about what they do.
+
+---
+
+## 2026-11-28 — Check faster at minutes you choose (Issue #95)
+
+**What it does:** A new **Release windows** section in the dashboard's `⋯` menu. Pick up to four minutes past the hour, say how long each should last, and the bot checks faster during those minutes — normal pace the rest of the time.
+
+```
+☐ Check faster at set minutes
+   at min [26] for [2] min
+   at min [56] for [2] min
+   at min [  ] for [ ] min        ← blank = unused
+   at min [  ] for [ ] min
+   every [6]–[10] sec inside
+```
+
+**Why those numbers appear as examples:** the rival extension on this same website ships exactly 26 and 56 as its defaults, with a 2-minute window and an 8-second interval. That is their guess about when slots are released, and they believe it enough to ship it. **Nothing is fixed in our code** — they are grey placeholder text only. Set whatever minutes you want, or none.
+
+**What changed for you:**
+- **Off until you turn it on**, and turning it on asks once, plainly: this sends more requests at the busiest minute, and the website may answer with rate limits or Cloudflare checks. Turning it off never asks and puts everything back exactly as it was.
+- **Slot searching only.** The login check is deliberately left alone — running a login sweep in the same minute would compete with the searching it is meant to help.
+- **One setting for everything.** A slot appearing at :26 appears at :26 for every client, so this is set once and applies everywhere, rather than fifty times.
+- **It still varies.** Inside a window the gap is a random 6–10 seconds, not a metronome tick at exactly 8. A perfectly regular beat is the thing most likely to be noticed.
+
+**The part that matters most:** it counts. Every check is recorded as inside or outside a window, and the menu shows the comparison:
+
+```
+in windows: 3 finds / 48 checks (6.25%)
+outside:    11 finds / 2104 checks (0.52%)
+```
+
+After a few weeks that tells you whether :26 is real **for your consulates** — or that the real minute is different, or that it is noise. Without it you would be inheriting someone else's guess and never finding out.
+
+**What it costs:** a 2-minute window at about 8 seconds makes roughly 15 checks where the normal pace makes 10. Two windows is about 11 extra checks an hour per running client. Modest — but it is more traffic at the busiest minute, and your logs already show the website saying *"The system is processing too many requests."* If that gets worse after turning this on, that is the cause.
+
+**Tested:** 17 checks on the timing (windows hit on the right minutes, every hour, and a window set to run past the hour — ":58 for 5 minutes" correctly covers :58 to :02), and 6 on the pace itself, including 2,000 gaps with the feature off to prove it is byte-for-byte the old 10–15 seconds, 2,000 with it on to prove the faster range still varies rather than ticking, and that "enabled but no windows set" behaves as off. All 23 passing, and confirmed working on the live dashboard.
+
+---
+
+## 2026-11-25 — Say which dates a client cannot take, and how much notice they need (Issue #94)
+
+**What it does:** A collapsible **Date rules** section in the booking panel — the panel that appears on the visa site once a client is logged in, next to the date range and locations.
+
+**Excluded dates** — days this client cannot take, even if a slot appears. Type them the way you would say them: `15 Jan 27, 20-25 Feb 27`. Strict form works too: `2027-01-15`. Underneath the box it tells you what it understood — *"7 day(s) excluded: 15 Jan 27, 20 Feb 27, …"* — before you save. If it cannot read something it says so and names the bit it could not read, so nothing is ever thrown away quietly.
+
+**Minimum notice** — the soonest the client could actually attend, in days. Put 10 and a slot three days away is ignored. Underneath it shows the real date that works out to, so there is no counting on your fingers.
+
+Leave either blank and nothing changes for that client.
+
+**Why:** A client's window was only a start and an end date. If they were abroad for a fortnight in the middle, or needed two weeks to arrange travel, the bot would happily grab a slot they could not attend — and you had to watch for it and undo it by hand, which rather defeats the point.
+
+**What changed for you:**
+- Dates the client cannot take are **still shown** in the slot alerts, marked 🚫, rather than disappearing. So "was there anything on the 18th?" has an answer, instead of looking like the bot missed it.
+- The same rules apply everywhere — the scan, the grab, the counts, the alerts. A date that cannot be taken is never shown as available and then refused.
+- Minimum notice counts from today and moves with it: a date that is eleven days away today stops qualifying in two days' time. That is correct, but it does mean a date can quietly drop out.
+
+**Where you set them — two places, one value:**
+- **The booking panel**, after a client logs in: expand **Date rules** beside the date range.
+- **The Edit box** on their client card, under the dates.
+
+Whichever you use, it is the same saved setting — change it in one and the other shows it. What you enter is saved to that client, so it is still there next run and on your other machines.
+
+**One step for you:** needs a small change in Supabase first — two new optional fields. The file is `sql/06-date-rules.sql`. Run it once. Until you do, everything works exactly as before and the two boxes simply have nothing to save into.
+
+**When the rules leave nothing to book, it now says so.** Minimum notice counts from today and moves with it, so a window closes from both ends. With a window of 1–31 December and one week's notice, on 24 December only the 31st is still reachable, and from the 25th nothing is. Before this the bot would have carried on hunting that client for ever, finding slots and refusing every one, with nothing on screen explaining why.
+
+Two places now catch it:
+- **On the client's card:** *"No bookable dates left — 7 days' notice means nothing before 1 Dec, but the window ends 30 Nov."*
+- **While you type it:** the line under the notice box turns amber and says the same thing, so you see it when registering the client rather than three weeks later. It re-checks when you change either date too.
+
+**Tested:** 15 checks on the date reader (friendly and strict forms, ranges, rubbish, and impossible dates like 31 February, which must be rejected rather than rolled into March), 15 on the booking rule itself (no rules, excluded only, notice only, both together, and nonsense stored in the fields, which must never widen the window). and 9 on the no-bookable-dates check (open-ended windows, notice landing exactly on the end date, overrunning it by one day, a window already past, and every remaining day excluded). All 39 passing, and confirmed working on the live dashboard.
+
+---
+
 ## 2026-11-24 — Client card reordered, and the state dropdown matches the buttons (Issue #93)
 
 **What it does:** Two things on each client card.
