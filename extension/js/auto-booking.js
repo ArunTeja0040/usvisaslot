@@ -2397,6 +2397,101 @@
   // sweep sat on that client until the dashboard's SWEEP_STUCK_MS fired.
   //
   // So: own the page here, loop in place for the retry, and always finish.
+  // #94 Panel wiring: fill the fields from the client, echo what was typed,
+  // and save it back so it is still there next run and on the other machines.
+  function abRulesSummary() {
+    const n = __dateRules.excluded.size, d = __dateRules.minNoticeDays;
+    const bits = [];
+    if (n) bits.push(n + " excluded");
+    if (d) bits.push(d + "d notice");
+    return bits.length ? "— " + bits.join(", ") : "— none set";
+  }
+
+  function abUpdateRuleEchoes() {
+    const ex = document.getElementById("ab-excluded");
+    const exEcho = document.getElementById("ab-excluded-echo");
+    if (ex && exEcho) {
+      const raw = ex.value.trim();
+      if (!raw) { exEcho.textContent = ""; exEcho.style.color = "#777"; }
+      else {
+        const r = abParseExcluded(raw);
+        const shown = r.dates.slice(0, 6).map(abFmtDate).join(", ");
+        const more = r.dates.length > 6 ? " +" + (r.dates.length - 6) + " more" : "";
+        if (r.bad.length) {
+          exEcho.style.color = "#b9770e";
+          exEcho.textContent = "Could not read: " + r.bad.join(", ") +
+            (r.dates.length ? " · reading " + r.dates.length + ": " + shown + more : "");
+        } else {
+          exEcho.style.color = "#1e8449";
+          exEcho.textContent = r.dates.length + " day(s) excluded: " + shown + more;
+        }
+      }
+    }
+    const mn = document.getElementById("ab-min-notice");
+    const mnEcho = document.getElementById("ab-min-notice-echo");
+    if (mn && mnEcho) {
+      const n = Math.floor(Number(mn.value) || 0);
+      if (n <= 0) { mnEcho.textContent = ""; mnEcho.style.color = "#777"; }
+      else {
+        const from = new Date(); from.setHours(0, 0, 0, 0); from.setDate(from.getDate() + n);
+        const fromISO = from.getFullYear() + "-" + String(from.getMonth() + 1).padStart(2, "0") +
+                        "-" + String(from.getDate()).padStart(2, "0");
+        // Warn here rather than letting the bot hunt a window that has closed.
+        const endVal = String(document.getElementById("ab-end-date")?.value || "").trim();
+        if (endVal && fromISO > endVal) {
+          mnEcho.style.color = "#b9770e";
+          mnEcho.textContent = "Nothing before " + abFmtDate(fromISO) + " — but the window ends " +
+                               abFmtDate(endVal) + ", so no date can be booked";
+        } else {
+          mnEcho.style.color = "#1e8449";
+          mnEcho.textContent = "Nothing before " + abFmtDate(fromISO);
+        }
+      }
+    }
+    const sum = document.getElementById("ab-rules-summary");
+    if (sum) sum.textContent = abRulesSummary();
+  }
+
+  // Applies what is typed to the live rules, saves it to the client, and keeps
+  // it in the cycling state so the keep-alive page reload does not lose it.
+  async function abSaveRules() {
+    const exRaw = document.getElementById("ab-excluded")?.value || "";
+    const parsed = abParseExcluded(exRaw);
+    const notice = Math.max(0, Math.floor(Number(document.getElementById("ab-min-notice")?.value) || 0));
+
+    loadDateRules({ excludedDates: parsed.dates, minimumNoticeDays: notice });
+    abUpdateRuleEchoes();
+
+    const d = await new Promise((r) => chrome.storage.local.get(["loginDetails", "userProfilesList"], r));
+    const username = d.loginDetails?.username;
+    const profiles = d.userProfilesList || [];
+    const prof = username ? profiles.find((x) => x.username === username) : null;
+    if (!prof) return;
+    prof.excludedDates = parsed.dates;
+    prof.minimumNoticeDays = notice;
+    await new Promise((r) => chrome.storage.local.set({ userProfilesList: profiles }, r));
+    if (SUPABASE_ENABLED && SupabaseSync.isReady()) {
+      try { SupabaseSync.pushProfile(prof); } catch (e) { /* offline is fine; local stands */ }
+    }
+    log(`[dates] rules saved for ${username} — ${parsed.dates.length} excluded, ${notice}d notice`);
+  }
+
+  function abWireRuleFields(profile) {
+    const ex = document.getElementById("ab-excluded");
+    const mn = document.getElementById("ab-min-notice");
+    if (!ex || !mn) return;
+    ex.value = (profile && Array.isArray(profile.excludedDates) ? profile.excludedDates : []).map(abFmtDate).join(", ");
+    mn.value = (profile && profile.minimumNoticeDays) || "";
+    abUpdateRuleEchoes();
+    // Echo as they type; save when they leave the field, so a half-typed date
+    // is never written.
+    ex.addEventListener("input", abUpdateRuleEchoes);
+    mn.addEventListener("input", abUpdateRuleEchoes);
+    ex.addEventListener("change", abSaveRules);
+    mn.addEventListener("change", abSaveRules);
+    document.getElementById("ab-end-date")?.addEventListener("change", abUpdateRuleEchoes);
+  }
+
   async function handleVerifySecurityQuestions(username) {
     if (window.__abVerifySecHandling) return;   // router and watcher can both arrive
     window.__abVerifySecHandling = true;
@@ -2937,6 +3032,26 @@
                    style="width:52px;padding:4px 6px;border:1px solid #ccc;border-radius:4px;">
           </label>
         </div>
+          <!-- #94 Collapsed by default: set once per client and then left
+               alone, so it must not crowd the panel during a live run. -->
+          <details id="ab-rules" style="margin-bottom:12px;border:1px solid #e0e0e0;border-radius:5px;padding:6px 10px;background:#fafafa;">
+            <summary style="font-size:13px;font-weight:600;cursor:pointer;color:#1a5276;">Date rules <span id="ab-rules-summary" style="font-weight:400;color:#777;"></span></summary>
+            <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start;margin-top:8px;">
+              <label style="font-size:12px;font-weight:600;">Excluded dates
+                <input type="text" id="ab-excluded" placeholder="15 Dec 26, 20-23 Dec 26"
+                       title="Days this client cannot take, even if a slot appears."
+                       style="display:block;width:260px;margin-top:3px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-weight:400;">
+                <div id="ab-excluded-echo" style="font-size:11px;margin-top:3px;min-height:13px;color:#777;font-weight:400;"></div>
+              </label>
+              <label style="font-size:12px;font-weight:600;">Min. notice (days)
+                <input type="number" id="ab-min-notice" min="0" step="1" placeholder="0"
+                       title="Ignore slots sooner than this many days from today."
+                       style="display:block;width:90px;margin-top:3px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-weight:400;">
+                <div id="ab-min-notice-echo" style="font-size:11px;margin-top:3px;min-height:13px;color:#777;font-weight:400;"></div>
+              </label>
+            </div>
+            <div style="font-size:11px;color:#888;margin-top:6px;">Saved to this client \u2014 still here next run, and on your other machines.</div>
+          </details>
         <div style="margin-bottom:12px;">
           <strong style="font-size:13px;">Locations: </strong>
           ${checkboxesHTML}
@@ -3013,6 +3128,7 @@
           // #94 Same profile the dates come from, so the rules can never be
           // out of step with the window they narrow.
           loadDateRules(profile);
+          abWireRuleFields(profile);
           log("Booking panel auto-populated from profile: " + (profile.name || activeUser));
         }
       }
@@ -5240,6 +5356,84 @@
           `${__dateRules.minNoticeDays} day(s) minimum notice`);
     }
     return __dateRules;
+  }
+
+  // #94 The operator types these in the booking panel, so the parsing lives
+  // here. Loose by design — "15 Dec 26", "20-23 Dec 26", "2026-12-15" — with
+  // the understood result echoed under the field before it is saved, so a
+  // format that could be misread never is.
+  const AB_MONTHS = { jan:1, feb:2, mar:3, apr:4, may:5, jun:6, jul:7, aug:8, sep:9, oct:10, nov:11, dec:12 };
+  const AB_MON_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+  function abToISO(y, m, d) {
+    if (!(m >= 1 && m <= 12) || !(d >= 1 && d <= 31)) return null;
+    const yy = y < 100 ? 2000 + y : y;
+    const dt = new Date(Date.UTC(yy, m - 1, d));
+    // Rejects the 31st of a 30-day month rather than rolling it into the next.
+    if (dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return null;
+    return yy + "-" + String(m).padStart(2, "0") + "-" + String(d).padStart(2, "0");
+  }
+
+  function abParseOneDate(tok) {
+    const t = String(tok || "").trim().replace(/\s+/g, " ");
+    if (!t) return null;
+    let m = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if (m) return abToISO(+m[1], +m[2], +m[3]);
+    m = t.match(/^(\d{1,2})[ \/.-]([A-Za-z]{3,})[ \/.,-]*(\d{2,4})$/);
+    if (m) { const mo = AB_MONTHS[m[2].slice(0, 3).toLowerCase()]; return mo ? abToISO(+m[3], mo, +m[1]) : null; }
+    m = t.match(/^([A-Za-z]{3,})[ \/.-](\d{1,2})[ \/.,-]*(\d{2,4})$/);
+    if (m) { const mo = AB_MONTHS[m[1].slice(0, 3).toLowerCase()]; return mo ? abToISO(+m[3], mo, +m[2]) : null; }
+    m = t.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})$/);
+    if (m) return abToISO(+m[3], +m[2], +m[1]);     // day first, as written here
+    return null;
+  }
+
+  // The whole token is tried as one date FIRST, then every split point in turn,
+  // because an ISO date contains the very "-" used as a range separator:
+  // "2026-12-15" split on its first dash gives "2026" and "12-15", which reads
+  // as nothing.
+  function abParseDateToken(tok) {
+    const t = String(tok || "").trim();
+    const single = abParseOneDate(t);
+    if (single) return [single];
+    const seps = [];
+    const re = /\s*(?:to|:|–|—|-)\s*/gi;
+    let m;
+    while ((m = re.exec(t)) !== null) {
+      seps.push([m.index, m.index + m[0].length]);
+      if (m[0].length === 0) re.lastIndex++;
+    }
+    for (let i = 0; i < seps.length; i++) {
+      const left = t.slice(0, seps[i][0]).trim();
+      const right = t.slice(seps[i][1]).trim();
+      const end = abParseOneDate(right);
+      if (!end) continue;
+      let begin = abParseOneDate(left);
+      if (!begin && /^\d{1,2}$/.test(left)) begin = abToISO(+end.slice(0, 4), +end.slice(5, 7), +left);
+      if (!begin || begin > end) continue;
+      const out = [];
+      for (let d = new Date(begin + "T00:00:00Z"); d <= new Date(end + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + 1)) {
+        out.push(d.toISOString().slice(0, 10));
+        if (out.length > 400) break;              // a typo must not build a decade
+      }
+      return out;
+    }
+    return null;
+  }
+
+  function abParseExcluded(raw) {
+    const dates = new Set(); const bad = [];
+    String(raw || "").split(",").map(function (t) { return t.trim(); }).filter(Boolean).forEach(function (tok) {
+      const got = abParseDateToken(tok);
+      if (got && got.length) got.forEach(function (d) { dates.add(d); });
+      else bad.push(tok);
+    });
+    return { dates: Array.from(dates).sort(), bad: bad };
+  }
+
+  function abFmtDate(iso) {
+    const d = new Date(iso + "T00:00:00Z");
+    return d.getUTCDate() + " " + AB_MON_ABBR[d.getUTCMonth()] + " " + String(d.getUTCFullYear()).slice(2);
   }
 
   // Why a date was refused, or "" when it is bookable. Separate from the

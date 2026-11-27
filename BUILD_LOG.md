@@ -14,7 +14,7 @@ Format:
 
 ## 2026-11-25 — Say which dates a client cannot take, and how much notice they need (Issue #94)
 
-**What it does:** Two new optional boxes in a client's Edit screen, next to their dates.
+**What it does:** A collapsible **Date rules** section in the booking panel — the panel that appears on the visa site once a client is logged in, next to the date range and locations.
 
 **Excluded dates** — days this client cannot take, even if a slot appears. Type them the way you would say them: `15 Jan 27, 20-25 Feb 27`. Strict form works too: `2027-01-15`. Underneath the box it tells you what it understood — *"7 day(s) excluded: 15 Jan 27, 20 Feb 27, …"* — before you save. If it cannot read something it says so and names the bit it could not read, so nothing is ever thrown away quietly.
 
@@ -28,6 +28,8 @@ Leave either blank and nothing changes for that client.
 - Dates the client cannot take are **still shown** in the slot alerts, marked 🚫, rather than disappearing. So "was there anything on the 18th?" has an answer, instead of looking like the bot missed it.
 - The same rules apply everywhere — the scan, the grab, the counts, the alerts. A date that cannot be taken is never shown as available and then refused.
 - Minimum notice counts from today and moves with it: a date that is eleven days away today stops qualifying in two days' time. That is correct, but it does mean a date can quietly drop out.
+
+**Where you set them:** open the booking panel after logging a client in, expand **Date rules**, and type. What you enter is saved to that client — it is still there next run, and on your other machines, so you set it once rather than every session.
 
 **One step for you:** needs a small change in Supabase first — two new optional fields. The file is `sql/06-date-rules.sql`. Run it once. Until you do, everything works exactly as before and the two boxes simply have nothing to save into.
 

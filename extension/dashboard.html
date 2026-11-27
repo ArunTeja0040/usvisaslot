@@ -472,23 +472,6 @@
           <div><label>Start Date</label><input type="date" id="edit-start-date"></div>
           <div><label>End Date</label><input type="date" id="edit-end-date"></div>
         </div>
-        <!-- #94 Two optional rules that narrow the window above. Both blank
-             means nothing changes for this client. -->
-        <div class="form-row two-col">
-          <div>
-            <label>Excluded dates</label>
-            <input type="text" id="edit-excluded-dates"
-                   placeholder="15 Jan 27, 20-25 Feb 27"
-                   title="Days this client cannot take, even if a slot appears. Single days or ranges.">
-            <div id="edit-excluded-echo" class="field-echo"></div>
-          </div>
-          <div>
-            <label>Minimum notice (days)</label>
-            <input type="number" id="edit-min-notice" min="0" step="1" placeholder="0"
-                   title="Ignore slots sooner than this many days from today. Blank or 0 means no minimum.">
-            <div id="edit-min-notice-echo" class="field-echo"></div>
-          </div>
-        </div>
         <div class="form-row">
           <label>Locations</label>
           <div id="edit-locations" class="edit-locations">
