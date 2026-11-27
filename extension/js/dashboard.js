@@ -176,6 +176,50 @@
     return d.getUTCDate() + " " + MON_ABBR[d.getUTCMonth()] + " " + String(d.getUTCFullYear()).slice(2);
   }
 
+  // #94 The Edit dialog's own echo for the same two rules the booking panel
+  // sets. Parsing comes from js/date-rules.js, loaded before this file, so the
+  // two surfaces can never disagree about what "20-23 Dec 26" means.
+  function updateExcludedEcho() {
+    const input = document.getElementById("edit-excluded-dates");
+    const echo = document.getElementById("edit-excluded-echo");
+    if (!input || !echo) return;
+    const raw = input.value.trim();
+    if (!raw) { echo.textContent = ""; echo.className = "field-echo"; return; }
+    const r = window.ABDateRules.parseExcluded(raw);
+    const shown = r.dates.slice(0, 8).map(fmtEchoDate).join(", ");
+    const more = r.dates.length > 8 ? " +" + (r.dates.length - 8) + " more" : "";
+    if (r.bad.length) {
+      echo.className = "field-echo is-bad";
+      echo.textContent = "Could not read: " + r.bad.join(", ") +
+        (r.dates.length ? " · reading " + r.dates.length + " day(s): " + shown + more : "");
+    } else {
+      echo.className = "field-echo is-ok";
+      echo.textContent = r.dates.length + " day(s) excluded: " + shown + more;
+    }
+  }
+
+  function updateNoticeEcho() {
+    const input = document.getElementById("edit-min-notice");
+    const echo = document.getElementById("edit-min-notice-echo");
+    if (!input || !echo) return;
+    const n = Math.floor(Number(input.value) || 0);
+    if (n <= 0) { echo.textContent = ""; echo.className = "field-echo"; return; }
+    const from = new Date(); from.setHours(0, 0, 0, 0); from.setDate(from.getDate() + n);
+    const fromISO = from.getFullYear() + "-" + String(from.getMonth() + 1).padStart(2, "0") +
+                    "-" + String(from.getDate()).padStart(2, "0");
+    // Warn at the point of entry when the notice period already runs past this
+    // client's end date, rather than letting the bot hunt a closed window.
+    const endVal = String(document.getElementById("edit-end-date")?.value || "").trim();
+    if (endVal && fromISO > endVal) {
+      echo.className = "field-echo is-bad";
+      echo.textContent = "Nothing before " + fmtEchoDate(fromISO) +
+        " — but the window ends " + fmtEchoDate(endVal) + ", so no date can be booked";
+      return;
+    }
+    echo.className = "field-echo is-ok";
+    echo.textContent = "Nothing before " + fmtEchoDate(fromISO);
+  }
+
   // #94 Can this client still be booked at all?
   //
   // Minimum notice is measured from today and moves with it, so a window closes
@@ -2920,6 +2964,13 @@
   });
 
 
+  // #94 Echo as they type; re-check when either date moves, since changing the
+  // window can turn a fine notice period into an impossible one.
+  document.getElementById("edit-excluded-dates")?.addEventListener("input", updateExcludedEcho);
+  document.getElementById("edit-min-notice")?.addEventListener("input", updateNoticeEcho);
+  document.getElementById("edit-end-date")?.addEventListener("change", updateNoticeEcho);
+  document.getElementById("edit-start-date")?.addEventListener("change", updateNoticeEcho);
+
   document.getElementById("sweep-report-close")?.addEventListener("click", async () => {
     const sweep = await readSweep();
     if (sweep) { sweep.dismissed = true; await writeSweep(sweep); }
@@ -3102,6 +3153,13 @@
       document.getElementById("edit-price").value = profile.pricePerPerson || profile.agreedPrice || "";
       const paidField = document.getElementById("edit-paid");
       if (paidField) paidField.value = profile.paidAmount || "";
+      // #94 Same saved value the booking panel shows.
+      const exField = document.getElementById("edit-excluded-dates");
+      if (exField) exField.value = (profile.excludedDates || []).map(fmtEchoDate).join(", ");
+      const mnField = document.getElementById("edit-min-notice");
+      if (mnField) mnField.value = profile.minimumNoticeDays || "";
+      updateExcludedEcho();
+      updateNoticeEcho();
       calcTotalPrice();
 
       // Automation
@@ -3152,6 +3210,10 @@
       applicantCount: parseInt(document.getElementById("edit-applicants").value) || 1,
       pricePerPerson: document.getElementById("edit-price").value.trim(),
       paidAmount: Math.max(0, Math.round(Number(document.getElementById("edit-paid")?.value) || 0)),
+      // #94 Only what parsed cleanly is stored; anything unreadable was shown
+      // under the field before saving, so nothing is dropped silently.
+      excludedDates: window.ABDateRules.parseExcluded(document.getElementById("edit-excluded-dates")?.value).dates,
+      minimumNoticeDays: Math.max(0, Math.floor(Number(document.getElementById("edit-min-notice")?.value) || 0)),
       agreedPrice: String((parseInt(document.getElementById("edit-price").value) || 0) * (parseInt(document.getElementById("edit-applicants").value) || 1)),
       autoLogin: document.getElementById("edit-auto-login").checked,
       autoDashboard: document.getElementById("edit-auto-dashboard").checked,
@@ -3491,6 +3553,12 @@
     document.getElementById("edit-total-price").value = "";
     const paidReset = document.getElementById("edit-paid");
     if (paidReset) paidReset.value = "";
+    const exReset = document.getElementById("edit-excluded-dates");
+    if (exReset) exReset.value = "";
+    const mnReset = document.getElementById("edit-min-notice");
+    if (mnReset) mnReset.value = "";
+    updateExcludedEcho();
+    updateNoticeEcho();
     document.getElementById("edit-auto-login").checked = true;
     document.getElementById("edit-auto-dashboard").checked = true;
     document.getElementById("edit-auto-select").checked = true;

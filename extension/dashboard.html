@@ -472,6 +472,22 @@
           <div><label>Start Date</label><input type="date" id="edit-start-date"></div>
           <div><label>End Date</label><input type="date" id="edit-end-date"></div>
         </div>
+        <!-- #94 The same two rules as the booking panel, reachable from here
+             too. One saved value; whichever surface you use, both show it. -->
+        <div class="form-row two-col">
+          <div>
+            <label>Excluded dates</label>
+            <input type="text" id="edit-excluded-dates" placeholder="15 Dec 26, 20-23 Dec 26"
+                   title="Days this client cannot take, even if a slot appears.">
+            <div id="edit-excluded-echo" class="field-echo"></div>
+          </div>
+          <div>
+            <label>Minimum notice (days)</label>
+            <input type="number" id="edit-min-notice" min="0" step="1" placeholder="0"
+                   title="Ignore slots sooner than this many days from today.">
+            <div id="edit-min-notice-echo" class="field-echo"></div>
+          </div>
+        </div>
         <div class="form-row">
           <label>Locations</label>
           <div id="edit-locations" class="edit-locations">
@@ -515,6 +531,7 @@
   <script src="js/supabase-sync.js"></script>
   <script src="js/sheets-sync.js"></script>
   <script src="js/ui-kit.js"></script>
+  <script src="js/date-rules.js"></script>
   <script src="js/dashboard.js"></script>
 </body>
 </html>

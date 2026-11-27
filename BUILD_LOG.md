@@ -29,7 +29,11 @@ Leave either blank and nothing changes for that client.
 - The same rules apply everywhere — the scan, the grab, the counts, the alerts. A date that cannot be taken is never shown as available and then refused.
 - Minimum notice counts from today and moves with it: a date that is eleven days away today stops qualifying in two days' time. That is correct, but it does mean a date can quietly drop out.
 
-**Where you set them:** open the booking panel after logging a client in, expand **Date rules**, and type. What you enter is saved to that client — it is still there next run, and on your other machines, so you set it once rather than every session.
+**Where you set them — two places, one value:**
+- **The booking panel**, after a client logs in: expand **Date rules** beside the date range.
+- **The Edit box** on their client card, under the dates.
+
+Whichever you use, it is the same saved setting — change it in one and the other shows it. What you enter is saved to that client, so it is still there next run and on your other machines.
 
 **One step for you:** needs a small change in Supabase first — two new optional fields. The file is `sql/06-date-rules.sql`. Run it once. Until you do, everything works exactly as before and the two boxes simply have nothing to save into.
 
